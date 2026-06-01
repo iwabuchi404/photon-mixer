@@ -259,9 +259,10 @@ class PhotonMixerApp {
     const allInterp    = this.interpolator.interpolate(stabilized);
     const allStroke    = this.strokeManager.finalizeStroke(allInterp);
 
-    // 2点オーバーラップ: 前セグメントの末尾2点を含めて再描画することで境界ギャップを埋める
-    // max blend なのでアルファ蓄積は発生しない
-    const OVERLAP = 2;
+    // spacing=1 により 1px 間隔でスタンプが密になるため境界ギャップが生じない
+    // OVERLAP を設けると混色中に brushHeadColor が変わった箇所で
+    // 前の色と新しい色の max blend により明るいスポットが出るため 0 にする
+    const OVERLAP = 0;
     const startIdx   = Math.max(0, this.progressiveLastInterpCount - OVERLAP);
     const newSegment = allStroke.slice(startIdx);
 
