@@ -198,10 +198,24 @@ class PhotonMixerApp {
 
   /**
    * brushHeadColor を現在座標のキャンバス色と混合して進化させる
+   *
+   * 処理順:
+   *   1. 减衰: brushHeadColor を元の色に向けて少しずつ戻す（引きずりすぎ防止）
+   *   2. 混色: キャンバスに既存色があれば Oklab 空間で混ぜる
    */
   private evolveProgressiveMixing(x: number, y: number): void {
     if (!this.brushHeadColor) return;
 
+    // ① 减衰: ストロークが進むにつれ元の色に戻る（距離依存ではなくstep依存の近似）
+    // DECAY_RATE = 1ステップあたり元の色に向かう割合（0=减衰なし、1=即戻る）
+    const DECAY_RATE = 0.06;
+    const headOklab = linearToOklab(this.brushHeadColor);
+    const origOklab = linearToOklab(this.state.currentColor);
+    const decayedOklab = mixOklab(headOklab, origOklab, DECAY_RATE);
+    const decayed = oklabToLinear(decayedOklab);
+    this.brushHeadColor = { ...decayed, a: this.state.currentColor.a };
+
+    // ② キャンバスの色を拾って混ぜる
     if (this.committedSnapshot) {
       const canvas = this.renderer!.canvas;
       const canvasColor = sampleSnapshot(
@@ -212,7 +226,6 @@ class PhotonMixerApp {
 
       if (canvasColor.a > 0.001) {
         const brushOklab  = linearToOklab(this.brushHeadColor);
-        // アンプリマルチプライドして Oklab 変換
         const canvasLinear: LinearColor = {
           r: canvasColor.r / canvasColor.a,
           g: canvasColor.g / canvasColor.a,
@@ -232,18 +245,23 @@ class PhotonMixerApp {
       }
     }
 
-    // 常に GPU の brush_color を更新（スナップショット未取得時は currentColor のまま）
     this.renderPipeline?.updateBrushConfig({ color: { ...this.brushHeadColor } });
   }
 
   /**
    * 最後のコミット以降の新しい補間点をコミットする
+   * セグメント境界の点線を防ぐため、前のセグメントの末尾2点をオーバーラップして再描画する
    */
   private commitProgressiveSegment(): void {
     const stabilized   = this.stabilizer.stabilizeBatch(this.rawPoints);
     const allInterp    = this.interpolator.interpolate(stabilized);
     const allStroke    = this.strokeManager.finalizeStroke(allInterp);
-    const newSegment   = allStroke.slice(this.progressiveLastInterpCount);
+
+    // 2点オーバーラップ: 前セグメントの末尾2点を含めて再描画することで境界ギャップを埋める
+    // max blend なのでアルファ蓄積は発生しない
+    const OVERLAP = 2;
+    const startIdx   = Math.max(0, this.progressiveLastInterpCount - OVERLAP);
+    const newSegment = allStroke.slice(startIdx);
 
     if (newSegment.length > 0) {
       this.renderPipeline?.commitStroke(newSegment);
