@@ -75,7 +75,9 @@ class PhotonMixerApp {
 
   constructor() {
     this.stabilizer = new Stabilizer({ threshold: 1000, minAlpha: 0.3 });
-    this.interpolator = new Interpolator({ spacing: 4, speedThreshold: 2000 });
+    // spacing=1: 4x バッファでダウンサンプルするため 1px でも GPU 負荷は低く品質が高い
+    // 半透明ブラシで点線にならないためスタンプを密に配置する
+    this.interpolator = new Interpolator({ spacing: 1, speedThreshold: 2000 });
     this.strokeManager = new StrokeManager({ baseSize: 2, maxSize: 20, curve: 'smooth' });
     this.perfMonitor = new PerfMonitor();
   }
@@ -296,7 +298,7 @@ class PhotonMixerApp {
       const baseSize = Math.max(1, Math.round(maxSize * 0.1));
       sizeVal.textContent = maxSize.toString();
       this.strokeManager.updatePressureConfig({ maxSize, baseSize });
-      this.interpolator.updateConfig({ spacing: Math.max(1, Math.round(maxSize * 0.2)) });
+      // spacing は 1 固定（サイズ変更で変えない。4x バッファで品質を確保）
     });
 
     alphaSlider.addEventListener('input', () => {
