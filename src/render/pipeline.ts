@@ -180,6 +180,38 @@ export class RenderPipeline {
     this.brushRenderer.updateConfig(config);
   }
 
+  /**
+   * committedTexture の内容を CPU に読み出す（引きずり混色用スナップショット）
+   * pen-down 時に非同期で取得し、move イベントで色をサンプリングする
+   */
+  async requestCommittedSnapshot(): Promise<{ data: Uint16Array; bytesPerRow: number }> {
+    const { device, canvas } = this.renderer;
+    const { width, height } = canvas;
+    // rgba16float: 8 bytes/pixel, bytesPerRow は 256 バイトアライン
+    const bytesPerRow = Math.ceil(width * 8 / 256) * 256;
+
+    const stagingBuffer = device.createBuffer({
+      size: bytesPerRow * height,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    const encoder = device.createCommandEncoder();
+    encoder.copyTextureToBuffer(
+      { texture: this.committedTexture },
+      { buffer: stagingBuffer, bytesPerRow },
+      [width, height],
+    );
+    device.queue.submit([encoder.finish()]);
+
+    await stagingBuffer.mapAsync(GPUMapMode.READ);
+    // slice() でバッファを解放前にコピーする
+    const data = new Uint16Array(stagingBuffer.getMappedRange().slice(0));
+    stagingBuffer.unmap();
+    stagingBuffer.destroy();
+
+    return { data, bytesPerRow };
+  }
+
   clear(): void {
     this.currentStroke = [];
     const { canvas } = this.renderer;

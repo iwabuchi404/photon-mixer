@@ -8,17 +8,20 @@ import type { StrokePoint } from '../pen/stroke.js';
 /**
  * ブラシ描画の設定
  */
+// 'stamp'      : スタンプ混色（GPU側で各スタンプがcommittedを読んで独立混色）
+// 'progressive': 引きずり混色（CPU側でbrushHeadColorを追跡し、GPU側は色をそのまま塗る）
+export type BrushMixMode = 'stamp' | 'progressive';
+
 export interface BrushConfig {
   color: { r: number; g: number; b: number; a: number }; // リニア空間 0-1
-  wetRatio: number; // 混色率 0-1
+  wetRatio: number;   // 混色率 0-1
+  mixMode: BrushMixMode;
 }
 
-/**
- * デフォルト設定（白、不透明度1.0、混色なし）
- */
 const DEFAULT_BRUSH_CONFIG: BrushConfig = {
   color: { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
   wetRatio: 0.0,
+  mixMode: 'stamp',
 };
 
 /**
@@ -119,18 +122,19 @@ export class BrushRenderer {
    * Uniformsを更新
    */
   private updateUniforms(canvasWidth: number, canvasHeight: number): void {
-    const uniformData = new Float32Array([
-      canvasWidth,
-      canvasHeight,
-      this.config.wetRatio,
-      0, // padding
-      this.config.color.r,
-      this.config.color.g,
-      this.config.color.b,
-      this.config.color.a,
-    ]);
-
-    this.device.queue.writeBuffer(this.uniformBuffer, 0, uniformData);
+    // ArrayBuffer を float と u32 で共有して use_gpu_mix を正確に書き込む
+    const buf = new ArrayBuffer(32);
+    const f32 = new Float32Array(buf);
+    const u32 = new Uint32Array(buf);
+    f32[0] = canvasWidth;
+    f32[1] = canvasHeight;
+    f32[2] = this.config.wetRatio;
+    u32[3] = this.config.mixMode === 'stamp' ? 1 : 0; // use_gpu_mix
+    f32[4] = this.config.color.r;
+    f32[5] = this.config.color.g;
+    f32[6] = this.config.color.b;
+    f32[7] = this.config.color.a;
+    this.device.queue.writeBuffer(this.uniformBuffer, 0, buf);
   }
 
   /**

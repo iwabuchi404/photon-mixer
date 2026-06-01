@@ -7,7 +7,7 @@ struct Uniforms {
   canvas_width: f32,
   canvas_height: f32,
   wet_ratio: f32,
-  padding: f32,
+  use_gpu_mix: u32,  // 1=スタンプ混色(GPU), 0=引きずり混色(CPU制御)
   brush_color: vec4<f32>,
 }
 
@@ -99,15 +99,15 @@ fn fragment_main(input: FragmentInput) -> @location(0) vec4<f32> {
 
   let stamp_alpha = uniforms.brush_color.a * (1.0 - smoothstep(0.8, 1.0, dist));
 
-  // 混色ロジック
   var target_color = uniforms.brush_color.rgb;
 
-  if (uniforms.wet_ratio > 0.0) {
+  // スタンプ混色モード（GPU側処理）
+  // 引きずり混色モードでは brush_color が CPU 側で更新済みのためここでは何もしない
+  if (uniforms.use_gpu_mix != 0u && uniforms.wet_ratio > 0.0) {
     let existing = textureSampleLevel(committed_texture, committed_sampler, input.canvas_uv, 0.0);
     if (existing.a > 0.001) {
       let brush_oklab = linear_to_oklab(target_color);
       let canvas_oklab = linear_to_oklab(existing.rgb / existing.a);
-      // existing.a を考慮して混ぜる（透明な部分とは混ざらない）
       let mixed_oklab = mix(brush_oklab, canvas_oklab, uniforms.wet_ratio * existing.a);
       target_color = oklab_to_linear(mixed_oklab);
     }
