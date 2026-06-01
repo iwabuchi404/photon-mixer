@@ -14,12 +14,12 @@ import { linearToOklab, oklabToLinear, mixOklab } from './color/oklab.js';
 import type { LinearColor } from './color/types.js';
 import type { BrushMixMode } from './render/brush.js';
 
-// Float16 (Uint16 表現) → Float32 変換
+// Float16（Uint16 表現）→ Float32 変換
 function float16ToFloat32(h: number): number {
   const sign = (h >> 15) & 1;
-  const exp = (h >> 10) & 0x1F;
-  const frac = h & 0x3FF;
-  if (exp === 0) return (sign ? -1 : 1) * Math.pow(2, -14) * (frac / 1024);
+  const exp  = (h >> 10) & 0x1F;
+  const frac =  h        & 0x3FF;
+  if (exp === 0)  return (sign ? -1 : 1) * Math.pow(2, -14) * (frac / 1024);
   if (exp === 31) return frac === 0 ? (sign ? -Infinity : Infinity) : NaN;
   return (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + frac / 1024);
 }
@@ -31,10 +31,10 @@ function sampleSnapshot(
   canvasWidth: number, canvasHeight: number,
   bytesPerRow: number,
 ): LinearColor {
-  const px = Math.max(0, Math.min(canvasWidth - 1, Math.round(x)));
+  const px = Math.max(0, Math.min(canvasWidth  - 1, Math.round(x)));
   const py = Math.max(0, Math.min(canvasHeight - 1, Math.round(y)));
-  const uint16sPerRow = bytesPerRow / 2; // bytesPerRow / sizeof(uint16)
-  const idx = py * uint16sPerRow + px * 4; // RGBA × 4 channels
+  const uint16sPerRow = bytesPerRow / 2;
+  const idx = py * uint16sPerRow + px * 4;
   return {
     r: float16ToFloat32(data[idx]),
     g: float16ToFloat32(data[idx + 1]),
@@ -70,6 +70,8 @@ class PhotonMixerApp {
   // 引きずり混色（progressive）用
   private brushHeadColor: LinearColor | null = null;
   private committedSnapshot: { data: Uint16Array; bytesPerRow: number } | null = null;
+  // move ごとにコミット済みの補間点数を追跡（スタンプの重複防止）
+  private progressiveLastInterpCount = 0;
 
   constructor() {
     this.stabilizer = new Stabilizer({ threshold: 1000, minAlpha: 0.3 });
@@ -110,6 +112,10 @@ class PhotonMixerApp {
     console.log('PhotonMixer initialized');
   }
 
+  private isProgressiveMixing(): boolean {
+    return this.state.mixMode === 'progressive' && this.state.wetRatio > 0;
+  }
+
   private handlePenInput(event: import('./pen/input.js').PenInputEvent): void {
     const { type, point } = event;
 
@@ -117,9 +123,10 @@ class PhotonMixerApp {
       case 'down': {
         this.state.isDrawing = true;
         this.rawPoints = [point];
+        this.progressiveLastInterpCount = 0;
 
-        // 引きずり混色: 筆先色を初期化してスナップショットを非同期取得
-        if (this.state.mixMode === 'progressive' && this.state.wetRatio > 0) {
+        if (this.isProgressiveMixing()) {
+          // 筆先色を初期化してスナップショットを非同期取得
           this.brushHeadColor = { ...this.state.currentColor };
           this.committedSnapshot = null;
           this.renderPipeline?.requestCommittedSnapshot().then(snap => {
@@ -133,16 +140,11 @@ class PhotonMixerApp {
         if (!this.state.isDrawing) return;
         this.rawPoints.push(point);
 
-        // 引きずり混色: move ごとに brushHeadColor を進化させる
-        if (this.state.mixMode === 'progressive' && this.state.wetRatio > 0 && this.brushHeadColor) {
-          this.evolveProgressiveMixing(point.x, point.y);
+        if (this.isProgressiveMixing() && this.brushHeadColor !== null) {
+          this.handleProgressiveMove(point.x, point.y);
+        } else {
+          this.handleStampMove();
         }
-
-        const stabilized = this.stabilizer.stabilizeBatch(this.rawPoints);
-        const interpolated = this.interpolator.interpolate(stabilized);
-        const liveStroke = this.strokeManager.finalizeStroke(interpolated);
-        this.renderPipeline?.setCurrentStroke(liveStroke);
-        this.perfMonitor.setPoints(liveStroke.length);
 
         const inputId = this.perfMonitor.recordInput();
         this.perfMonitor.recordRender(inputId);
@@ -152,20 +154,23 @@ class PhotonMixerApp {
       case 'up': {
         if (!this.state.isDrawing) return;
 
-        const stabilized = this.stabilizer.stabilizeBatch(this.rawPoints);
-        const interpolated = this.interpolator.interpolate(stabilized);
-        const finalStroke = this.strokeManager.finalizeStroke(interpolated);
-        if (finalStroke.length > 0) {
-          this.renderPipeline?.commitStroke(finalStroke);
+        if (this.isProgressiveMixing() && this.brushHeadColor !== null) {
+          // 残った末端点をコミット
+          this.commitProgressiveSegment();
+          // ブラシ色を元に戻す
+          this.renderPipeline?.updateBrushConfig({ color: { ...this.state.currentColor } });
+        } else {
+          const stabilized = this.stabilizer.stabilizeBatch(this.rawPoints);
+          const interpolated = this.interpolator.interpolate(stabilized);
+          const finalStroke = this.strokeManager.finalizeStroke(interpolated);
+          if (finalStroke.length > 0) {
+            this.renderPipeline?.commitStroke(finalStroke);
+          }
         }
 
-        // 引きずり混色の後始末: ブラシ色を元に戻す
-        if (this.state.mixMode === 'progressive' && this.brushHeadColor) {
-          this.renderPipeline?.updateBrushConfig({ color: { ...this.state.currentColor } });
-        }
         this.brushHeadColor = null;
         this.committedSnapshot = null;
-
+        this.progressiveLastInterpCount = 0;
         this.state.isDrawing = false;
         this.rawPoints = [];
         break;
@@ -174,60 +179,102 @@ class PhotonMixerApp {
   }
 
   /**
-   * 引きずり混色: 現在位置のキャンバス色を拾って brushHeadColor を更新し GPU に送る
-   * スナップショット未取得の間は混色なしで描く（初動の数フレームのみ）
+   * 引きずり混色の move 処理
+   * ① brushHeadColor を進化させる
+   * ② 新しい補間点のみ即座にコミット（焼き付け）
+   * → 各点が描かれた瞬間の brushHeadColor で記録される
+   */
+  private handleProgressiveMove(x: number, y: number): void {
+    // ① brushHeadColor を進化させて GPU に送る
+    this.evolveProgressiveMixing(x, y);
+
+    // ② 新しい補間点をコミット
+    this.commitProgressiveSegment();
+
+    // committed が最新なのでライブプレビューは不要
+    this.renderPipeline?.setCurrentStroke([]);
+    this.perfMonitor.setPoints(this.progressiveLastInterpCount);
+  }
+
+  /**
+   * brushHeadColor を現在座標のキャンバス色と混合して進化させる
    */
   private evolveProgressiveMixing(x: number, y: number): void {
-    if (!this.brushHeadColor || !this.committedSnapshot) return;
+    if (!this.brushHeadColor) return;
 
-    const canvas = this.renderer!.canvas;
-    const canvasColor = sampleSnapshot(
-      this.committedSnapshot.data,
-      x, y,
-      canvas.width, canvas.height,
-      this.committedSnapshot.bytesPerRow,
-    );
+    if (this.committedSnapshot) {
+      const canvas = this.renderer!.canvas;
+      const canvasColor = sampleSnapshot(
+        this.committedSnapshot.data, x, y,
+        canvas.width, canvas.height,
+        this.committedSnapshot.bytesPerRow,
+      );
 
-    // 既存色がある場所でのみ混ぜる
-    if (canvasColor.a > 0.001) {
-      const brushOklab = linearToOklab(this.brushHeadColor);
-      // アンプリマルチプライドして Oklab 変換
-      const canvasLinear: LinearColor = {
-        r: canvasColor.r / canvasColor.a,
-        g: canvasColor.g / canvasColor.a,
-        b: canvasColor.b / canvasColor.a,
-        a: 1,
-      };
-      const canvasOklab = linearToOklab(canvasLinear);
-      // 混色量 = wet_ratio × 既存色の不透明度（薄い部分は拾いにくい）
-      const t = this.state.wetRatio * canvasColor.a;
-      const mixed = mixOklab(brushOklab, canvasOklab, t);
-      const mixedLinear = oklabToLinear(mixed);
-      this.brushHeadColor = {
-        r: mixedLinear.r,
-        g: mixedLinear.g,
-        b: mixedLinear.b,
-        a: this.state.currentColor.a, // 不透明度はブラシ設定を維持
-      };
+      if (canvasColor.a > 0.001) {
+        const brushOklab  = linearToOklab(this.brushHeadColor);
+        // アンプリマルチプライドして Oklab 変換
+        const canvasLinear: LinearColor = {
+          r: canvasColor.r / canvasColor.a,
+          g: canvasColor.g / canvasColor.a,
+          b: canvasColor.b / canvasColor.a,
+          a: 1,
+        };
+        const canvasOklab = linearToOklab(canvasLinear);
+        const t = this.state.wetRatio * canvasColor.a;
+        const mixed = mixOklab(brushOklab, canvasOklab, t);
+        const mixedLinear = oklabToLinear(mixed);
+        this.brushHeadColor = {
+          r: mixedLinear.r,
+          g: mixedLinear.g,
+          b: mixedLinear.b,
+          a: this.state.currentColor.a,
+        };
+      }
     }
 
-    // GPU の brush_color uniform を更新（shader では use_gpu_mix=0 なのでそのまま塗る）
+    // 常に GPU の brush_color を更新（スナップショット未取得時は currentColor のまま）
     this.renderPipeline?.updateBrushConfig({ color: { ...this.brushHeadColor } });
   }
 
+  /**
+   * 最後のコミット以降の新しい補間点をコミットする
+   */
+  private commitProgressiveSegment(): void {
+    const stabilized   = this.stabilizer.stabilizeBatch(this.rawPoints);
+    const allInterp    = this.interpolator.interpolate(stabilized);
+    const allStroke    = this.strokeManager.finalizeStroke(allInterp);
+    const newSegment   = allStroke.slice(this.progressiveLastInterpCount);
+
+    if (newSegment.length > 0) {
+      this.renderPipeline?.commitStroke(newSegment);
+      this.progressiveLastInterpCount = allStroke.length;
+    }
+  }
+
+  /**
+   * スタンプモードの move 処理（従来通り全点をライブプレビュー）
+   */
+  private handleStampMove(): void {
+    const stabilized  = this.stabilizer.stabilizeBatch(this.rawPoints);
+    const interpolated = this.interpolator.interpolate(stabilized);
+    const liveStroke  = this.strokeManager.finalizeStroke(interpolated);
+    this.renderPipeline?.setCurrentStroke(liveStroke);
+    this.perfMonitor.setPoints(liveStroke.length);
+  }
+
   private setupControls(): void {
-    const sizeSlider = document.getElementById('brush-size') as HTMLInputElement;
-    const sizeVal = document.getElementById('brush-size-val')!;
-    const alphaSlider = document.getElementById('brush-alpha') as HTMLInputElement;
-    const alphaVal = document.getElementById('brush-alpha-val')!;
-    const wetSlider = document.getElementById('brush-wet') as HTMLInputElement;
-    const wetVal = document.getElementById('brush-wet-val')!;
-    const colorPicker = document.getElementById('brush-color') as HTMLInputElement;
-    const mixModeSelect = document.getElementById('mix-mode') as HTMLSelectElement;
-    const clearBtn = document.getElementById('clear-btn')!;
+    const sizeSlider    = document.getElementById('brush-size')    as HTMLInputElement;
+    const sizeVal       = document.getElementById('brush-size-val')!;
+    const alphaSlider   = document.getElementById('brush-alpha')   as HTMLInputElement;
+    const alphaVal      = document.getElementById('brush-alpha-val')!;
+    const wetSlider     = document.getElementById('brush-wet')     as HTMLInputElement;
+    const wetVal        = document.getElementById('brush-wet-val')!;
+    const colorPicker   = document.getElementById('brush-color')   as HTMLInputElement;
+    const mixModeSelect = document.getElementById('mix-mode')      as HTMLSelectElement;
+    const clearBtn      = document.getElementById('clear-btn')!;
 
     sizeSlider.addEventListener('input', () => {
-      const maxSize = parseInt(sizeSlider.value);
+      const maxSize  = parseInt(sizeSlider.value);
       const baseSize = Math.max(1, Math.round(maxSize * 0.1));
       sizeVal.textContent = maxSize.toString();
       this.strokeManager.updatePressureConfig({ maxSize, baseSize });
@@ -243,7 +290,7 @@ class PhotonMixerApp {
 
     wetSlider.addEventListener('input', () => {
       this.state.wetRatio = parseInt(wetSlider.value) / 100;
-      wetVal.textContent = wetSlider.value;
+      wetVal.textContent  = wetSlider.value;
       this.renderPipeline?.updateBrushConfig({ wetRatio: this.state.wetRatio });
     });
 
