@@ -1,0 +1,8 @@
+# 依存関係
+node_modules/
+
+# TypeScript ビルド出力
+dist/
+
+# 検証用スクリーンショット（自動生成）
+screenshots/
