@@ -98,12 +98,25 @@ export class RenderPipeline {
     this.currentStroke = points;
   }
 
+  /**
+   * ペンアップ時の通常コミット（over blend: 別ストロークとα蓄積あり）
+   */
   commitStroke(points: StrokePoint[]): void {
     if (points.length > 0) {
-      // 最後に最新の状態で isolatedTexture に描画してからベイクする
       this.drawToIsolated(points);
-      // 現在のストロークを確定済みテクスチャにベイク
       this.compositeRenderer.bake(this.isolatedTexture, this.committedTexture);
+    }
+    this.currentStroke = [];
+  }
+
+  /**
+   * progressive モードのセグメントコミット（max blend: 同一ストローク内α蓄積なし）
+   * OVERLAP で再描画してもα蓄積が起きないため半透明ブラシでも点線にならない
+   */
+  commitProgressiveSegment(points: StrokePoint[]): void {
+    if (points.length > 0) {
+      this.drawToIsolated(points);
+      this.compositeRenderer.bakeMax(this.isolatedTexture, this.committedTexture);
     }
     this.currentStroke = [];
   }

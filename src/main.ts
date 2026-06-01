@@ -266,7 +266,8 @@ class PhotonMixerApp {
     const newSegment = allStroke.slice(startIdx);
 
     if (newSegment.length > 0) {
-      this.renderPipeline?.commitStroke(newSegment);
+      // progressive モード専用コミット（max blend でα蓄積なし）
+      this.renderPipeline?.commitProgressiveSegment(newSegment);
       this.progressiveLastInterpCount = allStroke.length;
     }
   }
