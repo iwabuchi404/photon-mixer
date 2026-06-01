@@ -312,11 +312,183 @@ private handlePenInput(event) {
 
 ---
 
+# Step 2: 実用性向上（追加実装）
+
+Step 1（3-A〜3-E）完了後に追加する、日常的な使用に効く機能群。
+本筋の Block 4 以降に進む前に、ツールとして最低限「使える」状態にする。
+
+## S2-A: PNG 書き出し（最優先）
+
+### 目的
+描いた成果物をファイルとして保存できるようにする。現状は保存手段がない。
+
+### 設計
+`committedTexture`（rgba16float・プリマルチプライドα・リニア）を CPU に読み出し、
+sRGB 変換して 8bit PNG として保存する。Block 6 のエクスポート機能の先取り。
+
+```
+committedTexture (rgba16float, linear, premultiplied)
+  → requestCommittedSnapshot() で Uint16Array 取得
+  → 各ピクセル: アンプリマルチプライド → linearToSrgb → 0-255
+  → 紙背景(不透明)と合成するか、透明背景のまま出すか選択
+  → PNG エンコード
+```
+
+### 実装
+
+**`src/io/png-export.ts`（新規）**
+```typescript
+// committed スナップショットを sRGB 8bit RGBA に変換
+export function snapshotToSrgbRgba(
+  data: Uint16Array, width: number, height: number, bytesPerRow: number,
+): Uint8ClampedArray {
+  // float16→float32, アンプリマルチプライド, linearToSrgb, 0-255 量子化
+}
+
+// Uint8 RGBA → PNG Blob（OffscreenCanvas 経由）
+export async function encodePng(
+  rgba: Uint8ClampedArray, width: number, height: number,
+): Promise<Blob> {
+  const canvas = new OffscreenCanvas(width, height);
+  const ctx = canvas.getContext('2d')!;
+  ctx.putImageData(new ImageData(rgba, width, height), 0, 0);
+  return canvas.convertToBlob({ type: 'image/png' });
+}
+```
+
+**保存ダイアログ**
+- Electron: `electron/main.ts` に `dialog:save` IPC を追加、preload で公開
+- Blob → ArrayBuffer → `fs.writeFile`
+- 簡易版としてまず `<a download>` によるブラウザ保存でも可
+
+### 注意点
+- committed の bytesPerRow は 256 アラインなので行ごとに詰め直す
+- 透明部分の扱い: デフォルトは透明 PNG。紙背景込みで出すオプションは後で
+- 量子化前に必ずアンプリマルチプライド（premult のまま sRGB 変換すると暗くなる）
+
+### 完了条件
+- [ ] 描いた内容が PNG として保存できる
+- [ ] 保存した PNG の色が画面表示と一致する（sRGB 変換が正しい）
+- [ ] 半透明部分のα が正しく保存される
+
+---
+
+## S2-B: ブラシサイズ数値入力
+
+### 目的
+スライダーだけでは微調整しづらい。数値直接入力と増減ショートカットを追加。
+
+### 実装
+**`index.html`**: サイズ表示の `<span>` を `<input type="number">` に変更、
+または隣に数値入力を併設。スライダーと双方向同期。
+
+```html
+<input type="range" id="brush-size" min="1" max="100" value="20">
+<input type="number" id="brush-size-num" min="1" max="500" value="20">
+```
+
+**`src/main.ts`**: 双方向同期 + キーボードショートカット
+```typescript
+// [ でサイズダウン、] でサイズアップ
+if (e.key === '[') this.adjustBrushSize(-2);
+if (e.key === ']') this.adjustBrushSize(+2);
+
+private adjustBrushSize(delta: number): void {
+  const next = Math.max(1, Math.min(500, currentMaxSize + delta));
+  // slider/number/strokeManager を更新
+}
+```
+
+- 数値入力はスライダー上限(100)を超える値（〜500px）も許容
+- サイズ変更時の baseSize 連動は既存ロジックを流用
+
+### 完了条件
+- [ ] 数値入力でブラシサイズを直接指定できる
+- [ ] スライダーと数値が同期する
+- [ ] `[` `]` でサイズが増減する
+
+---
+
+## S2-C: キャンバス回転
+
+### 目的
+線の引きやすい角度に画面を回せるようにする（手の自然な動きに合わせる）。
+
+### 設計
+`Viewport` に回転角 `rotation`（ラジアン）を追加。
+スクリーン⇔キャンバス変換に回転を組み込む。表示の合成シェーダー（`vs_display`）にも回転を渡す。
+
+```
+変換順: キャンバス座標 → 回転 → スケール → オフセット → スクリーン座標
+逆変換（ペン入力 toCanvas）も回転の逆行列を適用
+```
+
+### 実装
+
+**`src/viewport.ts`**
+```typescript
+private rotation = 0; // ラジアン
+
+rotate(deltaRad: number, pivotX: number, pivotY: number): void {
+  // pivot 中心に回転（オフセットも更新して pivot を固定）
+}
+
+toCanvas(sx: number, sy: number): { x: number; y: number } {
+  // 逆オフセット → 逆スケール → 逆回転
+}
+
+getTransform() { return { scale, offsetX, offsetY, rotation }; }
+```
+
+**`shaders/composite.wgsl`** `vs_display`
+```wgsl
+// canvas_pos に回転行列を適用してから scale/offset
+let cosR = cos(viewport.rotation);
+let sinR = sin(viewport.rotation);
+let rx = c_pos.x * cosR - c_pos.y * sinR;
+let ry = c_pos.x * sinR + c_pos.y * cosR;
+// 以降 rx, ry に scale/offset
+```
+→ ViewportUniforms に `rotation: f32` を追加（padding 調整）
+
+**`src/main.ts`**: 操作割り当て
+- 数字キー（例: `R` で15度回転 / `Shift+R` で逆 / `R` 長押しでリセット等）
+- または回転ジェスチャ（後回し可）
+
+### 注意点
+- ペン入力座標の逆変換に回転を必ず含める（ズレ防止）
+- 紙背景・枠も同じ変換なので `fs_paper` 側は変更不要（vs_display 経由）
+- 回転リセット手段を用意する
+
+### 完了条件
+- [ ] キャンバスを任意角度に回転できる
+- [ ] 回転中もペン入力位置が正確（座標逆変換が正しい）
+- [ ] 回転をリセットできる
+
+---
+
+## Step 2 実装順序
+
+```
+S2-A（PNG書き出し）→ S2-B（サイズ数値入力）→ S2-C（キャンバス回転）
+```
+
+S2-A が最優先（成果物保存）。S2-B は小規模。S2-C は Viewport とシェーダー両方に触れるため最後。
+
+---
+
 ## 完了条件
 
-- [ ] Ctrl+Z で最後のストロークが取り消される
-- [ ] Ctrl+Y で Redo できる
-- [ ] ホイールでズームイン/アウトできる
-- [ ] スペース+ドラッグでパンできる
-- [ ] 消しゴムで描いた部分が消える
+### Step 1
+- [x] Ctrl+Z で最後のストロークが取り消される
+- [x] Ctrl+Y で Redo できる
+- [x] ホイールでズームイン/アウトできる
+- [x] スペース+ドラッグでパンできる
+- [x] 消しゴムで描いた部分が消える
 - [ ] キャンバスサイズを設定して新規作成できる
+- [x] （追加）スポイト・バケツツール
+
+### Step 2
+- [ ] PNG として書き出せる（S2-A）
+- [ ] ブラシサイズの数値入力・`[` `]` 増減（S2-B）
+- [ ] キャンバス回転（S2-C）
