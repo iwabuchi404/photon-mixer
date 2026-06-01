@@ -72,7 +72,8 @@ export class RenderPipeline {
     return this.renderer.device.createTexture({
       size: [width, height],
       format: BUFFER_FORMAT,
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      // COPY_SRC: requestCommittedSnapshot() の copyTextureToBuffer に必要
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
     });
   }
 
