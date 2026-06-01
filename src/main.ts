@@ -12,6 +12,7 @@ import { PerfMonitor } from './ui/perf-monitor.js';
 import { srgbToLinear } from './color/linear.js';
 import { linearToOklab, oklabToLinear, mixOklab } from './color/oklab.js';
 import type { LinearColor } from './color/types.js';
+import type { StrokePoint } from './pen/stroke.js';
 import type { BrushMixMode } from './render/brush.js';
 
 // Float16（Uint16 表現）→ Float32 変換
@@ -67,11 +68,8 @@ class PhotonMixerApp {
 
   private rawPoints: import('./pen/input.js').PointerPoint[] = [];
 
-  // 引きずり混色（progressive）用
-  private brushHeadColor: LinearColor | null = null;
+  // 引きずり混色（progressive）用: pen-down 時の committed スナップショット
   private committedSnapshot: { data: Uint16Array; bytesPerRow: number } | null = null;
-  // move ごとにコミット済みの補間点数を追跡（スタンプの重複防止）
-  private progressiveLastInterpCount = 0;
 
   constructor() {
     this.stabilizer = new Stabilizer({ threshold: 1000, minAlpha: 0.3 });
@@ -125,13 +123,10 @@ class PhotonMixerApp {
       case 'down': {
         this.state.isDrawing = true;
         this.rawPoints = [point];
-        this.progressiveLastInterpCount = 0;
 
         if (this.isProgressiveMixing()) {
-          // 蓄積バッファをクリアして新しいストロークを開始
-          this.renderPipeline?.beginProgressiveStroke();
-          // 筆先色を初期化してスナップショットを非同期取得
-          this.brushHeadColor = { ...this.state.currentColor };
+          // 点ごとの色を使うモードに切り替えてスナップショットを非同期取得
+          this.renderPipeline?.updateBrushConfig({ usePointColor: true });
           this.committedSnapshot = null;
           this.renderPipeline?.requestCommittedSnapshot().then(snap => {
             this.committedSnapshot = snap;
@@ -144,8 +139,8 @@ class PhotonMixerApp {
         if (!this.state.isDrawing) return;
         this.rawPoints.push(point);
 
-        if (this.isProgressiveMixing() && this.brushHeadColor !== null) {
-          this.handleProgressiveMove(point.x, point.y);
+        if (this.isProgressiveMixing()) {
+          this.handleProgressiveMove();
         } else {
           this.handleStampMove();
         }
@@ -158,13 +153,14 @@ class PhotonMixerApp {
       case 'up': {
         if (!this.state.isDrawing) return;
 
-        if (this.isProgressiveMixing() && this.brushHeadColor !== null) {
-          // 残った末端点をコミット
-          this.commitProgressiveSegment();
-          // 蓄積したストロークを committed へ over blend で確定（別ストロークと正しく合成）
-          this.renderPipeline?.finishProgressiveStroke();
-          // ブラシ色を元に戻す
-          this.renderPipeline?.updateBrushConfig({ color: { ...this.state.currentColor } });
+        if (this.isProgressiveMixing()) {
+          // 色付きの全点を over blend で committed へ確定（別ストロークと正しく合成）
+          const colored = this.buildColoredStroke();
+          if (colored.length > 0) {
+            this.renderPipeline?.commitStroke(colored);
+          }
+          // 点ごとの色モードを解除
+          this.renderPipeline?.updateBrushConfig({ usePointColor: false });
         } else {
           const stabilized = this.stabilizer.stabilizeBatch(this.rawPoints);
           const interpolated = this.interpolator.interpolate(stabilized);
@@ -174,9 +170,7 @@ class PhotonMixerApp {
           }
         }
 
-        this.brushHeadColor = null;
         this.committedSnapshot = null;
-        this.progressiveLastInterpCount = 0;
         this.state.isDrawing = false;
         this.rawPoints = [];
         break;
@@ -186,95 +180,67 @@ class PhotonMixerApp {
 
   /**
    * 引きずり混色の move 処理
-   * ① brushHeadColor を進化させる
-   * ② 新しい補間点のみ即座にコミット（焼き付け）
-   * → 各点が描かれた瞬間の brushHeadColor で記録される
+   * ストローク全体を色付きで再構築してライブプレビュー（isolated に毎フレーム描画）
    */
-  private handleProgressiveMove(x: number, y: number): void {
-    // ① brushHeadColor を進化させて GPU に送る
-    this.evolveProgressiveMixing(x, y);
-
-    // ② 新しい補間点をコミット
-    this.commitProgressiveSegment();
-
-    // committed が最新なのでライブプレビューは不要
-    this.renderPipeline?.setCurrentStroke([]);
-    this.perfMonitor.setPoints(this.progressiveLastInterpCount);
+  private handleProgressiveMove(): void {
+    const colored = this.buildColoredStroke();
+    this.renderPipeline?.setCurrentStroke(colored);
+    this.perfMonitor.setPoints(colored.length);
   }
 
   /**
-   * brushHeadColor を現在座標のキャンバス色と混合して進化させる
+   * ストローク全体を補間し、各点に「引きずり混色」の色を焼き込んで返す
    *
-   * 処理順:
-   *   1. 减衰: brushHeadColor を元の色に向けて少しずつ戻す（引きずりすぎ防止）
-   *   2. 混色: キャンバスに既存色があれば Oklab 空間で混ぜる
+   * 各点ごとに筆先色(head)を進化させる:
+   *   1. 減衰: 直前点からの距離に応じて元のブラシ色へ指数的に戻す（引きずりすぎ防止）
+   *   2. 混色: スナップショットの既存色を Oklab 空間で拾って混ぜる
+   * 点ごとに色を持たせるため、セグメント継ぎ目も色の階段も生じない
    */
-  private evolveProgressiveMixing(x: number, y: number): void {
-    if (!this.brushHeadColor) return;
+  private buildColoredStroke(): StrokePoint[] {
+    const stabilized = this.stabilizer.stabilizeBatch(this.rawPoints);
+    const interpolated = this.interpolator.interpolate(stabilized);
+    const stroke = this.strokeManager.finalizeStroke(interpolated);
+    if (stroke.length === 0) return stroke;
 
-    // ① 减衰: ストロークが進むにつれ元の色に戻る（距離依存ではなくstep依存の近似）
-    // DECAY_RATE = 1ステップあたり元の色に向かう割合（0=减衰なし、1=即戻る）
-    const DECAY_RATE = 0.06;
-    const headOklab = linearToOklab(this.brushHeadColor);
-    const origOklab = linearToOklab(this.state.currentColor);
-    const decayedOklab = mixOklab(headOklab, origOklab, DECAY_RATE);
-    const decayed = oklabToLinear(decayedOklab);
-    this.brushHeadColor = { ...decayed, a: this.state.currentColor.a };
+    const orig = this.state.currentColor;
+    const snap = this.committedSnapshot;
+    const canvas = this.renderer!.canvas;
 
-    // ② キャンバスの色を拾って混ぜる
-    if (this.committedSnapshot) {
-      const canvas = this.renderer!.canvas;
-      const canvasColor = sampleSnapshot(
-        this.committedSnapshot.data, x, y,
-        canvas.width, canvas.height,
-        this.committedSnapshot.bytesPerRow,
-      );
+    // 拾った色が e-fold で薄れる距離（px）。大きいほど長く引きずる
+    const DECAY_LEN = 40;
 
-      if (canvasColor.a > 0.001) {
-        const brushOklab  = linearToOklab(this.brushHeadColor);
-        const canvasLinear: LinearColor = {
-          r: canvasColor.r / canvasColor.a,
-          g: canvasColor.g / canvasColor.a,
-          b: canvasColor.b / canvasColor.a,
-          a: 1,
-        };
-        const canvasOklab = linearToOklab(canvasLinear);
-        const t = this.state.wetRatio * canvasColor.a;
-        const mixed = mixOklab(brushOklab, canvasOklab, t);
-        const mixedLinear = oklabToLinear(mixed);
-        this.brushHeadColor = {
-          r: mixedLinear.r,
-          g: mixedLinear.g,
-          b: mixedLinear.b,
-          a: this.state.currentColor.a,
-        };
+    let head: LinearColor = { ...orig };
+    let prevX = stroke[0].x;
+    let prevY = stroke[0].y;
+
+    for (const p of stroke) {
+      // ① 減衰（距離ベース・解像度非依存）
+      const dx = p.x - prevX, dy = p.y - prevY;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      prevX = p.x; prevY = p.y;
+      const decayT = 1 - Math.exp(-dist / DECAY_LEN);
+      if (decayT > 0) {
+        const mixed = mixOklab(linearToOklab(head), linearToOklab(orig), decayT);
+        const lin = oklabToLinear(mixed);
+        head = { r: lin.r, g: lin.g, b: lin.b, a: orig.a };
       }
+
+      // ② 既存色を拾って混ぜる
+      if (snap) {
+        const cc = sampleSnapshot(snap.data, p.x, p.y, canvas.width, canvas.height, snap.bytesPerRow);
+        if (cc.a > 0.001) {
+          const canvasLinear: LinearColor = { r: cc.r / cc.a, g: cc.g / cc.a, b: cc.b / cc.a, a: 1 };
+          const t = this.state.wetRatio * cc.a;
+          const mixed = mixOklab(linearToOklab(head), linearToOklab(canvasLinear), t);
+          const lin = oklabToLinear(mixed);
+          head = { r: lin.r, g: lin.g, b: lin.b, a: orig.a };
+        }
+      }
+
+      p.color = { r: head.r, g: head.g, b: head.b, a: orig.a };
     }
 
-    this.renderPipeline?.updateBrushConfig({ color: { ...this.brushHeadColor } });
-  }
-
-  /**
-   * 最後のコミット以降の新しい補間点をコミットする
-   * セグメント境界の点線を防ぐため、前のセグメントの末尾2点をオーバーラップして再描画する
-   */
-  private commitProgressiveSegment(): void {
-    const stabilized   = this.stabilizer.stabilizeBatch(this.rawPoints);
-    const allInterp    = this.interpolator.interpolate(stabilized);
-    const allStroke    = this.strokeManager.finalizeStroke(allInterp);
-
-    // spacing=1 により 1px 間隔でスタンプが密になるため境界ギャップが生じない
-    // OVERLAP を設けると混色中に brushHeadColor が変わった箇所で
-    // 前の色と新しい色の max blend により明るいスポットが出るため 0 にする
-    const OVERLAP = 0;
-    const startIdx   = Math.max(0, this.progressiveLastInterpCount - OVERLAP);
-    const newSegment = allStroke.slice(startIdx);
-
-    if (newSegment.length > 0) {
-      // progressive モード専用コミット（max blend でα蓄積なし）
-      this.renderPipeline?.commitProgressiveSegment(newSegment);
-      this.progressiveLastInterpCount = allStroke.length;
-    }
+    return stroke;
   }
 
   /**

@@ -10,6 +10,8 @@ import type { PointerPoint } from './input.js';
  */
 export interface StrokePoint extends PointerPoint {
   size: number; // 補正後のサイズ
+  // progressive 混色用の点ごとの色（リニア、未指定時は uniform のブラシ色を使う）
+  color?: { r: number; g: number; b: number; a: number };
 }
 
 /**

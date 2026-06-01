@@ -7,26 +7,38 @@ struct Uniforms {
   canvas_width: f32,
   canvas_height: f32,
   wet_ratio: f32,
-  use_gpu_mix: u32,  // 1=スタンプ混色(GPU), 0=引きずり混色(CPU制御)
+  use_gpu_mix: u32,      // 1=スタンプ混色(GPU), 0=引きずり混色(CPU制御)
   brush_color: vec4<f32>,
+  use_point_color: u32,  // 1=点ごとの色を使う(progressive), 0=uniform brush_color
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+}
+
+// 点ごとのデータ: data=(x, y, size, pressure), color=(r, g, b, a)
+struct Point {
+  data: vec4<f32>,
+  color: vec4<f32>,
 }
 
 struct VertexOutput {
   @builtin(position) position: vec4<f32>,
   @location(0) uv: vec2<f32>,
   @location(1) canvas_uv: vec2<f32>,
+  @location(2) point_color: vec4<f32>,
 }
 
 struct FragmentInput {
   @location(0) uv: vec2<f32>,
   @location(1) canvas_uv: vec2<f32>,
+  @location(2) point_color: vec4<f32>,
 }
 
 @group(0) @binding(0)
 var<uniform> uniforms: Uniforms;
 
 @group(0) @binding(1)
-var<storage, read> points: array<vec4<f32>>; // x, y, size, pressure
+var<storage, read> points: array<Point>;
 
 @group(0) @binding(2)
 var committed_texture: texture_2d<f32>;
@@ -67,8 +79,8 @@ fn oklab_to_linear(c: vec3f) -> vec3f {
 @vertex
 fn vertex_main(@builtin(instance_index) instance_id: u32, @builtin(vertex_index) vertex_id: u32) -> VertexOutput {
   let point = points[instance_id];
-  let center = point.xy;
-  let size = point.z;
+  let center = point.data.xy;
+  let size = point.data.z;
 
   let offsets = array<vec2<f32>, 4>(
     vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0),
@@ -86,7 +98,8 @@ fn vertex_main(@builtin(instance_index) instance_id: u32, @builtin(vertex_index)
   output.uv = offsets[vertex_id];
   // キャンバス座標系 UV (0-1)
   output.canvas_uv = vec2<f32>(pos.x / uniforms.canvas_width, pos.y / uniforms.canvas_height);
-  
+  output.point_color = point.color;
+
   return output;
 }
 
@@ -97,12 +110,18 @@ fn fragment_main(input: FragmentInput) -> @location(0) vec4<f32> {
     return vec4<f32>(0.0, 0.0, 0.0, 0.0);
   }
 
-  let stamp_alpha = uniforms.brush_color.a * (1.0 - smoothstep(0.8, 1.0, dist));
+  // 点ごとの色（progressive）か uniform のブラシ色（stamp）かを選ぶ
+  var base_color = uniforms.brush_color;
+  if (uniforms.use_point_color != 0u) {
+    base_color = input.point_color;
+  }
 
-  var target_color = uniforms.brush_color.rgb;
+  let stamp_alpha = base_color.a * (1.0 - smoothstep(0.8, 1.0, dist));
+
+  var target_color = base_color.rgb;
 
   // スタンプ混色モード（GPU側処理）
-  // 引きずり混色モードでは brush_color が CPU 側で更新済みのためここでは何もしない
+  // 引きずり混色モードでは色が CPU 側で確定済みのためここでは何もしない
   if (uniforms.use_gpu_mix != 0u && uniforms.wet_ratio > 0.0) {
     let existing = textureSampleLevel(committed_texture, committed_sampler, input.canvas_uv, 0.0);
     if (existing.a > 0.001) {

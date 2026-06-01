@@ -31,9 +31,6 @@ export class RenderPipeline {
   private committedTexture!: GPUTexture;
   // 現在のストロークのみを描画するテクスチャ（1x, downsample先）
   private isolatedTexture!: GPUTexture;
-  // progressive モードで現在ストロークをセグメント単位で蓄積するテクスチャ
-  // ストローク内は max blend（α蓄積なし）、pen-up 時に over blend で committed へ
-  private strokeAccumTexture!: GPUTexture;
 
   private currentStroke: StrokePoint[] = [];
 
@@ -61,7 +58,6 @@ export class RenderPipeline {
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
     this.committedTexture = this.makeTexture(width, height);
-    this.strokeAccumTexture = this.makeTexture(width, height);
     this.isolatedTexture = this.renderer.device.createTexture({
       size: [width, height],
       format: BUFFER_FORMAT,
@@ -69,7 +65,6 @@ export class RenderPipeline {
     });
     // 新規テクスチャは内容が未定義のため透明でクリアする
     this.clearTextureContent(this.committedTexture);
-    this.clearTextureContent(this.strokeAccumTexture);
     this.clearTextureContent(this.isolatedTexture);
   }
 
@@ -112,35 +107,6 @@ export class RenderPipeline {
       this.compositeRenderer.bake(this.isolatedTexture, this.committedTexture);
     }
     this.currentStroke = [];
-  }
-
-  /**
-   * progressive ストローク開始時に蓄積バッファをクリアする（pen-down で呼ぶ）
-   */
-  beginProgressiveStroke(): void {
-    this.clearTextureContent(this.strokeAccumTexture);
-  }
-
-  /**
-   * progressive モードのセグメントコミット
-   * strokeAccumTexture に max blend で蓄積（同一ストローク内α蓄積なし）
-   * committed には触れないため別ストロークとの合成は pen-up まで保留される
-   */
-  commitProgressiveSegment(points: StrokePoint[]): void {
-    if (points.length > 0) {
-      this.drawToIsolated(points);
-      this.compositeRenderer.bakeMax(this.isolatedTexture, this.strokeAccumTexture);
-    }
-    this.currentStroke = [];
-  }
-
-  /**
-   * progressive ストローク確定（pen-up で呼ぶ）
-   * 蓄積したストロークを over blend で committed へ合成し、別ストロークと正しく重ねる
-   */
-  finishProgressiveStroke(): void {
-    this.compositeRenderer.bake(this.strokeAccumTexture, this.committedTexture);
-    this.clearTextureContent(this.strokeAccumTexture);
   }
 
   /**
@@ -204,9 +170,7 @@ export class RenderPipeline {
       });
       // 1. 確定済みストロークを描画
       this.compositeRenderer.draw(pass, this.committedTexture);
-      // 2. progressive 蓄積ストロークを重ねる（progressive 以外は空なので無影響）
-      this.compositeRenderer.draw(pass, this.strokeAccumTexture);
-      // 3. 現在のストローク（stamp モードのライブプレビュー）を重ねる
+      // 2. 現在のストローク（downsampled）を重ねる
       this.compositeRenderer.draw(pass, this.isolatedTexture);
       pass.end();
     }
@@ -257,7 +221,6 @@ export class RenderPipeline {
     this.committedTexture = this.makeTexture(canvas.width, canvas.height);
     // 新規テクスチャと残存ストロークを透明でクリア
     this.clearTextureContent(this.committedTexture);
-    this.clearTextureContent(this.strokeAccumTexture);
     this.clearTextureContent(this.isolatedTexture);
   }
 
@@ -268,7 +231,6 @@ export class RenderPipeline {
 
     this.brushTexture4x.destroy();
     this.committedTexture.destroy();
-    this.strokeAccumTexture.destroy();
     this.isolatedTexture.destroy();
     this.createTextures(width, height);
   }
@@ -277,7 +239,6 @@ export class RenderPipeline {
     this.brushRenderer.dispose();
     this.brushTexture4x?.destroy();
     this.committedTexture?.destroy();
-    this.strokeAccumTexture?.destroy();
     this.isolatedTexture?.destroy();
   }
 }

@@ -16,12 +16,15 @@ export interface BrushConfig {
   color: { r: number; g: number; b: number; a: number }; // リニア空間 0-1
   wetRatio: number;   // 混色率 0-1
   mixMode: BrushMixMode;
+  // 点ごとの色を使うか（progressive で点に焼いた色を使う場合 true）
+  usePointColor: boolean;
 }
 
 const DEFAULT_BRUSH_CONFIG: BrushConfig = {
   color: { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
   wetRatio: 0.0,
   mixMode: 'stamp',
+  usePointColor: false,
 };
 
 /**
@@ -50,16 +53,16 @@ export class BrushRenderer {
     this.config = { ...DEFAULT_BRUSH_CONFIG, ...config };
     this.shaderPath = shaderPath;
 
-    // Uniformバッファ作成（32 bytes）
-    // canvas_width(4) + canvas_height(4) + brush_color(16) + wet_ratio(4) + padding(4)
+    // Uniformバッファ作成（48 bytes）
+    // canvas_w(4)+canvas_h(4)+wet(4)+use_gpu_mix(4) + brush_color(16) + use_point_color(4)+pad(12)
     this.uniformBuffer = device.createBuffer({
-      size: 32,
+      size: 48,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
-    // 点バッファ作成（x, y, size, pressure）× maxPoints × 4bytes
+    // 点バッファ作成: data(x,y,size,pressure) + color(r,g,b,a) = 8 floats × maxPoints
     this.pointBuffer = device.createBuffer({
-      size: this.maxPoints * 4 * 4,
+      size: this.maxPoints * 8 * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
 
@@ -122,8 +125,8 @@ export class BrushRenderer {
    * Uniformsを更新
    */
   private updateUniforms(canvasWidth: number, canvasHeight: number): void {
-    // ArrayBuffer を float と u32 で共有して use_gpu_mix を正確に書き込む
-    const buf = new ArrayBuffer(32);
+    // ArrayBuffer を float と u32 で共有して整数フラグを正確に書き込む
+    const buf = new ArrayBuffer(48);
     const f32 = new Float32Array(buf);
     const u32 = new Uint32Array(buf);
     f32[0] = canvasWidth;
@@ -134,6 +137,7 @@ export class BrushRenderer {
     f32[5] = this.config.color.g;
     f32[6] = this.config.color.b;
     f32[7] = this.config.color.a;
+    u32[8] = this.config.usePointColor ? 1 : 0;       // use_point_color
     this.device.queue.writeBuffer(this.uniformBuffer, 0, buf);
   }
 
@@ -181,15 +185,23 @@ export class BrushRenderer {
       points = trimmedPoints;
     }
 
-    // 点バッファにデータを書き込み
-    const pointData = new Float32Array(points.length * 4);
+    // 点バッファにデータを書き込み（8 floats: data + color）
+    const c = this.config.color;
+    const pointData = new Float32Array(points.length * 8);
     for (let i = 0; i < points.length; i++) {
       const p = points[i];
+      const base = i * 8;
       // 4x サブピクセルバッファ用に座標とサイズをスケール
-      pointData[i * 4 + 0] = p.x * scale;
-      pointData[i * 4 + 1] = p.y * scale;
-      pointData[i * 4 + 2] = p.size * scale;
-      pointData[i * 4 + 3] = p.pressure;
+      pointData[base + 0] = p.x * scale;
+      pointData[base + 1] = p.y * scale;
+      pointData[base + 2] = p.size * scale;
+      pointData[base + 3] = p.pressure;
+      // 点ごとの色（未指定時はブラシ色。usePointColor=false なら shader 側で無視される）
+      const col = p.color ?? c;
+      pointData[base + 4] = col.r;
+      pointData[base + 5] = col.g;
+      pointData[base + 6] = col.b;
+      pointData[base + 7] = col.a;
     }
 
     this.device.queue.writeBuffer(this.pointBuffer, 0, pointData);

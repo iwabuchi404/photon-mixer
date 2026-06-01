@@ -8,8 +8,6 @@ export class CompositeRenderer {
   private sampler: GPUSampler;
   // ストローク間ベイク用（over blend: 別ストロークは蓄積される）
   private bakePipeline: GPURenderPipeline | null = null;
-  // progressiveモード内セグメントベイク用（max blend: 同一ストローク内で蓄積しない）
-  private bakeMaxPipeline: GPURenderPipeline | null = null;
   // 画面への表示用（canvasフォーマット）
   private displayPipeline: GPURenderPipeline | null = null;
 
@@ -42,23 +40,6 @@ export class CompositeRenderer {
 
     this.bakePipeline = makePipeline('rgba16float', 'fs_main');
     this.displayPipeline = makePipeline(canvasFormat, 'fs_display');
-
-    // max blend パイプライン（progressive モード用: α蓄積なし）
-    this.bakeMaxPipeline = this.device.createRenderPipeline({
-      layout: 'auto',
-      vertex: { module, entryPoint: 'vs_main' },
-      fragment: {
-        module, entryPoint: 'fs_main',
-        targets: [{
-          format: 'rgba16float' as GPUTextureFormat,
-          blend: {
-            color: { srcFactor: 'one', dstFactor: 'one', operation: 'max' },
-            alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'max' },
-          },
-        }],
-      },
-      primitive: { topology: 'triangle-strip' },
-    });
   }
 
   /**
@@ -84,14 +65,6 @@ export class CompositeRenderer {
    */
   bake(src: GPUTexture, dst: GPUTexture): void {
     this.runBake(src, dst, this.bakePipeline!);
-  }
-
-  /**
-   * src を dst に max blend でベイク（同一ストローク内セグメント: α蓄積なし）
-   * 半透明ブラシでセグメント境界の重複部分が明るくなる問題を防ぐ
-   */
-  bakeMax(src: GPUTexture, dst: GPUTexture): void {
-    this.runBake(src, dst, this.bakeMaxPipeline!);
   }
 
   private runBake(src: GPUTexture, dst: GPUTexture, pipeline: GPURenderPipeline): void {
