@@ -33,8 +33,7 @@ export class BrushRenderer {
   private shaderPath: string; // シェーダーファイルのパス
   private canvasSize = { width: 0, height: 0 };
 
-  // 最大点数（バッファサイズ）- 増量
-  private readonly maxPoints = 100000;
+  private readonly maxPoints = 500000;
 
   constructor(
     device: GPUDevice,
@@ -88,17 +87,11 @@ export class BrushRenderer {
         targets: [
           {
             format,
+            // プリマルチプライドαで max ブレンド
+            // 同一ストローク内でスタンプが重なってもαが蓄積しない
             blend: {
-              color: {
-                srcFactor: 'src-alpha',
-                dstFactor: 'one-minus-src-alpha',
-                operation: 'add',
-              },
-              alpha: {
-                srcFactor: 'one',
-                dstFactor: 'one-minus-src-alpha',
-                operation: 'add',
-              },
+              color: { srcFactor: 'one', dstFactor: 'one', operation: 'max' },
+              alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'max' },
             },
           },
         ],

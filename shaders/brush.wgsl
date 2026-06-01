@@ -76,7 +76,8 @@ fn fragment_main(input: FragmentInput) -> @location(0) vec4<f32> {
   }
 
   // 滑らかなエッジ（アンチエイリアス）
-  let alpha = 1.0 - smoothstep(0.8, 1.0, dist);
+  let alpha = uniforms.brush_color.a * (1.0 - smoothstep(0.8, 1.0, dist));
 
-  return vec4<f32>(uniforms.brush_color.rgb, uniforms.brush_color.a * alpha);
+  // プリマルチプライドα: max ブレンドと整合させるために rgb も α 倍して出力
+  return vec4<f32>(uniforms.brush_color.rgb * alpha, alpha);
 }
