@@ -23,6 +23,10 @@ export class RenderPipeline {
   private currentStroke: StrokePoint[] = [];
   private eraseMode = false;
 
+  // キャンバスサイズ（描画対象のサイズ）
+  private canvasWidth = 0;
+  private canvasHeight = 0;
+
   constructor(renderer: Renderer) {
     this.renderer = renderer;
     this.brushRenderer = new BrushRenderer(renderer.device);
@@ -36,12 +40,12 @@ export class RenderPipeline {
     await this.compositeRenderer.init(format);
     await this.downsampleRenderer.init();
     this.createTextures(canvas.width, canvas.height);
-    this.updateViewport(1.0, 0, 0);
+    this.updateViewport(1.0, 0, 0, 0);
   }
 
-  updateViewport(scale: number, offsetX: number, offsetY: number): void {
+  updateViewport(scale: number, offsetX: number, offsetY: number, rotation: number): void {
     const { canvas } = this.renderer;
-    this.compositeRenderer.updateViewport(scale, offsetX, offsetY, canvas.width, canvas.height, window.innerWidth, window.innerHeight);
+    this.compositeRenderer.updateViewport(scale, offsetX, offsetY, rotation, canvas.width, canvas.height, window.innerWidth, window.innerHeight);
   }
 
   setEraseMode(enabled: boolean): void {
@@ -49,6 +53,10 @@ export class RenderPipeline {
   }
 
   private createTextures(width: number, height: number): void {
+    // キャンバスサイズを保存
+    this.canvasWidth = width;
+    this.canvasHeight = height;
+
     this.brushTexture4x = this.renderer.device.createTexture({
       size: [width * 4, height * 4],
       format: BUFFER_FORMAT,
@@ -123,11 +131,13 @@ export class RenderPipeline {
   // ... (その他のメソッド)
   updateBrushConfig(config: Partial<BrushConfig>): void { this.brushRenderer.updateConfig(config); }
   async requestCommittedSnapshot() {
-    const { device, canvas } = this.renderer;
-    const bytesPerRow = Math.ceil(canvas.width * 8 / 256) * 256;
-    const staging = device.createBuffer({ size: bytesPerRow * canvas.height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const { device } = this.renderer;
+    const width = this.canvasWidth;
+    const height = this.canvasHeight;
+    const bytesPerRow = Math.ceil(width * 8 / 256) * 256;
+    const staging = device.createBuffer({ size: bytesPerRow * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const enc = device.createCommandEncoder();
-    enc.copyTextureToBuffer({ texture: this.committedTexture }, { buffer: staging, bytesPerRow }, [canvas.width, canvas.height]);
+    enc.copyTextureToBuffer({ texture: this.committedTexture }, { buffer: staging, bytesPerRow }, [width, height]);
     device.queue.submit([enc.finish()]);
     await staging.mapAsync(GPUMapMode.READ);
     const data = new Uint16Array(staging.getMappedRange().slice(0));
@@ -155,13 +165,15 @@ export class RenderPipeline {
     this.brushRenderer.updateConfig({ usePointColor: false });
   }
   updateCommittedTexture(data: Uint16Array): void {
-    const { device, canvas } = this.renderer;
-    const bytesPerRow = Math.ceil(canvas.width * 8 / 256) * 256;
+    const { device } = this.renderer;
+    const width = this.canvasWidth;
+    const height = this.canvasHeight;
+    const bytesPerRow = Math.ceil(width * 8 / 256) * 256;
     device.queue.writeTexture(
       { texture: this.committedTexture },
       data as unknown as BufferSource,
-      { bytesPerRow, rowsPerImage: canvas.height },
-      [canvas.width, canvas.height]
+      { bytesPerRow, rowsPerImage: height },
+      [width, height]
     );
   }
   clear() {
@@ -169,14 +181,117 @@ export class RenderPipeline {
     this.clearTextureContent(this.committedTexture);
     this.clearTextureContent(this.isolatedTexture);
   }
-  resize(w: number, h: number) {
-    this.renderer.canvas.width = w; this.renderer.canvas.height = h;
+
+  /**
+   * キャンバスサイズを変更（canvas.width/height は変更しない）
+   */
+  resizeCanvasSize(w: number, h: number) {
     this.brushRenderer.resize(w * 4, h * 4);
     this.brushTexture4x.destroy(); this.committedTexture.destroy(); this.isolatedTexture.destroy();
     this.createTextures(w, h);
   }
+
+  /**
+   * スクリーンサイズを変更（canvas.width/height のみ変更）
+   */
+  resizeScreenSize(w: number, h: number) {
+    this.renderer.canvas.width = w;
+    this.renderer.canvas.height = h;
+  }
+
+  /**
+   * コミット済テクスチャを PNG としてエクスポート
+   * float16 リニアデータを読み取り、sRGB 変換して Canvas 経由で PNG に変換
+   */
+  async exportToPNG(): Promise<Blob> {
+    const { device } = this.renderer;
+    const width = this.canvasWidth;
+    const height = this.canvasHeight;
+    const bytesPerRow = Math.ceil(width * 8 / 256) * 256;
+
+    // テクスチャからバッファにコピー
+    const staging = device.createBuffer({
+      size: bytesPerRow * height,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+    });
+    const encoder = device.createCommandEncoder();
+    encoder.copyTextureToBuffer(
+      { texture: this.committedTexture },
+      { buffer: staging, bytesPerRow },
+      [width, height]
+    );
+    device.queue.submit([encoder.finish()]);
+
+    await staging.mapAsync(GPUMapMode.READ);
+    const uint16Data = new Uint16Array(staging.getMappedRange().slice(0));
+    staging.unmap();
+    staging.destroy();
+
+    // 一時 Canvas に描画して sRGB PNG を生成
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = width;
+    tempCanvas.height = height;
+    const ctx = tempCanvas.getContext('2d')!;
+    const imageData = ctx.createImageData(width, height);
+
+    // Float16 → sRGB 変換
+    const uint16sPerRow = bytesPerRow / 2;
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = y * uint16sPerRow + x * 4;
+        const r = float16ToFloat32(uint16Data[idx]);
+        const g = float16ToFloat32(uint16Data[idx + 1]);
+        const b = float16ToFloat32(uint16Data[idx + 2]);
+        const a = float16ToFloat32(uint16Data[idx + 3]);
+
+        const pxIdx = (y * width + x) * 4;
+        if (a < 0.0001) {
+          imageData.data[pxIdx] = 0;
+          imageData.data[pxIdx + 1] = 0;
+          imageData.data[pxIdx + 2] = 0;
+          imageData.data[pxIdx + 3] = 0;
+        } else {
+          // プリマルチプライドαを元に戻して sRGB 変換
+          const straightR = r / a;
+          const straightG = g / a;
+          const straightB = b / a;
+          imageData.data[pxIdx] = Math.round(linearToSrgbByte(straightR));
+          imageData.data[pxIdx + 1] = Math.round(linearToSrgbByte(straightG));
+          imageData.data[pxIdx + 2] = Math.round(linearToSrgbByte(straightB));
+          imageData.data[pxIdx + 3] = Math.round(a * 255);
+        }
+      }
+    }
+
+    ctx.putImageData(imageData, 0, 0);
+
+    // Canvas を PNG Blob に変換
+    const blob = await new Promise<Blob>((resolve) => {
+      tempCanvas.toBlob((b) => resolve(b!), 'image/png');
+    });
+
+    return blob;
+  }
+
   dispose() {
     this.brushRenderer.dispose();
     this.brushTexture4x?.destroy(); this.committedTexture?.destroy(); this.isolatedTexture?.destroy();
   }
+}
+
+// Float16 → Float32 変換
+function float16ToFloat32(h: number): number {
+  const sign = (h >> 15) & 1;
+  const exp = (h >> 10) & 0x1F;
+  const frac = h & 0x3FF;
+  if (exp === 0) return (sign ? -1 : 1) * Math.pow(2, -14) * (frac / 1024);
+  if (exp === 31) return frac === 0 ? (sign ? -Infinity : Infinity) : NaN;
+  return (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + frac / 1024);
+}
+
+// リニア→sRGB 変換 (Byte)
+function linearToSrgbByte(v: number): number {
+  const c = Math.max(0, Math.min(1, v));
+  if (c <= 0.0031308) return c * 255 * 12.92;
+  return (1.055 * Math.pow(c, 1.0 / 2.4) - 0.055) * 255;
 }

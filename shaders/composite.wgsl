@@ -1,17 +1,18 @@
 /**
  * テクスチャ合成シェーダー
- * Phase 3: ビューポート変換（ズーム・パン）＋キャンバス背景・枠対応
+ * Phase 3: ビューポート変換（ズーム・パン・回転）＋キャンバス背景・枠対応
  */
 
 struct ViewportUniforms {
   scale: f32,
   offsetX: f32,
   offsetY: f32,
-  padding: f32,
+  rotation: f32,  // 回転角（ラジアン）
   canvas_width: f32,
   canvas_height: f32,
   screen_width: f32,
   screen_height: f32,
+  _padding: f32,
 }
 
 struct VertexOutput {
@@ -40,7 +41,7 @@ fn vs_bake(@builtin(vertex_index) vid: u32) -> VertexOutput {
   return out;
 }
 
-// 画面表示用頂点シェーダー（ズーム・パンを適用）
+// 画面表示用頂点シェーダー（ズーム・パン・回転を適用）
 @vertex
 fn vs_display(@builtin(vertex_index) vid: u32) -> VertexOutput {
   var canvas_pos = array<vec2f, 4>(
@@ -49,18 +50,32 @@ fn vs_display(@builtin(vertex_index) vid: u32) -> VertexOutput {
     vec2f(0.0, 0.0),
     vec2f(viewport.canvas_width, 0.0)
   );
-  
+
   var uv = array<vec2f, 4>(
     vec2f(0.0, 1.0), vec2f(1.0, 1.0),
     vec2f(0.0, 0.0), vec2f(1.0, 0.0)
   );
 
-  let c_pos = canvas_pos[vid];
-  let screen_x = c_pos.x * viewport.scale + viewport.offsetX;
-  let screen_y = c_pos.y * viewport.scale + viewport.offsetY;
-  
-  let nx = (screen_x / viewport.screen_width) * 2.0 - 1.0;
-  let ny = 1.0 - (screen_y / viewport.screen_height) * 2.0;
+  // 変換順序: キャンバス中心 → スケール → 回転 → パン
+  let c_pos = canvas_pos[vid] - vec2f(viewport.canvas_width, viewport.canvas_height) * 0.5;
+
+  // スケールを適用
+  let scaled = c_pos * viewport.scale;
+
+  // 回転を適用
+  let cos_r = cos(viewport.rotation);
+  let sin_r = sin(viewport.rotation);
+  let rotated = vec2f(
+    scaled.x * cos_r - scaled.y * sin_r,
+    scaled.x * sin_r + scaled.y * cos_r
+  );
+
+  // パンを適用（スクリーン座標系）
+  let screen_pos = rotated + vec2f(viewport.offsetX, viewport.offsetY);
+
+  // 画面中心を原点に
+  let nx = (screen_pos.x / viewport.screen_width) * 2.0 - 1.0;
+  let ny = 1.0 - (screen_pos.y / viewport.screen_height) * 2.0;
 
   var out: VertexOutput;
   out.position = vec4f(nx, ny, 0.0, 1.0);

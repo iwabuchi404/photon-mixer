@@ -118,6 +118,7 @@ class PhotonMixerApp {
     const canvas = document.getElementById('canvas') as HTMLCanvasElement;
     if (!canvas) throw new Error('Canvas element not found');
 
+    // 画面サイズに追従（キャンバスではなく描画領域）
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
 
@@ -126,20 +127,12 @@ class PhotonMixerApp {
       console.log('WebGPU initialized successfully');
     } catch (e) {
       console.error('Failed to initialize WebGPU:', e);
-      alert('WebGPUの初期化に失敗しました。ブラウザがWebGPUに対応しているか確認してください。');
+      alert('WebGPUの初期化に失敗しました。');
       return;
     }
 
     this.renderPipeline = new RenderPipeline(this.renderer);
     await this.renderPipeline.init();
-
-    // キャンバス初期配置
-    this.viewport.reset(canvas.width, canvas.height, window.innerWidth, window.innerHeight);
-    this.renderPipeline.updateViewport(
-      this.viewport.getTransform().scale,
-      this.viewport.getTransform().offsetX,
-      this.viewport.getTransform().offsetY
-    );
 
     this.penInput = new PenInputManager(canvas);
     this.penInput.onPenInput((event) => this.handlePenInput(event));
@@ -148,9 +141,39 @@ class PhotonMixerApp {
 
     this.setupControls();
     this.setupInteractions();
-    this.startRenderLoop();
+    
+    // ダイアログ表示
+    const modal = document.getElementById('new-canvas-modal')!;
+    const createBtn = document.getElementById('create-canvas-btn')!;
+    const inputW = document.getElementById('canvas-w') as HTMLInputElement;
+    const inputH = document.getElementById('canvas-h') as HTMLInputElement;
 
-    console.log('PhotonMixer initialized');
+    createBtn.addEventListener('click', () => {
+      const w = parseInt(inputW.value) || 2000;
+      const h = parseInt(inputH.value) || 2000;
+      this.createNewCanvas(w, h);
+      modal.style.display = 'none';
+      this.startRenderLoop();
+    });
+
+    console.log('PhotonMixer initialized (waiting for canvas creation)');
+  }
+
+  private createNewCanvas(width: number, height: number): void {
+    if (!this.renderPipeline) return;
+    this.renderPipeline.resizeCanvasSize(width, height);
+    this.viewport.reset(width, height, window.innerWidth, window.innerHeight);
+    const transform = this.viewport.getTransform();
+    this.renderPipeline.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation);
+    this.strokeHistory.clear();
+    this.updateZoomDisplay();
+  }
+
+  private updateZoomDisplay(): void {
+    const zoomVal = document.getElementById('zoom-val');
+    if (zoomVal) {
+      zoomVal.textContent = Math.round(this.viewport.getTransform().scale * 100).toString();
+    }
   }
 
   private isProgressiveMixing(): boolean {
@@ -248,13 +271,21 @@ class PhotonMixerApp {
   private setupInteractions(): void {
     const canvas = this.renderer!.canvas;
 
-    // ホイールズーム
+    // ホイール操作（ズーム or 回転）
     canvas.addEventListener('wheel', (e) => {
       e.preventDefault();
-      const factor = e.deltaY < 0 ? 1.1 : 0.9;
-      this.viewport.zoom(factor, e.clientX, e.clientY);
+      if (e.altKey) {
+        // Alt + ホイールで回転
+        const delta = e.deltaY > 0 ? 0.05 : -0.05; // ラジアン
+        this.viewport.rotate(delta);
+      } else {
+        // ホイールのみでズーム
+        const factor = e.deltaY < 0 ? 1.1 : 0.9;
+        this.viewport.zoom(factor, e.clientX, e.clientY);
+      }
       const transform = this.viewport.getTransform();
-      this.renderPipeline?.updateViewport(transform.scale, transform.offsetX, transform.offsetY);
+      this.renderPipeline?.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation);
+      this.updateZoomDisplay();
     }, { passive: false });
 
     // パン操作 (Space + ドラッグ)
@@ -284,6 +315,13 @@ class PhotonMixerApp {
       if (e.key === 'e') this.setTool('eraser');
       if (e.key === 'i') this.setTool('spoit');
       if (e.key === 'g') this.setTool('bucket');
+      if (e.key === 'r') {
+        // R キーで回転リセット
+        e.preventDefault();
+        this.viewport.resetRotation();
+        const transform = this.viewport.getTransform();
+        this.renderPipeline?.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation);
+      }
       if (e.key === 'Alt') {
         e.preventDefault();
         this.prevTool = this.state.currentTool;
@@ -313,7 +351,7 @@ class PhotonMixerApp {
         const dy = e.clientY - lastY;
         this.viewport.pan(dx, dy);
         const transform = this.viewport.getTransform();
-        this.renderPipeline?.updateViewport(transform.scale, transform.offsetX, transform.offsetY);
+        this.renderPipeline?.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation);
         lastX = e.clientX;
         lastY = e.clientY;
       }
@@ -332,7 +370,8 @@ class PhotonMixerApp {
   private async handleSpoit(x: number, y: number): Promise<void> {
     if (!this.renderPipeline) return;
     const snap = await this.renderPipeline.requestCommittedSnapshot();
-    const c = sampleSnapshot(snap.data, x, y, this.renderer!.canvas.width, this.renderer!.canvas.height, snap.bytesPerRow);
+    const { width, height } = this.viewport.getCanvasSize();
+    const c = sampleSnapshot(snap.data, x, y, width, height, snap.bytesPerRow);
     // committed はプリマルチプライドαなので straight color に戻す（α=0 は透明＝拾わない）
     if (c.a < 0.001) return;
     this.updateCurrentColor({ r: c.r / c.a, g: c.g / c.a, b: c.b / c.a, a: 1 });
@@ -341,10 +380,10 @@ class PhotonMixerApp {
   private updateCurrentColor(color: LinearColor): void {
     this.state.currentColor = { ...color };
     const srgb = linearColorToSrgb(color);
-    const hex = '#' + [srgb.r, srgb.g, srgb.b].map(v => 
+    const hex = '#' + [srgb.r, srgb.g, srgb.b].map(v =>
       Math.max(0, Math.min(255, Math.round(v * 255))).toString(16).padStart(2, '0')
     ).join('');
-    
+
     const colorPicker = document.getElementById('brush-color') as HTMLInputElement;
     if (colorPicker) colorPicker.value = hex;
     this.renderPipeline?.updateBrushConfig({ color });
@@ -352,13 +391,12 @@ class PhotonMixerApp {
 
   private async handleBucketFill(x: number, y: number): Promise<void> {
     if (!this.renderPipeline) return;
-    
-    const canvas = this.renderer!.canvas;
-    const { width, height } = canvas;
+
+    const { width, height } = this.viewport.getCanvasSize();
     const snap = await this.renderPipeline.requestCommittedSnapshot();
     const data = snap.data;
     const uint16sPerRow = snap.bytesPerRow / 2;
-    
+
     const ix = Math.round(x);
     const iy = Math.round(y);
     if (ix < 0 || ix >= width || iy < 0 || iy >= height) return;
@@ -532,7 +570,7 @@ class PhotonMixerApp {
     bucketBtn?.addEventListener('click', () => this.setTool('bucket'));
 
     const sizeSlider    = document.getElementById('brush-size')    as HTMLInputElement;
-    const sizeVal       = document.getElementById('brush-size-val')!;
+    const sizeNum       = document.getElementById('brush-size-num') as HTMLInputElement;
     const alphaSlider   = document.getElementById('brush-alpha')   as HTMLInputElement;
     const alphaVal      = document.getElementById('brush-alpha-val')!;
     const wetSlider     = document.getElementById('brush-wet')     as HTMLInputElement;
@@ -541,12 +579,28 @@ class PhotonMixerApp {
     const mixModeSelect = document.getElementById('mix-mode')      as HTMLSelectElement;
     const clearBtn      = document.getElementById('clear-btn')!;
 
-    sizeSlider.addEventListener('input', () => {
-      const maxSize  = parseInt(sizeSlider.value);
+    // ブラシサイズ同期ヘルパー
+    const updateBrushSize = (size: number) => {
+      const clamped = Math.max(1, Math.min(100, size));
+      sizeSlider.value = clamped.toString();
+      sizeNum.value = clamped.toString();
+      const maxSize = clamped;
       const baseSize = Math.max(1, Math.round(maxSize * 0.1));
-      sizeVal.textContent = maxSize.toString();
       this.strokeManager.updatePressureConfig({ maxSize, baseSize });
-      // spacing は 1 固定（サイズ変更で変えない。4x バッファで品質を確保）
+    };
+
+    sizeSlider.addEventListener('input', () => {
+      updateBrushSize(parseInt(sizeSlider.value));
+    });
+
+    sizeNum.addEventListener('input', () => {
+      updateBrushSize(parseInt(sizeNum.value) || 1);
+    });
+
+    sizeNum.addEventListener('change', () => {
+      // Enter やフォーカス失った時に範囲クランプ
+      const val = parseInt(sizeNum.value) || 1;
+      updateBrushSize(Math.max(1, Math.min(100, val)));
     });
 
     alphaSlider.addEventListener('input', () => {
@@ -575,6 +629,23 @@ class PhotonMixerApp {
       this.renderPipeline?.updateBrushConfig({ mixMode: this.state.mixMode });
     });
 
+    const exportPngBtn = document.getElementById('export-png-btn');
+    exportPngBtn?.addEventListener('click', async () => {
+      if (!this.renderPipeline) return;
+      try {
+        const blob = await this.renderPipeline.exportToPNG();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `photonmixer_${Date.now()}.png`;
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch (e) {
+        console.error('PNG export failed:', e);
+        alert('PNG 書き出しに失敗しました。');
+      }
+    });
+
     clearBtn.addEventListener('click', () => {
       this.renderPipeline?.clear();
       this.strokeHistory.clear();
@@ -584,10 +655,12 @@ class PhotonMixerApp {
   private handleResize(): void {
     const canvas = document.getElementById('canvas') as HTMLCanvasElement;
     if (!canvas || !this.renderPipeline) return;
-    this.renderPipeline.resize(window.innerWidth, window.innerHeight);
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+    this.renderPipeline.resizeScreenSize(window.innerWidth, window.innerHeight);
     // リサイズ後もビューポートを更新
     const transform = this.viewport.getTransform();
-    this.renderPipeline.updateViewport(transform.scale, transform.offsetX, transform.offsetY);
+    this.renderPipeline.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation);
   }
 
   private startRenderLoop(): void {

@@ -19,7 +19,8 @@ export class CompositeRenderer {
   constructor(device: GPUDevice) {
     this.device = device;
     this.sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
-    this.uniformBuffer = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    // scale, offsetX, offsetY, rotation, cw, ch, sw, sh (9 floats = 36 bytes)
+    this.uniformBuffer = device.createBuffer({ size: 36, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.dummyTexture = this.device.createTexture({ size: [1, 1], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING });
 
     this.bindGroupLayout = this.device.createBindGroupLayout({
@@ -66,8 +67,8 @@ export class CompositeRenderer {
     this.paperPipeline = make(canvasFormat, 'vs_display', 'fs_paper'); 
   }
 
-  updateViewport(scale: number, offsetX: number, offsetY: number, cw: number, ch: number, sw: number, sh: number): void {
-    const data = new Float32Array([scale, offsetX, offsetY, 0, cw, ch, sw, sh]);
+  updateViewport(scale: number, offsetX: number, offsetY: number, rotation: number, cw: number, ch: number, sw: number, sh: number): void {
+    const data = new Float32Array([scale, offsetX, offsetY, rotation, cw, ch, sw, sh, 0]);
     this.device.queue.writeBuffer(this.uniformBuffer, 0, data);
   }
 
