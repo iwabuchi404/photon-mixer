@@ -128,6 +128,8 @@ class PhotonMixerApp {
         this.progressiveLastInterpCount = 0;
 
         if (this.isProgressiveMixing()) {
+          // 蓄積バッファをクリアして新しいストロークを開始
+          this.renderPipeline?.beginProgressiveStroke();
           // 筆先色を初期化してスナップショットを非同期取得
           this.brushHeadColor = { ...this.state.currentColor };
           this.committedSnapshot = null;
@@ -159,6 +161,8 @@ class PhotonMixerApp {
         if (this.isProgressiveMixing() && this.brushHeadColor !== null) {
           // 残った末端点をコミット
           this.commitProgressiveSegment();
+          // 蓄積したストロークを committed へ over blend で確定（別ストロークと正しく合成）
+          this.renderPipeline?.finishProgressiveStroke();
           // ブラシ色を元に戻す
           this.renderPipeline?.updateBrushConfig({ color: { ...this.state.currentColor } });
         } else {
