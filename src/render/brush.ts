@@ -147,6 +147,7 @@ export class BrushRenderer {
   renderStroke(
     renderPass: GPURenderPassEncoder,
     points: StrokePoint[],
+    scale = 1.0,
   ): void {
     if (points.length === 0) return;
 
@@ -166,9 +167,10 @@ export class BrushRenderer {
     const pointData = new Float32Array(points.length * 4);
     for (let i = 0; i < points.length; i++) {
       const p = points[i];
-      pointData[i * 4 + 0] = p.x;
-      pointData[i * 4 + 1] = p.y;
-      pointData[i * 4 + 2] = p.size;
+      // 4x サブピクセルバッファ用に座標とサイズをスケール
+      pointData[i * 4 + 0] = p.x * scale;
+      pointData[i * 4 + 1] = p.y * scale;
+      pointData[i * 4 + 2] = p.size * scale;
       pointData[i * 4 + 3] = p.pressure;
     }
 

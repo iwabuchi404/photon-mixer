@@ -30,7 +30,7 @@ class PhotonMixerApp {
 
   constructor() {
     this.stabilizer = new Stabilizer({ threshold: 1000, minAlpha: 0.3 });
-    this.interpolator = new Interpolator({ spacing: 1, speedThreshold: 2000 });
+    this.interpolator = new Interpolator({ spacing: 4, speedThreshold: 2000 });
     this.strokeManager = new StrokeManager({ baseSize: 2, maxSize: 20, curve: 'smooth' });
     this.perfMonitor = new PerfMonitor();
   }
@@ -125,6 +125,8 @@ class PhotonMixerApp {
       const baseSize = Math.max(1, Math.round(maxSize * 0.1));
       sizeVal.textContent = maxSize.toString();
       this.strokeManager.updatePressureConfig({ maxSize, baseSize });
+      // spacing も更新 (maxSize の 20% を目安にする)
+      this.interpolator.updateConfig({ spacing: Math.max(1, Math.round(maxSize * 0.2)) });
     });
 
     alphaSlider.addEventListener('input', () => {

@@ -28,7 +28,9 @@ export async function initGPUDevice(canvas: HTMLCanvasElement): Promise<GPUDevic
   }
 
   // デバイス取得
-  const device = await adapter.requestDevice();
+  const device = await adapter.requestDevice({
+    requiredFeatures: ['float32-filterable'],
+  });
 
   if (!device) {
     throw new Error('Failed to get GPU device');
