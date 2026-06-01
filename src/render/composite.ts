@@ -1,21 +1,33 @@
 /**
  * テクスチャ合成レンダラー
- * プリマルチプライドαテクスチャをフルスクリーン四角形で描画・合成する
  */
 
 export class CompositeRenderer {
   private device: GPUDevice;
   private sampler: GPUSampler;
-  // ストローク間ベイク用（over blend: 別ストロークは蓄積される）
+  private uniformBuffer: GPUBuffer;
+  private bindGroupLayout: GPUBindGroupLayout;
+  
   private bakePipeline: GPURenderPipeline | null = null;
-  // 画面への表示用（canvasフォーマット）
+  private eraseBakePipeline: GPURenderPipeline | null = null;
   private displayPipeline: GPURenderPipeline | null = null;
+  private eraseDisplayPipeline: GPURenderPipeline | null = null;
+  private paperPipeline: GPURenderPipeline | null = null;
+  
+  private dummyTexture: GPUTexture;
 
   constructor(device: GPUDevice) {
     this.device = device;
-    this.sampler = device.createSampler({
-      magFilter: 'linear',
-      minFilter: 'linear',
+    this.sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+    this.uniformBuffer = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.dummyTexture = this.device.createTexture({ size: [1, 1], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING });
+
+    this.bindGroupLayout = this.device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        { binding: 2, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+      ],
     });
   }
 
@@ -24,35 +36,49 @@ export class CompositeRenderer {
     if (!response.ok) throw new Error('Failed to load composite.wgsl');
     const module = this.device.createShaderModule({ code: await response.text() });
 
-    // プリマルチプライドαの over 合成
-    const blendState: GPUBlendState = {
+    const pipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [this.bindGroupLayout] });
+
+    // 通常合成 (Over blend)
+    const overBlend: GPUBlendState = {
       color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
       alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
     };
 
-    const makePipeline = (format: GPUTextureFormat, entryPoint: string): GPURenderPipeline =>
+    // 消しゴム合成 (Erase blend)
+    // 描画先のアルファを削る: dst = dst * (1 - src_alpha)
+    const eraseBlend: GPUBlendState = {
+      color: { srcFactor: 'zero', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+      alpha: { srcFactor: 'zero', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+    };
+
+    const make = (format: GPUTextureFormat, vs: string, fs: string, blend?: GPUBlendState) =>
       this.device.createRenderPipeline({
-        layout: 'auto',
-        vertex: { module, entryPoint: 'vs_main' },
-        fragment: { module, entryPoint, targets: [{ format, blend: blendState }] },
+        layout: pipelineLayout,
+        vertex: { module, entryPoint: vs },
+        fragment: { module, entryPoint: fs, targets: [{ format, blend }] },
         primitive: { topology: 'triangle-strip' },
       });
 
-    this.bakePipeline = makePipeline('rgba16float', 'fs_main');
-    this.displayPipeline = makePipeline(canvasFormat, 'fs_display');
+    this.bakePipeline = make('rgba16float', 'vs_bake', 'fs_main', overBlend);
+    this.eraseBakePipeline = make('rgba16float', 'vs_bake', 'fs_main', eraseBlend);
+    this.displayPipeline = make(canvasFormat, 'vs_display', 'fs_display', overBlend);
+    this.eraseDisplayPipeline = make(canvasFormat, 'vs_display', 'fs_display', eraseBlend);
+    this.paperPipeline = make(canvasFormat, 'vs_display', 'fs_paper'); 
   }
 
-  /**
-   * テクスチャをレンダーパスに描画
-   * @param bake true のとき rgba16float ターゲット（committed への書き込み用）
-   */
-  draw(pass: GPURenderPassEncoder, texture: GPUTexture, bake = false): void {
-    const pipeline = bake ? this.bakePipeline! : this.displayPipeline!;
+  updateViewport(scale: number, offsetX: number, offsetY: number, cw: number, ch: number, sw: number, sh: number): void {
+    const data = new Float32Array([scale, offsetX, offsetY, 0, cw, ch, sw, sh]);
+    this.device.queue.writeBuffer(this.uniformBuffer, 0, data);
+  }
+
+  draw(pass: GPURenderPassEncoder, texture: GPUTexture, eraseMode = false): void {
+    const pipeline = eraseMode ? this.eraseDisplayPipeline! : this.displayPipeline!;
     const bindGroup = this.device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
+      layout: this.bindGroupLayout,
       entries: [
         { binding: 0, resource: texture.createView() },
         { binding: 1, resource: this.sampler },
+        { binding: 2, resource: { buffer: this.uniformBuffer } },
       ],
     });
     pass.setPipeline(pipeline);
@@ -60,27 +86,33 @@ export class CompositeRenderer {
     pass.draw(4);
   }
 
-  /**
-   * src を dst に over blend でベイク（ストローク間: α蓄積あり）
-   */
-  bake(src: GPUTexture, dst: GPUTexture): void {
-    this.runBake(src, dst, this.bakePipeline!);
+  drawPaper(pass: GPURenderPassEncoder): void {
+    if (!this.paperPipeline) return;
+    const bindGroup = this.device.createBindGroup({
+      layout: this.bindGroupLayout,
+      entries: [
+        { binding: 0, resource: this.dummyTexture.createView() },
+        { binding: 1, resource: this.sampler },
+        { binding: 2, resource: { buffer: this.uniformBuffer } },
+      ],
+    });
+    pass.setPipeline(this.paperPipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(4);
   }
 
-  private runBake(src: GPUTexture, dst: GPUTexture, pipeline: GPURenderPipeline): void {
+  bake(src: GPUTexture, dst: GPUTexture, eraseMode = false): void {
     const encoder = this.device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view: dst.createView(),
-        loadOp: 'load',
-        storeOp: 'store',
-      }],
+      colorAttachments: [{ view: dst.createView(), loadOp: 'load', storeOp: 'store' }],
     });
+    const pipeline = eraseMode ? this.eraseBakePipeline! : this.bakePipeline!;
     const bindGroup = this.device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
+      layout: this.bindGroupLayout,
       entries: [
         { binding: 0, resource: src.createView() },
         { binding: 1, resource: this.sampler },
+        { binding: 2, resource: { buffer: this.uniformBuffer } },
       ],
     });
     pass.setPipeline(pipeline);

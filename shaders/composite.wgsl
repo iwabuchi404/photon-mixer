@@ -1,15 +1,31 @@
 /**
  * テクスチャ合成シェーダー
- * Phase 2: リニア -> sRGB 表示変換対応
+ * Phase 3: ビューポート変換（ズーム・パン）＋キャンバス背景・枠対応
  */
+
+struct ViewportUniforms {
+  scale: f32,
+  offsetX: f32,
+  offsetY: f32,
+  padding: f32,
+  canvas_width: f32,
+  canvas_height: f32,
+  screen_width: f32,
+  screen_height: f32,
+}
 
 struct VertexOutput {
   @builtin(position) position: vec4f,
   @location(0) uv: vec2f,
 }
 
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var<uniform> viewport: ViewportUniforms;
+
+// 通常のベイク用頂点シェーダー（テクスチャ全体をカバー）
 @vertex
-fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
+fn vs_bake(@builtin(vertex_index) vid: u32) -> VertexOutput {
   var pos = array<vec2f, 4>(
     vec2f(-1.0, -1.0), vec2f( 1.0, -1.0),
     vec2f(-1.0,  1.0), vec2f( 1.0,  1.0)
@@ -24,8 +40,33 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
   return out;
 }
 
-@group(0) @binding(0) var tex: texture_2d<f32>;
-@group(0) @binding(1) var samp: sampler;
+// 画面表示用頂点シェーダー（ズーム・パンを適用）
+@vertex
+fn vs_display(@builtin(vertex_index) vid: u32) -> VertexOutput {
+  var canvas_pos = array<vec2f, 4>(
+    vec2f(0.0, viewport.canvas_height),
+    vec2f(viewport.canvas_width, viewport.canvas_height),
+    vec2f(0.0, 0.0),
+    vec2f(viewport.canvas_width, 0.0)
+  );
+  
+  var uv = array<vec2f, 4>(
+    vec2f(0.0, 1.0), vec2f(1.0, 1.0),
+    vec2f(0.0, 0.0), vec2f(1.0, 0.0)
+  );
+
+  let c_pos = canvas_pos[vid];
+  let screen_x = c_pos.x * viewport.scale + viewport.offsetX;
+  let screen_y = c_pos.y * viewport.scale + viewport.offsetY;
+  
+  let nx = (screen_x / viewport.screen_width) * 2.0 - 1.0;
+  let ny = 1.0 - (screen_y / viewport.screen_height) * 2.0;
+
+  var out: VertexOutput;
+  out.position = vec4f(nx, ny, 0.0, 1.0);
+  out.uv = uv[vid];
+  return out;
+}
 
 // --- 表示変換 (リニア -> sRGB 近似) ---
 fn linear_to_srgb(v: f32) -> f32 {
@@ -41,8 +82,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
 }
 
 // sRGB 変換して出力 (画面表示用)
-// テクスチャはプリマルチプライドα（r=R*α）で保存されているため
-// アンプリマルチプライド → sRGB 変換 → 再プリマルチプライドの順で処理する
 @fragment
 fn fs_display(in: VertexOutput) -> @location(0) vec4f {
   let linear = textureSample(tex, samp, in.uv);
@@ -51,4 +90,19 @@ fn fs_display(in: VertexOutput) -> @location(0) vec4f {
   let rgb = linear.rgb / a;
   let srgb = vec3f(linear_to_srgb(rgb.r), linear_to_srgb(rgb.g), linear_to_srgb(rgb.b));
   return vec4f(srgb * a, a);
+}
+
+// キャンバスの背景（紙）と枠を描画
+@fragment
+fn fs_paper(in: VertexOutput) -> @location(0) vec4f {
+  // 枠線の太さ (1px 相当を UV 空間に変換)
+  let border_x = 1.5 / viewport.canvas_width;
+  let border_y = 1.5 / viewport.canvas_height;
+  
+  // 枠線判定
+  if (in.uv.x < border_x || in.uv.x > 1.0 - border_x || in.uv.y < border_y || in.uv.y > 1.0 - border_y) {
+    return vec4f(0.3, 0.3, 0.3, 1.0); // 枠線の色 (ダークグレー)
+  }
+  
+  return vec4f(0.18, 0.18, 0.18, 1.0); // キャンバスの色 (背景より少し明るい)
 }

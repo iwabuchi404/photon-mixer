@@ -104,6 +104,24 @@
       background: #383838;
       color: #fff;
     }
+
+    .tool-btn {
+      flex: 1;
+      padding: 6px 0;
+      background: #2a2a2a;
+      color: #888;
+      border: 1px solid #444;
+      border-radius: 3px;
+      cursor: pointer;
+      font-family: monospace;
+      font-size: 11px;
+    }
+
+    .tool-btn.active {
+      background: #0f0;
+      color: #000;
+      border-color: #0f0;
+    }
   </style>
 </head>
 <body>
@@ -114,8 +132,14 @@
   </div>
   <div id="brush-controls">
     <div class="ctrl-row">
+      <button id="tool-brush" class="tool-btn active" title="ブラシ (B)">🖌️</button>
+      <button id="tool-eraser" class="tool-btn" title="消しゴム (E)">🧹</button>
+      <button id="tool-spoit" class="tool-btn" title="スポイト (I)">🧪</button>
+      <button id="tool-bucket" class="tool-btn" title="バケツ (G)">🪣</button>
+    </div>
+    <div class="ctrl-row" style="margin-top: 10px;">
       <span class="ctrl-label">サイズ</span>
-      <input type="range" id="brush-size" min="1" max="60" value="20">
+      <input type="range" id="brush-size" min="1" max="100" value="20">
       <span id="brush-size-val" class="ctrl-val">20</span>px
     </div>
     <div class="ctrl-row">

@@ -158,43 +158,72 @@ export class StrokeManager {
 }
 
 /**
- * 複数のストロークを管理するクラス（将来的な実装用）
+ * 履歴に積む操作レコード
+ * - stroke: 通常描画 or 消しゴム（points は色を焼き込み済み）
+ * - fill  : バケツ塗り（実行直後の committed スナップショットを保持し、rebake で上書き再現）
+ */
+export type StrokeRecord =
+  | { kind: 'stroke'; points: StrokePoint[]; erase: boolean }
+  | { kind: 'fill'; snapshot: Uint16Array; bytesPerRow: number };
+
+/**
+ * Undo/Redo を管理するクラス
  */
 export class StrokeHistory {
-  private strokes: StrokePoint[][] = [];
+  private undoStack: StrokeRecord[] = [];
+  private redoStack: StrokeRecord[] = [];
+  private readonly maxUndo = 50;
 
   /**
-   * ストロークを追加
+   * 操作レコードを追加
    */
-  addStroke(stroke: StrokePoint[]): void {
-    this.strokes.push([...stroke]);
+  addRecord(record: StrokeRecord): void {
+    this.undoStack.push(record);
+    this.redoStack = []; // 新しい操作で Redo スタックをクリア
+
+    // 最大数を超えたら古いものから削除
+    if (this.undoStack.length > this.maxUndo) {
+      this.undoStack.shift();
+    }
   }
 
   /**
-   * すべてのストロークを取得
+   * すべての操作レコードを取得（rebake 用）
    */
-  getAllStrokes(): StrokePoint[][] {
-    return [...this.strokes];
+  getAllRecords(): StrokeRecord[] {
+    return [...this.undoStack];
   }
 
   /**
-   * 直前のストロークを削除（Undo）
+   * 直前の操作を取り消し（Undo）。取り消した操作を返す
    */
-  undo(): StrokePoint[] | null {
-    return this.strokes.pop() || null;
+  undo(): StrokeRecord | null {
+    const record = this.undoStack.pop();
+    if (record) this.redoStack.push(record);
+    return record ?? null;
+  }
+
+  /**
+   * 取り消した操作をやり直し（Redo）
+   */
+  redo(): StrokeRecord | null {
+    const record = this.redoStack.pop();
+    if (record) this.undoStack.push(record);
+    return record ?? null;
   }
 
   /**
    * すべてクリア
    */
   clear(): void {
-    this.strokes = [];
+    this.undoStack = [];
+    this.redoStack = [];
   }
 
   /**
-   * ストローク数を取得
+   * 操作数を取得
    */
-  getStrokeCount(): number {
-    return this.strokes.length;
+  getRecordCount(): number {
+    return this.undoStack.length;
   }
 }

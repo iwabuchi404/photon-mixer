@@ -6,16 +6,37 @@ import { initRenderer } from './core/renderer.js';
 import { PenInputManager } from './pen/input.js';
 import { Stabilizer } from './pen/stabilization.js';
 import { Interpolator } from './pen/interpolation.js';
-import { StrokeManager } from './pen/stroke.js';
+import { StrokeManager, StrokeHistory } from './pen/stroke.js';
 import { RenderPipeline } from './render/pipeline.js';
 import { PerfMonitor } from './ui/perf-monitor.js';
-import { srgbToLinear } from './color/linear.js';
+import { Viewport } from './viewport.js';
+import { srgbToLinear, linearColorToSrgb } from './color/linear.js';
 import { linearToOklab, oklabToLinear, mixOklab } from './color/oklab.js';
 import type { LinearColor } from './color/types.js';
 import type { StrokePoint } from './pen/stroke.js';
 import type { BrushMixMode } from './render/brush.js';
+import { linearToSrgb } from './color/linear.js';
+
+// Float32 → Float16 (Uint16) 変換
+function float32ToFloat16(f: number): number {
+  const buf = new ArrayBuffer(4);
+  const f32 = new Float32Array(buf);
+  const u32 = new Uint32Array(buf);
+  f32[0] = f;
+  const x = u32[0];
+  const s = (x >> 16) & 0x8000;
+  let e = ((x >> 23) & 0xFF) - (127 - 15);
+  let m = x & 0x7FFFFF;
+  if (e <= 0) {
+    if (e < -10) return s;
+    m = (m | 0x800000) >> (1 - e);
+    return s | (m >> 13);
+  } else if (e >= 31) return s | 0x7C00;
+  return s | (e << 10) | (m >> 13);
+}
 
 // Float16（Uint16 表現）→ Float32 変換
+// ... (略)
 function float16ToFloat32(h: number): number {
   const sign = (h >> 15) & 1;
   const exp  = (h >> 10) & 0x1F;
@@ -44,11 +65,15 @@ function sampleSnapshot(
   };
 }
 
+type Tool = 'brush' | 'eraser' | 'spoit' | 'bucket';
+
 interface AppState {
   isDrawing: boolean;
   currentColor: LinearColor;
   wetRatio: number;
   mixMode: BrushMixMode;
+  currentTool: Tool;
+  isPanning: boolean;
 }
 
 class PhotonMixerApp {
@@ -57,16 +82,21 @@ class PhotonMixerApp {
   private stabilizer: Stabilizer;
   private interpolator: Interpolator;
   private strokeManager: StrokeManager;
+  private strokeHistory: StrokeHistory;
   private renderPipeline: RenderPipeline | null = null;
+  private viewport: Viewport;
   private perfMonitor: PerfMonitor;
   private state: AppState = {
     isDrawing: false,
     currentColor: { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
     wetRatio: 0,
     mixMode: 'stamp',
+    currentTool: 'brush',
+    isPanning: false,
   };
 
   private rawPoints: import('./pen/input.js').PointerPoint[] = [];
+  private prevTool: Tool | null = null;
 
   // 引きずり混色（progressive）用: pen-down 時の committed スナップショット
   private committedSnapshot: { data: Uint16Array; bytesPerRow: number } | null = null;
@@ -77,6 +107,8 @@ class PhotonMixerApp {
     // 半透明ブラシで点線にならないためスタンプを密に配置する
     this.interpolator = new Interpolator({ spacing: 1, speedThreshold: 2000 });
     this.strokeManager = new StrokeManager({ baseSize: 2, maxSize: 20, curve: 'smooth' });
+    this.strokeHistory = new StrokeHistory();
+    this.viewport = new Viewport();
     this.perfMonitor = new PerfMonitor();
   }
 
@@ -101,12 +133,21 @@ class PhotonMixerApp {
     this.renderPipeline = new RenderPipeline(this.renderer);
     await this.renderPipeline.init();
 
+    // キャンバス初期配置
+    this.viewport.reset(canvas.width, canvas.height, window.innerWidth, window.innerHeight);
+    this.renderPipeline.updateViewport(
+      this.viewport.getTransform().scale,
+      this.viewport.getTransform().offsetX,
+      this.viewport.getTransform().offsetY
+    );
+
     this.penInput = new PenInputManager(canvas);
     this.penInput.onPenInput((event) => this.handlePenInput(event));
 
     window.addEventListener('resize', () => this.handleResize());
 
     this.setupControls();
+    this.setupInteractions();
     this.startRenderLoop();
 
     console.log('PhotonMixer initialized');
@@ -117,12 +158,30 @@ class PhotonMixerApp {
   }
 
   private handlePenInput(event: import('./pen/input.js').PenInputEvent): void {
+    if (this.state.isPanning) return;
+
     const { type, point } = event;
+
+    // スクリーン座標 -> キャンバス座標
+    const { x, y } = this.viewport.toCanvas(point.x, point.y);
+    const transformedPoint = { ...point, x, y };
 
     switch (type) {
       case 'down': {
+        if (this.state.currentTool === 'spoit') {
+          this.handleSpoit(transformedPoint.x, transformedPoint.y);
+          return;
+        }
+        if (this.state.currentTool === 'bucket') {
+          this.handleBucketFill(transformedPoint.x, transformedPoint.y);
+          return;
+        }
+
         this.state.isDrawing = true;
-        this.rawPoints = [point];
+        this.rawPoints = [transformedPoint];
+
+        // 消しゴムモードならパイプライン切り替え
+        this.renderPipeline?.setEraseMode(this.state.currentTool === 'eraser');
 
         if (this.isProgressiveMixing()) {
           // 点ごとの色を使うモードに切り替えてスナップショットを非同期取得
@@ -137,7 +196,7 @@ class PhotonMixerApp {
 
       case 'move': {
         if (!this.state.isDrawing) return;
-        this.rawPoints.push(point);
+        this.rawPoints.push(transformedPoint);
 
         if (this.isProgressiveMixing()) {
           this.handleProgressiveMove();
@@ -153,11 +212,13 @@ class PhotonMixerApp {
       case 'up': {
         if (!this.state.isDrawing) return;
 
+        const erase = this.state.currentTool === 'eraser';
         if (this.isProgressiveMixing()) {
           // 色付きの全点を over blend で committed へ確定（別ストロークと正しく合成）
           const colored = this.buildColoredStroke();
           if (colored.length > 0) {
             this.renderPipeline?.commitStroke(colored);
+            this.strokeHistory.addRecord({ kind: 'stroke', points: colored, erase });
           }
           // 点ごとの色モードを解除
           this.renderPipeline?.updateBrushConfig({ usePointColor: false });
@@ -166,7 +227,10 @@ class PhotonMixerApp {
           const interpolated = this.interpolator.interpolate(stabilized);
           const finalStroke = this.strokeManager.finalizeStroke(interpolated);
           if (finalStroke.length > 0) {
+            // rebake 時に色を忠実に再現するため、各点に現在のブラシ色を焼き込む
+            this.bakeColorIntoPoints(finalStroke);
             this.renderPipeline?.commitStroke(finalStroke);
+            this.strokeHistory.addRecord({ kind: 'stroke', points: finalStroke, erase });
           }
         }
 
@@ -176,6 +240,191 @@ class PhotonMixerApp {
         break;
       }
     }
+  }
+
+  /**
+   * キーボード・マウス操作の設定
+   */
+  private setupInteractions(): void {
+    const canvas = this.renderer!.canvas;
+
+    // ホイールズーム
+    canvas.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.1 : 0.9;
+      this.viewport.zoom(factor, e.clientX, e.clientY);
+      const transform = this.viewport.getTransform();
+      this.renderPipeline?.updateViewport(transform.scale, transform.offsetX, transform.offsetY);
+    }, { passive: false });
+
+    // パン操作 (Space + ドラッグ)
+    let lastX = 0;
+    let lastY = 0;
+
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Space') {
+        this.state.isPanning = true;
+        canvas.style.cursor = 'grab';
+      }
+      // Undo/Redo
+      if (e.ctrlKey && e.key === 'z') {
+        e.preventDefault();
+        if (this.strokeHistory.undo()) {
+          this.renderPipeline?.rebakeFromRecords(this.strokeHistory.getAllRecords());
+        }
+      }
+      if (e.ctrlKey && (e.key === 'y' || (e.shiftKey && e.key === 'Z'))) {
+        e.preventDefault();
+        if (this.strokeHistory.redo()) {
+          this.renderPipeline?.rebakeFromRecords(this.strokeHistory.getAllRecords());
+        }
+      }
+      // ツール切り替えショートカット
+      if (e.key === 'b') this.setTool('brush');
+      if (e.key === 'e') this.setTool('eraser');
+      if (e.key === 'i') this.setTool('spoit');
+      if (e.key === 'g') this.setTool('bucket');
+      if (e.key === 'Alt') {
+        e.preventDefault();
+        this.prevTool = this.state.currentTool;
+        this.setTool('spoit');
+      }
+    });
+
+    window.addEventListener('keyup', (e) => {
+      if (e.code === 'Space') {
+        this.state.isPanning = false;
+        canvas.style.cursor = 'crosshair';
+      }
+      if (e.key === 'Alt' && this.prevTool) {
+        this.setTool(this.prevTool);
+        this.prevTool = null;
+      }
+    });
+
+    canvas.addEventListener('mousedown', (e) => {
+      lastX = e.clientX;
+      lastY = e.clientY;
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (this.state.isPanning && (e.buttons & 1 || e.buttons & 4)) {
+        const dx = e.clientX - lastX;
+        const dy = e.clientY - lastY;
+        this.viewport.pan(dx, dy);
+        const transform = this.viewport.getTransform();
+        this.renderPipeline?.updateViewport(transform.scale, transform.offsetX, transform.offsetY);
+        lastX = e.clientX;
+        lastY = e.clientY;
+      }
+    });
+  }
+
+  private setTool(tool: Tool): void {
+    this.state.currentTool = tool;
+    const tools: Tool[] = ['brush', 'eraser', 'spoit', 'bucket'];
+    tools.forEach(t => {
+      const btn = document.getElementById(`tool-${t}`);
+      if (btn) btn.classList.toggle('active', t === tool);
+    });
+  }
+
+  private async handleSpoit(x: number, y: number): Promise<void> {
+    if (!this.renderPipeline) return;
+    const snap = await this.renderPipeline.requestCommittedSnapshot();
+    const c = sampleSnapshot(snap.data, x, y, this.renderer!.canvas.width, this.renderer!.canvas.height, snap.bytesPerRow);
+    // committed はプリマルチプライドαなので straight color に戻す（α=0 は透明＝拾わない）
+    if (c.a < 0.001) return;
+    this.updateCurrentColor({ r: c.r / c.a, g: c.g / c.a, b: c.b / c.a, a: 1 });
+  }
+
+  private updateCurrentColor(color: LinearColor): void {
+    this.state.currentColor = { ...color };
+    const srgb = linearColorToSrgb(color);
+    const hex = '#' + [srgb.r, srgb.g, srgb.b].map(v => 
+      Math.max(0, Math.min(255, Math.round(v * 255))).toString(16).padStart(2, '0')
+    ).join('');
+    
+    const colorPicker = document.getElementById('brush-color') as HTMLInputElement;
+    if (colorPicker) colorPicker.value = hex;
+    this.renderPipeline?.updateBrushConfig({ color });
+  }
+
+  private async handleBucketFill(x: number, y: number): Promise<void> {
+    if (!this.renderPipeline) return;
+    
+    const canvas = this.renderer!.canvas;
+    const { width, height } = canvas;
+    const snap = await this.renderPipeline.requestCommittedSnapshot();
+    const data = snap.data;
+    const uint16sPerRow = snap.bytesPerRow / 2;
+    
+    const ix = Math.round(x);
+    const iy = Math.round(y);
+    if (ix < 0 || ix >= width || iy < 0 || iy >= height) return;
+
+    const targetColor = this.state.currentColor;
+
+    // committed はプリマルチプライドαなので RGB を α 倍して書き込む
+    const ta = targetColor.a;
+    const target16 = new Uint16Array([
+      float32ToFloat16(targetColor.r * ta),
+      float32ToFloat16(targetColor.g * ta),
+      float32ToFloat16(targetColor.b * ta),
+      float32ToFloat16(ta),
+    ]);
+
+    const start16 = new Uint16Array([
+      data[iy * uint16sPerRow + ix * 4],
+      data[iy * uint16sPerRow + ix * 4 + 1],
+      data[iy * uint16sPerRow + ix * 4 + 2],
+      data[iy * uint16sPerRow + ix * 4 + 3],
+    ]);
+
+    // 色が同じなら何もしない
+    if (target16.every((v, i) => v === start16[i])) return;
+
+    // シンプルなシードフィル (スキャンライン)
+    const stack: [number, number][] = [[ix, iy]];
+    const processed = new Uint8Array(width * height);
+    
+    while (stack.length > 0) {
+      const [cx, cy] = stack.pop()!;
+      let lx = cx;
+      while (lx > 0 && this.isSameColor(data, lx - 1, cy, start16, uint16sPerRow)) {
+        lx--;
+      }
+      let rx = cx;
+      while (rx < width - 1 && this.isSameColor(data, rx + 1, cy, start16, uint16sPerRow)) {
+        rx++;
+      }
+
+      for (let i = lx; i <= rx; i++) {
+        const idx = cy * uint16sPerRow + i * 4;
+        data[idx] = target16[0];
+        data[idx + 1] = target16[1];
+        data[idx + 2] = target16[2];
+        data[idx + 3] = target16[3];
+        processed[cy * width + i] = 1;
+
+        if (cy > 0 && !processed[(cy - 1) * width + i] && this.isSameColor(data, i, cy - 1, start16, uint16sPerRow)) {
+          stack.push([i, cy - 1]);
+        }
+        if (cy < height - 1 && !processed[(cy + 1) * width + i] && this.isSameColor(data, i, cy + 1, start16, uint16sPerRow)) {
+          stack.push([i, cy + 1]);
+        }
+      }
+    }
+
+    this.renderPipeline.updateCommittedTexture(data);
+    // 塗りつぶし直後のスナップショットを履歴に積む（rebake で上書き再現＝Undo 可能）
+    this.strokeHistory.addRecord({ kind: 'fill', snapshot: data, bytesPerRow: snap.bytesPerRow });
+  }
+
+  private isSameColor(data: Uint16Array, x: number, y: number, ref16: Uint16Array, uint16sPerRow: number): boolean {
+    const idx = y * uint16sPerRow + x * 4;
+    // 許容誤差 (Tolerance) は一旦 0
+    return data[idx] === ref16[0] && data[idx + 1] === ref16[1] && data[idx + 2] === ref16[2] && data[idx + 3] === ref16[3];
   }
 
   /**
@@ -261,7 +510,27 @@ class PhotonMixerApp {
     this.perfMonitor.setPoints(liveStroke.length);
   }
 
+  /**
+   * 各点に現在のブラシ色を焼き込む（Undo/Redo の rebake で色を忠実に再現するため）
+   */
+  private bakeColorIntoPoints(points: StrokePoint[]): void {
+    const c = this.state.currentColor;
+    for (const p of points) {
+      if (!p.color) p.color = { r: c.r, g: c.g, b: c.b, a: c.a };
+    }
+  }
+
   private setupControls(): void {
+    const brushBtn = document.getElementById('tool-brush');
+    const eraserBtn = document.getElementById('tool-eraser');
+    const spoitBtn = document.getElementById('tool-spoit');
+    const bucketBtn = document.getElementById('tool-bucket');
+    
+    brushBtn?.addEventListener('click', () => this.setTool('brush'));
+    eraserBtn?.addEventListener('click', () => this.setTool('eraser'));
+    spoitBtn?.addEventListener('click', () => this.setTool('spoit'));
+    bucketBtn?.addEventListener('click', () => this.setTool('bucket'));
+
     const sizeSlider    = document.getElementById('brush-size')    as HTMLInputElement;
     const sizeVal       = document.getElementById('brush-size-val')!;
     const alphaSlider   = document.getElementById('brush-alpha')   as HTMLInputElement;
@@ -308,6 +577,7 @@ class PhotonMixerApp {
 
     clearBtn.addEventListener('click', () => {
       this.renderPipeline?.clear();
+      this.strokeHistory.clear();
     });
   }
 
@@ -315,6 +585,9 @@ class PhotonMixerApp {
     const canvas = document.getElementById('canvas') as HTMLCanvasElement;
     if (!canvas || !this.renderPipeline) return;
     this.renderPipeline.resize(window.innerWidth, window.innerHeight);
+    // リサイズ後もビューポートを更新
+    const transform = this.viewport.getTransform();
+    this.renderPipeline.updateViewport(transform.scale, transform.offsetX, transform.offsetY);
   }
 
   private startRenderLoop(): void {
