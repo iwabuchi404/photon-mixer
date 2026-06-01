@@ -38,13 +38,13 @@ export class CompositeRenderer {
         primitive: { topology: 'triangle-strip' },
       });
 
-    this.bakePipeline = makePipeline('rgba8unorm');
+    this.bakePipeline = makePipeline('rgba16float');
     this.displayPipeline = makePipeline(canvasFormat);
   }
 
   /**
    * テクスチャをレンダーパスに描画
-   * @param bake true のとき rgba8unorm ターゲット（committed への書き込み用）
+   * @param bake true のとき rgba16float ターゲット（committed への書き込み用）
    */
   draw(pass: GPURenderPassEncoder, texture: GPUTexture, bake = false): void {
     const pipeline = bake ? this.bakePipeline! : this.displayPipeline!;

@@ -1,44 +1,71 @@
 /**
- * 描画パイプライン（隔離バッファ方式）
+ * 描画パイプライン
  *
- * 仕組み:
- *   isolatedTexture に全ストロークを max blend で描画
- *   → 同一ストローク内でスタンプが重なっても α が蓄積しない
- *   → canvas に over blend で転写
+ * テクスチャ構成:
+ *   brushTexture4x   4x 解像度でスタンプを描画（max blend でα蓄積なし）
+ *   isolatedTexture  ダウンサンプル後の現在ストローク（1x）
+ *   committedTexture 確定済みストロークの蓄積（ペンアップ時にベイク）
  *
- * 将来: 確定済みストロークを committed テクスチャにベイクして
- *       再描画コストを下げる（現在は全点を毎フレーム描画）
+ * レンダー順:
+ *   brushTexture4x → downsample → isolatedTexture
+ *   canvas = 背景 → committedTexture → isolatedTexture
  */
 
 import type { Renderer } from '../core/renderer.js';
 import type { StrokePoint } from '../pen/stroke.js';
 import { BrushRenderer, type BrushConfig } from './brush.js';
 import { CompositeRenderer } from './composite.js';
+import { DownsampleRenderer } from './downsample.js';
 
-const BUFFER_FORMAT: GPUTextureFormat = 'rgba8unorm';
+const BUFFER_FORMAT: GPUTextureFormat = 'rgba16float';
 
 export class RenderPipeline {
   private renderer: Renderer;
   private brushRenderer: BrushRenderer;
   private compositeRenderer: CompositeRenderer;
+  private downsampleRenderer: DownsampleRenderer;
 
-  // 全描画の中間バッファ（max blend でαを正しく積む）
+  // 4x 解像度のブラシ描画用テクスチャ
+  private brushTexture4x!: GPUTexture;
+  // 確定済みストロークを蓄積するテクスチャ
+  private committedTexture!: GPUTexture;
+  // 現在のストロークのみを描画するテクスチャ（1x, downsample先）
   private isolatedTexture!: GPUTexture;
-  // 確定済みストローク（毎フレーム再描画）
-  private strokes: StrokePoint[][] = [];
+
   private currentStroke: StrokePoint[] = [];
 
   constructor(renderer: Renderer) {
     this.renderer = renderer;
     this.brushRenderer = new BrushRenderer(renderer.device);
     this.compositeRenderer = new CompositeRenderer(renderer.device);
+    this.downsampleRenderer = new DownsampleRenderer(renderer.device);
   }
 
   async init(): Promise<void> {
     const { canvas, format } = this.renderer;
-    await this.brushRenderer.init(canvas.width, canvas.height, BUFFER_FORMAT);
+    // 4x 解像度で初期化
+    await this.brushRenderer.init(canvas.width * 4, canvas.height * 4, BUFFER_FORMAT);
     await this.compositeRenderer.init(format);
-    this.isolatedTexture = this.makeTexture(canvas.width, canvas.height);
+    await this.downsampleRenderer.init();
+
+    this.createTextures(canvas.width, canvas.height);
+  }
+
+  private createTextures(width: number, height: number): void {
+    this.brushTexture4x = this.renderer.device.createTexture({
+      size: [width * 4, height * 4],
+      format: BUFFER_FORMAT,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.committedTexture = this.makeTexture(width, height);
+    this.isolatedTexture = this.renderer.device.createTexture({
+      size: [width, height],
+      format: BUFFER_FORMAT,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+    });
+    // 新規テクスチャは内容が未定義のため透明でクリアする
+    this.clearTextureContent(this.committedTexture);
+    this.clearTextureContent(this.isolatedTexture);
   }
 
   private makeTexture(width: number, height: number): GPUTexture {
@@ -49,41 +76,88 @@ export class RenderPipeline {
     });
   }
 
+  /**
+   * テクスチャを透明（0,0,0,0）でクリアする
+   * WebGPU の新規テクスチャは内容が未定義のため、作成後に必ず呼ぶこと
+   */
+  private clearTextureContent(texture: GPUTexture): void {
+    const encoder = this.renderer.device.createCommandEncoder();
+    encoder.beginRenderPass({
+      colorAttachments: [{
+        view: texture.createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+    }).end();
+    this.renderer.device.queue.submit([encoder.finish()]);
+  }
+
   setCurrentStroke(points: StrokePoint[]): void {
     this.currentStroke = points;
   }
 
   commitStroke(points: StrokePoint[]): void {
     if (points.length > 0) {
-      this.strokes.push([...points]);
+      // 最後に最新の状態で isolatedTexture に描画してからベイクする
+      this.drawToIsolated(points);
+      // 現在のストロークを確定済みテクスチャにベイク
+      this.compositeRenderer.bake(this.isolatedTexture, this.committedTexture);
     }
     this.currentStroke = [];
   }
 
-  render(): void {
-    const { device, context } = this.renderer;
-    const allPoints = [...this.strokes.flat(), ...this.currentStroke];
+  /**
+   * 指定された点列を 4x バッファに描画し、1x (isolated) にダウンサンプルする
+   */
+  private drawToIsolated(points: StrokePoint[]): void {
+    const { device } = this.renderer;
     const encoder = device.createCommandEncoder();
 
-    // Pass 1: isolated をクリアして全点を max blend で描画（α蓄積なし）
+    // Pass 1: brushTexture4x をクリアして 4x で描画
     {
       const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: this.brushTexture4x.createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+      });
+      this.brushRenderer.renderStroke(pass, points, 4.0);
+      pass.end();
+    }
+
+    device.queue.submit([encoder.finish()]);
+
+    // Step 2: 4x -> 1x ダウンサンプル
+    this.downsampleRenderer.downsample(this.brushTexture4x, this.isolatedTexture);
+  }
+
+  render(): void {
+    const { device, context } = this.renderer;
+
+    // 現在描画中のストロークがあれば描画
+    if (this.currentStroke.length > 0) {
+      this.drawToIsolated(this.currentStroke);
+    } else {
+      // ストロークがない場合は isolated をクリアしておく（前回の残りを消す）
+      const encoder = device.createCommandEncoder();
+      encoder.beginRenderPass({
         colorAttachments: [{
           view: this.isolatedTexture.createView(),
           clearValue: { r: 0, g: 0, b: 0, a: 0 },
           loadOp: 'clear',
           storeOp: 'store',
         }],
-      });
-      if (allPoints.length > 0) {
-        this.brushRenderer.renderStroke(pass, allPoints);
-      }
-      pass.end();
+      }).end();
+      device.queue.submit([encoder.finish()]);
     }
 
-    // Pass 2: 背景色でクリアして isolated を over blend で転写
+    // Pass 3: 背景色でクリアして committed と isolated を over blend で転写
+    const finalEncoder = device.createCommandEncoder();
     {
-      const pass = encoder.beginRenderPass({
+      const pass = finalEncoder.beginRenderPass({
         colorAttachments: [{
           view: context.getCurrentTexture().createView(),
           clearValue: { r: 0.1, g: 0.1, b: 0.1, a: 1.0 },
@@ -91,11 +165,14 @@ export class RenderPipeline {
           storeOp: 'store',
         }],
       });
+      // 1. 確定済みストロークを描画
+      this.compositeRenderer.draw(pass, this.committedTexture);
+      // 2. 現在のストローク（downsampled）を重ねる
       this.compositeRenderer.draw(pass, this.isolatedTexture);
       pass.end();
     }
 
-    device.queue.submit([encoder.finish()]);
+    device.queue.submit([finalEncoder.finish()]);
   }
 
   updateBrushConfig(config: Partial<BrushConfig>): void {
@@ -103,20 +180,30 @@ export class RenderPipeline {
   }
 
   clear(): void {
-    this.strokes = [];
     this.currentStroke = [];
+    const { canvas } = this.renderer;
+    this.committedTexture.destroy();
+    this.committedTexture = this.makeTexture(canvas.width, canvas.height);
+    // 新規テクスチャと残存ストロークを透明でクリア
+    this.clearTextureContent(this.committedTexture);
+    this.clearTextureContent(this.isolatedTexture);
   }
 
   resize(width: number, height: number): void {
     this.renderer.canvas.width = width;
     this.renderer.canvas.height = height;
-    this.brushRenderer.resize(width, height);
+    this.brushRenderer.resize(width * 4, height * 4);
+
+    this.brushTexture4x.destroy();
+    this.committedTexture.destroy();
     this.isolatedTexture.destroy();
-    this.isolatedTexture = this.makeTexture(width, height);
+    this.createTextures(width, height);
   }
 
   dispose(): void {
     this.brushRenderer.dispose();
+    this.brushTexture4x?.destroy();
+    this.committedTexture?.destroy();
     this.isolatedTexture?.destroy();
   }
 }
