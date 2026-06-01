@@ -191,10 +191,15 @@ class PhotonMixerApp {
   /**
    * ストローク全体を補間し、各点に「引きずり混色」の色を焼き込んで返す
    *
-   * 各点ごとに筆先色(head)を進化させる:
-   *   1. 減衰: 直前点からの距離に応じて元のブラシ色へ指数的に戻す（引きずりすぎ防止）
-   *   2. 混色: スナップショットの既存色を Oklab 空間で拾って混ぜる
-   * 点ごとに色を持たせるため、セグメント継ぎ目も色の階段も生じない
+   * smudge と deposit を分離したモデル:
+   *   smudge  : 動きながら既存色を拾っていく running color（筆に付いた絵の具）
+   *   deposit : 実際に置く色 = mix(ブラシ色, smudge, wet)
+   *             → ブラシ色を常に (1-wet) で再注入するので選択色が消えない
+   *
+   * 各点で:
+   *   1. smudge を移動距離に応じて既存色へドリフト（空白上ではブラシ色へ戻る）
+   *   2. deposit = ブラシ色と smudge を wet で補間
+   * 点ごとに色を持たせるため継ぎ目も色の階段も生じない
    */
   private buildColoredStroke(): StrokePoint[] {
     const stabilized = this.stabilizer.stabilizeBatch(this.rawPoints);
@@ -203,41 +208,43 @@ class PhotonMixerApp {
     if (stroke.length === 0) return stroke;
 
     const orig = this.state.currentColor;
+    const wet = this.state.wetRatio;
     const snap = this.committedSnapshot;
     const canvas = this.renderer!.canvas;
 
-    // 拾った色が e-fold で薄れる距離（px）。大きいほど長く引きずる
-    const DECAY_LEN = 40;
+    // smudge が既存色/ブラシ色へドリフトする e-fold 距離（px）。小さいほど速く拾う
+    const SMUDGE_LEN = 25;
+    const origOklab = linearToOklab(orig);
 
-    let head: LinearColor = { ...orig };
+    let smudge: LinearColor = { ...orig };
     let prevX = stroke[0].x;
     let prevY = stroke[0].y;
 
     for (const p of stroke) {
-      // ① 減衰（距離ベース・解像度非依存）
       const dx = p.x - prevX, dy = p.y - prevY;
       const dist = Math.sqrt(dx * dx + dy * dy);
       prevX = p.x; prevY = p.y;
-      const decayT = 1 - Math.exp(-dist / DECAY_LEN);
-      if (decayT > 0) {
-        const mixed = mixOklab(linearToOklab(head), linearToOklab(orig), decayT);
-        const lin = oklabToLinear(mixed);
-        head = { r: lin.r, g: lin.g, b: lin.b, a: orig.a };
-      }
+      const rate = 1 - Math.exp(-dist / SMUDGE_LEN);
 
-      // ② 既存色を拾って混ぜる
+      // ① smudge をドリフト
+      let targetOklab = origOklab; // 空白上はブラシ色へ戻る
+      let driftT = rate;
       if (snap) {
         const cc = sampleSnapshot(snap.data, p.x, p.y, canvas.width, canvas.height, snap.bytesPerRow);
         if (cc.a > 0.001) {
-          const canvasLinear: LinearColor = { r: cc.r / cc.a, g: cc.g / cc.a, b: cc.b / cc.a, a: 1 };
-          const t = this.state.wetRatio * cc.a;
-          const mixed = mixOklab(linearToOklab(head), linearToOklab(canvasLinear), t);
-          const lin = oklabToLinear(mixed);
-          head = { r: lin.r, g: lin.g, b: lin.b, a: orig.a };
+          // 既存色を拾う（薄い既存色は弱く拾う）
+          targetOklab = linearToOklab({ r: cc.r / cc.a, g: cc.g / cc.a, b: cc.b / cc.a, a: 1 });
+          driftT = rate * cc.a;
         }
       }
+      if (driftT > 0) {
+        const s = oklabToLinear(mixOklab(linearToOklab(smudge), targetOklab, driftT));
+        smudge = { r: s.r, g: s.g, b: s.b, a: orig.a };
+      }
 
-      p.color = { r: head.r, g: head.g, b: head.b, a: orig.a };
+      // ② deposit = ブラシ色と smudge を wet で補間（ブラシ色を常に再注入）
+      const dep = oklabToLinear(mixOklab(origOklab, linearToOklab(smudge), wet));
+      p.color = { r: dep.r, g: dep.g, b: dep.b, a: orig.a };
     }
 
     return stroke;
