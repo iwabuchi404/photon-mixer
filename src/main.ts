@@ -10,9 +10,12 @@ import { Interpolator } from './pen/interpolation.js';
 import { StrokeManager } from './pen/stroke.js';
 import { RenderPipeline } from './render/pipeline.js';
 import { PerfMonitor } from './ui/perf-monitor.js';
+import { srgbToLinear } from './color/linear.js';
+import type { LinearColor } from './color/types.js';
 
 interface AppState {
   isDrawing: boolean;
+  currentColor: LinearColor;
 }
 
 class PhotonMixerApp {
@@ -23,7 +26,10 @@ class PhotonMixerApp {
   private strokeManager: StrokeManager;
   private renderPipeline: RenderPipeline | null = null;
   private perfMonitor: PerfMonitor;
-  private state: AppState = { isDrawing: false };
+  private state: AppState = { 
+    isDrawing: false,
+    currentColor: { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+  };
 
   // ペンダウンからペンアップまでの生入力点
   private rawPoints: import('./pen/input.js').PointerPoint[] = [];
@@ -132,7 +138,30 @@ class PhotonMixerApp {
     alphaSlider.addEventListener('input', () => {
       const alpha = parseInt(alphaSlider.value) / 100;
       alphaVal.textContent = alphaSlider.value;
-      this.renderPipeline?.updateBrushConfig({ color: { r: 1.0, g: 1.0, b: 1.0, a: alpha } });
+      this.state.currentColor.a = alpha;
+      this.renderPipeline?.updateBrushConfig({ color: { ...this.state.currentColor } });
+    });
+
+    const wetSlider = document.getElementById('brush-wet') as HTMLInputElement;
+    const wetVal = document.getElementById('brush-wet-val')!;
+    wetSlider.addEventListener('input', () => {
+      const wetRatio = parseInt(wetSlider.value) / 100;
+      wetVal.textContent = wetSlider.value;
+      this.renderPipeline?.updateBrushConfig({ wetRatio });
+    });
+
+    const colorPicker = document.getElementById('brush-color') as HTMLInputElement;
+    colorPicker.addEventListener('input', () => {
+      const hex = colorPicker.value;
+      const r = parseInt(hex.substring(1, 3), 16) / 255;
+      const g = parseInt(hex.substring(3, 5), 16) / 255;
+      const b = parseInt(hex.substring(5, 7), 16) / 255;
+      
+      this.state.currentColor.r = srgbToLinear(r);
+      this.state.currentColor.g = srgbToLinear(g);
+      this.state.currentColor.b = srgbToLinear(b);
+      
+      this.renderPipeline?.updateBrushConfig({ color: { ...this.state.currentColor } });
     });
 
     clearBtn.addEventListener('click', () => {

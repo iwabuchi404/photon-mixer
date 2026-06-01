@@ -30,16 +30,16 @@ export class CompositeRenderer {
       alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
     };
 
-    const makePipeline = (format: GPUTextureFormat): GPURenderPipeline =>
+    const makePipeline = (format: GPUTextureFormat, entryPoint: string): GPURenderPipeline =>
       this.device.createRenderPipeline({
         layout: 'auto',
         vertex: { module, entryPoint: 'vs_main' },
-        fragment: { module, entryPoint: 'fs_main', targets: [{ format, blend: blendState }] },
+        fragment: { module, entryPoint, targets: [{ format, blend: blendState }] },
         primitive: { topology: 'triangle-strip' },
       });
 
-    this.bakePipeline = makePipeline('rgba16float');
-    this.displayPipeline = makePipeline(canvasFormat);
+    this.bakePipeline = makePipeline('rgba16float', 'fs_main');
+    this.displayPipeline = makePipeline(canvasFormat, 'fs_display');
   }
 
   /**

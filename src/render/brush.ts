@@ -10,13 +10,15 @@ import type { StrokePoint } from '../pen/stroke.js';
  */
 export interface BrushConfig {
   color: { r: number; g: number; b: number; a: number }; // リニア空間 0-1
+  wetRatio: number; // 混色率 0-1
 }
 
 /**
- * デフォルト設定（白、不透明度1.0）
+ * デフォルト設定（白、不透明度1.0、混色なし）
  */
 const DEFAULT_BRUSH_CONFIG: BrushConfig = {
   color: { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+  wetRatio: 0.0,
 };
 
 /**
@@ -27,6 +29,7 @@ export class BrushRenderer {
   private pipeline: GPURenderPipeline | null = null;
   private uniformBuffer: GPUBuffer;
   private pointBuffer: GPUBuffer;
+  private sampler: GPUSampler;
   private bindGroup: GPUBindGroup | null = null;
   private bindGroupDirty = true; // BindGroup再作成フラグ
   private config: BrushConfig;
@@ -44,8 +47,8 @@ export class BrushRenderer {
     this.config = { ...DEFAULT_BRUSH_CONFIG, ...config };
     this.shaderPath = shaderPath;
 
-    // Uniformバッファ作成（16 + 16 = 32 bytes）
-    // canvas_width(4) + canvas_height(4) + padding(8) + brush_color(16)
+    // Uniformバッファ作成（32 bytes）
+    // canvas_width(4) + canvas_height(4) + brush_color(16) + wet_ratio(4) + padding(4)
     this.uniformBuffer = device.createBuffer({
       size: 32,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -55,6 +58,12 @@ export class BrushRenderer {
     this.pointBuffer = device.createBuffer({
       size: this.maxPoints * 4 * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    // サンプラー作成
+    this.sampler = device.createSampler({
+      magFilter: 'linear',
+      minFilter: 'linear',
     });
   }
 
@@ -113,7 +122,7 @@ export class BrushRenderer {
     const uniformData = new Float32Array([
       canvasWidth,
       canvasHeight,
-      0, // padding
+      this.config.wetRatio,
       0, // padding
       this.config.color.r,
       this.config.color.g,
@@ -127,7 +136,7 @@ export class BrushRenderer {
   /**
    * バインドグループを作成
    */
-  private createBindGroup(): GPUBindGroup {
+  private createBindGroup(committedTexture: GPUTexture): GPUBindGroup {
     if (!this.pipeline) {
       throw new Error('Pipeline not initialized');
     }
@@ -137,9 +146,13 @@ export class BrushRenderer {
       entries: [
         { binding: 0, resource: { buffer: this.uniformBuffer } },
         { binding: 1, resource: { buffer: this.pointBuffer } },
+        { binding: 2, resource: committedTexture.createView() },
+        { binding: 3, resource: this.sampler },
       ],
     });
   }
+
+  private lastCommittedTexture: GPUTexture | null = null;
 
   /**
    * ストローク点を描画
@@ -147,6 +160,7 @@ export class BrushRenderer {
   renderStroke(
     renderPass: GPURenderPassEncoder,
     points: StrokePoint[],
+    committedTexture: GPUTexture,
     scale = 1.0,
   ): void {
     if (points.length === 0) return;
@@ -177,9 +191,10 @@ export class BrushRenderer {
     this.device.queue.writeBuffer(this.pointBuffer, 0, pointData);
 
     // バインドグループを作成（キャッシュ機構で効率化）
-    if (this.bindGroupDirty || !this.bindGroup) {
-      this.bindGroup = this.createBindGroup();
+    if (this.bindGroupDirty || !this.bindGroup || this.lastCommittedTexture !== committedTexture) {
+      this.bindGroup = this.createBindGroup(committedTexture);
       this.bindGroupDirty = false;
+      this.lastCommittedTexture = committedTexture;
     }
 
     renderPass.setPipeline(this.pipeline!);

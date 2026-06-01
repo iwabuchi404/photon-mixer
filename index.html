@@ -123,6 +123,15 @@
       <input type="range" id="brush-alpha" min="1" max="100" value="100">
       <span id="brush-alpha-val" class="ctrl-val">100</span>%
     </div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">混色</span>
+      <input type="range" id="brush-wet" min="0" max="100" value="0">
+      <span id="brush-wet-val" class="ctrl-val">0</span>%
+    </div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">カラー</span>
+      <input type="color" id="brush-color" value="#ffffff" style="width: 80px; height: 18px; border: none; cursor: pointer;">
+    </div>
     <button id="clear-btn">クリア</button>
   </div>
   <canvas id="canvas"></canvas>

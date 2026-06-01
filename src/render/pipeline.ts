@@ -124,7 +124,8 @@ export class RenderPipeline {
           storeOp: 'store',
         }],
       });
-      this.brushRenderer.renderStroke(pass, points, 4.0);
+      // 混色用に committedTexture を渡す
+      this.brushRenderer.renderStroke(pass, points, this.committedTexture, 4.0);
       pass.end();
     }
 

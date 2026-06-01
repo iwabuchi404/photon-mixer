@@ -1,27 +1,25 @@
 /**
  * ブラシスタンプ描画シェーダー
- * Phase 1: 基本的な円形スタンプ描画
+ * Phase 2: Oklab 混色対応
  */
 
 struct Uniforms {
-  // Canvasサイズ
   canvas_width: f32,
   canvas_height: f32,
-  // ブラシ色（RGBA、リニア空間）
+  wet_ratio: f32,
+  padding: f32,
   brush_color: vec4<f32>,
-}
-
-struct VertexInput {
-  @builtin(vertex_index) vertex_id: u32,
 }
 
 struct VertexOutput {
   @builtin(position) position: vec4<f32>,
   @location(0) uv: vec2<f32>,
+  @location(1) canvas_uv: vec2<f32>,
 }
 
 struct FragmentInput {
   @location(0) uv: vec2<f32>,
+  @location(1) canvas_uv: vec2<f32>,
 }
 
 @group(0) @binding(0)
@@ -30,54 +28,90 @@ var<uniform> uniforms: Uniforms;
 @group(0) @binding(1)
 var<storage, read> points: array<vec4<f32>>; // x, y, size, pressure
 
-/**
- * 頂点シェーダー
- * 各点ごとに四角形を生成
- */
+@group(0) @binding(2)
+var committed_texture: texture_2d<f32>;
+
+@group(0) @binding(3)
+var committed_sampler: sampler;
+
+// --- Color Conversion (from color.wgsl) ---
+fn linear_to_oklab(c: vec3f) -> vec3f {
+  let l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
+  let m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;
+  let s = 0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b;
+  let l_ = pow(max(0.0, l), 1.0/3.0);
+  let m_ = pow(max(0.0, m), 1.0/3.0);
+  let s_ = pow(max(0.0, s), 1.0/3.0);
+  return vec3f(
+    0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+    1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+    0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,
+  );
+}
+
+fn oklab_to_linear(c: vec3f) -> vec3f {
+  let l_ = c.x + 0.3963377774 * c.y + 0.2158037573 * c.z;
+  let m_ = c.x - 0.1055613458 * c.y - 0.0638541728 * c.z;
+  let s_ = c.x - 0.0894841775 * c.y - 1.2914855480 * c.z;
+  let l = l_ * l_ * l_;
+  let m = m_ * m_ * m_;
+  let s = s_ * s_ * s_;
+  return vec3f(
+    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+   -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+   -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,
+  );
+}
+// ------------------------------------------
+
 @vertex
 fn vertex_main(@builtin(instance_index) instance_id: u32, @builtin(vertex_index) vertex_id: u32) -> VertexOutput {
   let point = points[instance_id];
   let center = point.xy;
   let size = point.z;
 
-  // 四角形の4頂点
   let offsets = array<vec2<f32>, 4>(
-    vec2<f32>(-1.0, -1.0), // 左下
-    vec2<f32>(1.0, -1.0),  // 右下
-    vec2<f32>(-1.0, 1.0),  // 左上
-    vec2<f32>(1.0, 1.0)    // 右上
+    vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0),
+    vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, 1.0)
   );
 
   let offset = offsets[vertex_id] * size;
   let pos = center + offset;
 
-  // 画面座標に変換 (0-1 → -1 to 1)
   let screen_x = (pos.x / uniforms.canvas_width) * 2.0 - 1.0;
-  let screen_y = 1.0 - (pos.y / uniforms.canvas_height) * 2.0; // Yは反転
+  let screen_y = 1.0 - (pos.y / uniforms.canvas_height) * 2.0;
 
   var output: VertexOutput;
   output.position = vec4<f32>(screen_x, screen_y, 0.0, 1.0);
   output.uv = offsets[vertex_id];
+  // キャンバス座標系 UV (0-1)
+  output.canvas_uv = vec2<f32>(pos.x / uniforms.canvas_width, pos.y / uniforms.canvas_height);
+  
   return output;
 }
 
-/**
- * フラグメントシェーダー
- * 円形スタンプを描画
- */
 @fragment
 fn fragment_main(input: FragmentInput) -> @location(0) vec4<f32> {
-  // UVを距離に変換（中心からの距離）
   let dist = length(input.uv);
-
-  // 円形判定（1.0以上なら透明）
   if (dist >= 1.0) {
     return vec4<f32>(0.0, 0.0, 0.0, 0.0);
   }
 
-  // 滑らかなエッジ（アンチエイリアス）
-  let alpha = uniforms.brush_color.a * (1.0 - smoothstep(0.8, 1.0, dist));
+  let stamp_alpha = uniforms.brush_color.a * (1.0 - smoothstep(0.8, 1.0, dist));
 
-  // プリマルチプライドα: max ブレンドと整合させるために rgb も α 倍して出力
-  return vec4<f32>(uniforms.brush_color.rgb * alpha, alpha);
+  // 混色ロジック
+  var target_color = uniforms.brush_color.rgb;
+
+  if (uniforms.wet_ratio > 0.0) {
+    let existing = textureSampleLevel(committed_texture, committed_sampler, input.canvas_uv, 0.0);
+    if (existing.a > 0.001) {
+      let brush_oklab = linear_to_oklab(target_color);
+      let canvas_oklab = linear_to_oklab(existing.rgb / existing.a);
+      // existing.a を考慮して混ぜる（透明な部分とは混ざらない）
+      let mixed_oklab = mix(brush_oklab, canvas_oklab, uniforms.wet_ratio * existing.a);
+      target_color = oklab_to_linear(mixed_oklab);
+    }
+  }
+
+  return vec4<f32>(target_color * stamp_alpha, stamp_alpha);
 }
