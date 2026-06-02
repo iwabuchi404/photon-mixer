@@ -1,6 +1,6 @@
 /**
  * ブラシスタンプ描画シェーダー
- * Phase 2: Oklab 混色対応
+ * Phase 4: テクスチャブラシ対応
  */
 
 struct Uniforms {
@@ -10,9 +10,9 @@ struct Uniforms {
   use_gpu_mix: u32,      // 1=スタンプ混色(GPU), 0=引きずり混色(CPU制御)
   brush_color: vec4<f32>,
   use_point_color: u32,  // 1=点ごとの色を使う(progressive), 0=uniform brush_color
+  use_texture: u32,      // 1=テクスチャブラシ, 0=円形ブラシ
+  texture_scale: f32,    // テクスチャのスケール（繰り返し回数）
   _pad0: u32,
-  _pad1: u32,
-  _pad2: u32,
 }
 
 // 点ごとのデータ: data=(x, y, size, pressure), color=(r, g, b, a)
@@ -45,6 +45,12 @@ var committed_texture: texture_2d<f32>;
 
 @group(0) @binding(3)
 var committed_sampler: sampler;
+
+@group(0) @binding(4)
+var brush_texture: texture_2d<f32>;
+
+@group(0) @binding(5)
+var brush_sampler: sampler;
 
 // --- Color Conversion (from color.wgsl) ---
 fn linear_to_oklab(c: vec3f) -> vec3f {
@@ -105,23 +111,41 @@ fn vertex_main(@builtin(instance_index) instance_id: u32, @builtin(vertex_index)
 
 @fragment
 fn fragment_main(input: FragmentInput) -> @location(0) vec4<f32> {
-  let dist = length(input.uv);
-  if (dist >= 1.0) {
-    return vec4<f32>(0.0, 0.0, 0.0, 0.0);
-  }
-
   // 点ごとの色（progressive）か uniform のブラシ色（stamp）かを選ぶ
   var base_color = uniforms.brush_color;
   if (uniforms.use_point_color != 0u) {
     base_color = input.point_color;
   }
 
-  let stamp_alpha = base_color.a * (1.0 - smoothstep(0.8, 1.0, dist));
+  var stamp_alpha: f32;
+
+  // テクスチャブラシか円形ブラシか
+  if (uniforms.use_texture != 0u) {
+    // テクスチャブラシ：キャンバス座標系でテクスチャをサンプリング
+    // input.canvas_uv を texture_scale 倍して繰り返しサンプリング
+    let tex_uv = input.canvas_uv * uniforms.texture_scale;
+    let tex_color = textureSampleLevel(brush_texture, brush_sampler, tex_uv, 0.0);
+    // 輝度をマスクに使う（黒=透明・白=不透明、グレースケール素材に対応）
+    // α も併用して、α付き素材は α でも抜けるようにする
+    let lum = dot(tex_color.rgb, vec3<f32>(0.299, 0.587, 0.114));
+    let mask = lum * tex_color.a;
+    // 円形フォールオフも掛けてスタンプの角を丸める
+    let dist = length(input.uv);
+    let falloff = 1.0 - smoothstep(0.8, 1.0, dist);
+    stamp_alpha = mask * base_color.a * falloff;
+  } else {
+    // 円形ブラシ
+    let dist = length(input.uv);
+    if (dist >= 1.0) {
+      return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+    stamp_alpha = base_color.a * (1.0 - smoothstep(0.8, 1.0, dist));
+  }
 
   var target_color = base_color.rgb;
 
   // スタンプ混色モード（GPU側処理）
-  // 引きずり混色モードでは色が CPU 側で確定済みのためここでは何もしない
+  // 引きずり混色モードでは色が CPU 側で確定済みためここでは何もしない
   if (uniforms.use_gpu_mix != 0u && uniforms.wet_ratio > 0.0) {
     let existing = textureSampleLevel(committed_texture, committed_sampler, input.canvas_uv, 0.0);
     if (existing.a > 0.001) {

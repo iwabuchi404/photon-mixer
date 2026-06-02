@@ -12,8 +12,10 @@ import { PerfMonitor } from './ui/perf-monitor.js';
 import { Viewport } from './viewport.js';
 import { srgbToLinear, linearColorToSrgb } from './color/linear.js';
 import { linearToOklab, oklabToLinear, mixOklab } from './color/oklab.js';
+import { BrushPresetManager } from './brush-preset.js';
 import type { LinearColor } from './color/types.js';
 import type { StrokePoint } from './pen/stroke.js';
+import type { BrushConfig } from './render/brush.js';
 import type { BrushMixMode } from './render/brush.js';
 import { linearToSrgb } from './color/linear.js';
 
@@ -74,6 +76,8 @@ interface AppState {
   mixMode: BrushMixMode;
   currentTool: Tool;
   isPanning: boolean;
+  useTexture: boolean;
+  textureScale: number;
 }
 
 class PhotonMixerApp {
@@ -93,10 +97,15 @@ class PhotonMixerApp {
     mixMode: 'stamp',
     currentTool: 'brush',
     isPanning: false,
+    useTexture: false,
+    textureScale: 1.0,
   };
 
   private rawPoints: import('./pen/input.js').PointerPoint[] = [];
   private prevTool: Tool | null = null;
+
+  // テクスチャブラシの元画像（プリセット保存で再利用するため保持）
+  private currentTextureBitmap: ImageBitmap | null = null;
 
   // 引きずり混色（progressive）用: pen-down 時の committed スナップショット
   private committedSnapshot: { data: Uint16Array; bytesPerRow: number } | null = null;
@@ -650,6 +659,175 @@ class PhotonMixerApp {
       this.renderPipeline?.clear();
       this.strokeHistory.clear();
     });
+
+    // テクスチャブラシ関連
+    const loadTextureBtn = document.getElementById('load-texture-btn');
+    const clearTextureBtn = document.getElementById('clear-texture-btn');
+    const textureScaleSlider = document.getElementById('texture-scale') as HTMLInputElement;
+    const textureScaleVal = document.getElementById('texture-scale-val')!;
+    const textureFileInput = document.getElementById('texture-file-input') as HTMLInputElement;
+
+    // テクスチャ読み込み
+    loadTextureBtn?.addEventListener('click', () => {
+      textureFileInput.click();
+    });
+
+    textureFileInput.addEventListener('change', async (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (!file || !this.renderPipeline) return;
+
+      try {
+        const image = await createImageBitmap(file);
+        await this.renderPipeline.loadBrushTexture(image);
+        this.currentTextureBitmap = image;
+        this.state.useTexture = true;
+        this.renderPipeline.updateBrushConfig({ useTexture: true });
+      } catch (err) {
+        console.error('Failed to load texture:', err);
+        alert('テクスチャの読み込みに失敗しました。');
+      }
+      // 入力をリセット
+      textureFileInput.value = '';
+    });
+
+    // テクスチャクリア
+    clearTextureBtn?.addEventListener('click', () => {
+      this.renderPipeline?.clearBrushTexture();
+      this.currentTextureBitmap = null;
+      this.state.useTexture = false;
+      this.renderPipeline?.updateBrushConfig({ useTexture: false });
+    });
+
+    // テクスチャスケール
+    textureScaleSlider.addEventListener('input', () => {
+      const scale = parseFloat(textureScaleSlider.value);
+      textureScaleVal.textContent = scale.toString();
+      this.state.textureScale = scale;
+      this.renderPipeline?.updateBrushConfig({ textureScale: scale });
+    });
+
+    // プリセット関連
+    const savePresetBtn = document.getElementById('save-preset-btn');
+    const loadPresetBtn = document.getElementById('load-preset-btn');
+    const presetFileInput = document.getElementById('preset-file-input') as HTMLInputElement;
+
+    // プリセット保存
+    savePresetBtn?.addEventListener('click', async () => {
+      if (!this.renderPipeline) return;
+
+      try {
+        // 現在のブラシ設定を取得
+        const config = this.getCurrentBrushConfig();
+
+        // プリセット名を生成（またはプロンプト）
+        const name = BrushPresetManager.generatePresetName();
+
+        // テクスチャブラシなら元画像も同梱する
+        const textureBitmap = config.useTexture ? (this.currentTextureBitmap ?? undefined) : undefined;
+
+        const preset = { name, version: '1.0', config };
+
+        // ZIPとして保存
+        const blob = await BrushPresetManager.savePreset(preset, textureBitmap);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${name}.zip`;
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch (e) {
+        console.error('Failed to save preset:', e);
+        alert('プリセットの保存に失敗しました。');
+      }
+    });
+
+    // プリセット読み込み
+    loadPresetBtn?.addEventListener('click', () => {
+      presetFileInput.click();
+    });
+
+    presetFileInput.addEventListener('change', async (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (!file || !this.renderPipeline) return;
+
+      try {
+        const preset = await BrushPresetManager.loadPreset(file);
+
+        // ブラシ設定を適用
+        this.applyBrushConfig(preset.config);
+
+        // テクスチャの同期（プリセットにテクスチャがあればロード、なければクリア）
+        if (preset.textureBitmap) {
+          await this.renderPipeline.loadBrushTexture(preset.textureBitmap);
+          this.currentTextureBitmap = preset.textureBitmap;
+          this.state.useTexture = preset.config.useTexture;
+        } else {
+          this.renderPipeline.clearBrushTexture();
+          this.currentTextureBitmap = null;
+          this.state.useTexture = false;
+          this.renderPipeline.updateBrushConfig({ useTexture: false });
+        }
+
+        alert(`プリセット「${preset.name}」を読み込みました。`);
+      } catch (e) {
+        console.error('Failed to load preset:', e);
+        alert('プリセットの読み込みに失敗しました。');
+      }
+      // 入力をリセット
+      presetFileInput.value = '';
+    });
+  }
+
+  /**
+   * 現在のブラシ設定を取得
+   */
+  private getCurrentBrushConfig(): BrushConfig {
+    return {
+      color: { ...this.state.currentColor },
+      wetRatio: this.state.wetRatio,
+      mixMode: this.state.mixMode,
+      usePointColor: false,
+      useTexture: this.state.useTexture,
+      textureScale: this.state.textureScale,
+    };
+  }
+
+  /**
+   * ブラシ設定を適用
+   */
+  private applyBrushConfig(config: BrushConfig): void {
+    // 色を適用
+    this.updateCurrentColor(config.color);
+
+    // 不透明度スライダーを更新
+    const alphaSlider = document.getElementById('brush-alpha') as HTMLInputElement;
+    const alphaVal = document.getElementById('brush-alpha-val')!;
+    const alpha = Math.round(config.color.a * 100);
+    alphaSlider.value = alpha.toString();
+    alphaVal.textContent = alpha.toString();
+
+    // にじみスライダーを更新
+    const wetSlider = document.getElementById('brush-wet') as HTMLInputElement;
+    const wetVal = document.getElementById('brush-wet-val')!;
+    const wet = Math.round(config.wetRatio * 100);
+    wetSlider.value = wet.toString();
+    wetVal.textContent = wet.toString();
+    this.state.wetRatio = config.wetRatio;
+
+    // 方式セレクトを更新
+    const mixModeSelect = document.getElementById('mix-mode') as HTMLSelectElement;
+    mixModeSelect.value = config.mixMode;
+    this.state.mixMode = config.mixMode;
+
+    // テクスチャスケールを更新
+    const textureScaleSlider = document.getElementById('texture-scale') as HTMLInputElement;
+    const textureScaleVal = document.getElementById('texture-scale-val')!;
+    textureScaleSlider.value = config.textureScale.toString();
+    textureScaleVal.textContent = config.textureScale.toString();
+    this.state.textureScale = config.textureScale;
+
+    // RenderPipeline に適用
+    this.renderPipeline?.updateBrushConfig(config);
   }
 
   private handleResize(): void {
