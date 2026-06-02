@@ -44,8 +44,13 @@ export class RenderPipeline {
   }
 
   updateViewport(scale: number, offsetX: number, offsetY: number, rotation: number): void {
-    const { canvas } = this.renderer;
-    this.compositeRenderer.updateViewport(scale, offsetX, offsetY, rotation, canvas.width, canvas.height, window.innerWidth, window.innerHeight);
+    // 紙の四角形のサイズはアートキャンバスのサイズ（committed texture と一致）を渡す。
+    // 画面サイズ（renderer.canvas）を渡すと toCanvas の中心と不一致になり座標がずれる。
+    this.compositeRenderer.updateViewport(
+      scale, offsetX, offsetY, rotation,
+      this.canvasWidth, this.canvasHeight,
+      window.innerWidth, window.innerHeight,
+    );
   }
 
   setEraseMode(enabled: boolean): void {
