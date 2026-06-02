@@ -8,6 +8,7 @@ export interface ViewportTransform {
   offsetX: number;
   offsetY: number;
   rotation: number; // ラジアン
+  flip: number;     // 1=通常, -1=左右反転
 }
 
 export class Viewport {
@@ -15,6 +16,7 @@ export class Viewport {
   private offsetX = 0;
   private offsetY = 0;
   private rotation = 0; // ラジアン
+  private flipX = false;
   private canvasWidth = 0;
   private canvasHeight = 0;
 
@@ -37,10 +39,13 @@ export class Viewport {
     const ry = ox * sin + oy * cos;
 
     // 3. スケールで割る
-    const cx = rx / this.scale;
+    let cx = rx / this.scale;
     const cy = ry / this.scale;
 
-    // 4. キャンバス中心を戻す
+    // 4. 左右反転の逆（flip は ±1 で自己逆元）
+    if (this.flipX) cx = -cx;
+
+    // 5. キャンバス中心を戻す
     return {
       x: cx + this.canvasWidth / 2,
       y: cy + this.canvasHeight / 2,
@@ -86,6 +91,13 @@ export class Viewport {
   }
 
   /**
+   * 左右反転をトグル
+   */
+  toggleFlip(): void {
+    this.flipX = !this.flipX;
+  }
+
+  /**
    * キャンバスサイズを設定
    */
   setCanvasSize(width: number, height: number): void {
@@ -115,6 +127,7 @@ export class Viewport {
     this.offsetX = screenWidth / 2;
     this.offsetY = screenHeight / 2;
     this.rotation = 0;
+    this.flipX = false;
   }
 
   getTransform(): ViewportTransform {
@@ -123,6 +136,7 @@ export class Viewport {
       offsetX: this.offsetX,
       offsetY: this.offsetY,
       rotation: this.rotation,
+      flip: this.flipX ? -1 : 1,
     };
   }
 }

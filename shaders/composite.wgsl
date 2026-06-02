@@ -12,7 +12,10 @@ struct ViewportUniforms {
   canvas_height: f32,
   screen_width: f32,
   screen_height: f32,
-  _padding: f32,
+  flip: f32,        // 左右反転（1=通常, -1=反転）
+  _pad0: f32,
+  _pad1: f32,
+  _pad2: f32,
 }
 
 struct VertexOutput {
@@ -56,8 +59,9 @@ fn vs_display(@builtin(vertex_index) vid: u32) -> VertexOutput {
     vec2f(0.0, 0.0), vec2f(1.0, 0.0)
   );
 
-  // 変換順序: キャンバス中心 → スケール → 回転 → パン
-  let c_pos = canvas_pos[vid] - vec2f(viewport.canvas_width, viewport.canvas_height) * 0.5;
+  // 変換順序: キャンバス中心 → 左右反転 → スケール → 回転 → パン
+  var c_pos = canvas_pos[vid] - vec2f(viewport.canvas_width, viewport.canvas_height) * 0.5;
+  c_pos.x = c_pos.x * viewport.flip; // 中心軸で左右反転
 
   // スケールを適用
   let scaled = c_pos * viewport.scale;

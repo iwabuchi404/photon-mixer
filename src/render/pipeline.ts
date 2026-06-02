@@ -75,11 +75,12 @@ export class RenderPipeline {
     this.updateViewport(1.0, 0, 0, 0);
   }
 
-  updateViewport(scale: number, offsetX: number, offsetY: number, rotation: number): void {
+  updateViewport(scale: number, offsetX: number, offsetY: number, rotation: number, flip = 1): void {
     this.compositeRenderer.updateViewport(
       scale, offsetX, offsetY, rotation,
       this.canvasWidth, this.canvasHeight,
       window.innerWidth, window.innerHeight,
+      flip,
     );
   }
 

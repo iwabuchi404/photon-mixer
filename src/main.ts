@@ -174,7 +174,7 @@ class PhotonMixerApp {
     this.renderPipeline.resizeCanvasSize(width, height);
     this.viewport.reset(width, height, window.innerWidth, window.innerHeight);
     const transform = this.viewport.getTransform();
-    this.renderPipeline.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation);
+    this.renderPipeline.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation, transform.flip);
     this.layerHistories.clear();
     this.rebuildLayerPanel();
     this.updateZoomDisplay();
@@ -301,7 +301,7 @@ class PhotonMixerApp {
       // ビューポートを作り直したキャンバスに合わせて再配置
       this.viewport.reset(width, height, window.innerWidth, window.innerHeight);
       const t = this.viewport.getTransform();
-      this.renderPipeline.updateViewport(t.scale, t.offsetX, t.offsetY, t.rotation);
+      this.renderPipeline.updateViewport(t.scale, t.offsetX, t.offsetY, t.rotation, t.flip);
       // 履歴はピクセルから復元できないためクリア（読込後の Undo は不可）
       this.layerHistories.clear();
       this.rebuildLayerPanel();
@@ -317,6 +317,34 @@ class PhotonMixerApp {
     if (zoomVal) {
       zoomVal.textContent = Math.round(this.viewport.getTransform().scale * 100).toString();
     }
+  }
+
+  /** 現在のビューポート状態をパイプラインへ反映 */
+  private applyViewport(): void {
+    const t = this.viewport.getTransform();
+    this.renderPipeline?.updateViewport(t.scale, t.offsetX, t.offsetY, t.rotation, t.flip);
+  }
+
+  /** UI パネルの表示/非表示をトグル（Tab） */
+  private uiHidden = false;
+  private toggleUI(): void {
+    this.uiHidden = !this.uiHidden;
+    const display = this.uiHidden ? 'none' : '';
+    for (const id of ['brush-controls', 'layer-panel', 'perf-monitor']) {
+      const el = document.getElementById(id);
+      if (el) el.style.display = display;
+    }
+  }
+
+  /** ブラシサイズを delta だけ増減（[ ] ショートカット用） */
+  private adjustBrushSize(delta: number): void {
+    const slider = document.getElementById('brush-size') as HTMLInputElement;
+    const num = document.getElementById('brush-size-num') as HTMLInputElement;
+    const next = Math.max(1, Math.min(100, parseInt(slider.value) + delta));
+    slider.value = next.toString();
+    num.value = next.toString();
+    const baseSize = Math.max(1, Math.round(next * 0.1));
+    this.strokeManager.updatePressureConfig({ maxSize: next, baseSize });
   }
 
   private isProgressiveMixing(): boolean {
@@ -427,7 +455,7 @@ class PhotonMixerApp {
         this.viewport.zoom(factor, e.clientX, e.clientY);
       }
       const transform = this.viewport.getTransform();
-      this.renderPipeline?.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation);
+      this.renderPipeline?.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation, transform.flip);
       this.updateZoomDisplay();
     }, { passive: false });
 
@@ -436,34 +464,61 @@ class PhotonMixerApp {
     let lastY = 0;
 
     window.addEventListener('keydown', (e) => {
+      // 入力欄フォーカス中はショートカットを抑制（誤発火防止）
+      const tag = (document.activeElement as HTMLElement | null)?.tagName;
+      if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+
+      // --- Ctrl 系 ---
+      if (e.ctrlKey) {
+        if (e.key === 'z') {
+          e.preventDefault();
+          if (this.activeHistory().undo()) this.renderPipeline?.rebakeFromRecords(this.activeHistory().getAllRecords());
+          return;
+        }
+        if (e.key === 'y' || (e.shiftKey && e.key === 'Z')) {
+          e.preventDefault();
+          if (this.activeHistory().redo()) this.renderPipeline?.rebakeFromRecords(this.activeHistory().getAllRecords());
+          return;
+        }
+        if (e.shiftKey && (e.key === 'S' || e.key === 's')) { // Ctrl+Shift+S: PNG
+          e.preventDefault();
+          document.getElementById('export-png-btn')?.dispatchEvent(new Event('click'));
+          return;
+        }
+        if (e.key === 's') { // Ctrl+S: .pmx 保存
+          e.preventDefault();
+          this.savePmxFile();
+          return;
+        }
+        return; // 他の Ctrl 組み合わせはブラウザに任せる
+      }
+
+      // --- 単キー ---
       if (e.code === 'Space') {
         this.state.isPanning = true;
         canvas.style.cursor = 'grab';
+        return;
       }
-      // Undo/Redo
-      if (e.ctrlKey && e.key === 'z') {
-        e.preventDefault();
-        if (this.activeHistory().undo()) {
-          this.renderPipeline?.rebakeFromRecords(this.activeHistory().getAllRecords());
-        }
-      }
-      if (e.ctrlKey && (e.key === 'y' || (e.shiftKey && e.key === 'Z'))) {
-        e.preventDefault();
-        if (this.activeHistory().redo()) {
-          this.renderPipeline?.rebakeFromRecords(this.activeHistory().getAllRecords());
-        }
-      }
-      // ツール切り替えショートカット
-      if (e.key === 'b') this.setTool('brush');
-      if (e.key === 'e') this.setTool('eraser');
-      if (e.key === 'i') this.setTool('spoit');
-      if (e.key === 'g') this.setTool('bucket');
-      if (e.key === 'r') {
-        // R キーで回転リセット
-        e.preventDefault();
-        this.viewport.resetRotation();
-        const transform = this.viewport.getTransform();
-        this.renderPipeline?.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation);
+      switch (e.key) {
+        case 'b': this.setTool('brush'); break;
+        case 'e': this.setTool('eraser'); break;
+        case 'i': this.setTool('spoit'); break;
+        case 'g': this.setTool('bucket'); break;
+        case '[': this.adjustBrushSize(-2); break;
+        case ']': this.adjustBrushSize(+2); break;
+        case 'h': // 左右反転
+          this.viewport.toggleFlip();
+          this.applyViewport();
+          break;
+        case 'r': // 回転リセット
+          e.preventDefault();
+          this.viewport.resetRotation();
+          this.applyViewport();
+          break;
+        case 'Tab': // UIパネルの表示/非表示
+          e.preventDefault();
+          this.toggleUI();
+          break;
       }
       if (e.key === 'Alt') {
         e.preventDefault();
@@ -494,11 +549,37 @@ class PhotonMixerApp {
         const dy = e.clientY - lastY;
         this.viewport.pan(dx, dy);
         const transform = this.viewport.getTransform();
-        this.renderPipeline?.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation);
+        this.renderPipeline?.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation, transform.flip);
         lastX = e.clientX;
         lastY = e.clientY;
       }
+      this.updateBrushCursor(e.clientX, e.clientY, true);
     });
+
+    // カーソルがウィンドウ外/UI上に出たら隠す
+    window.addEventListener('mouseout', () => this.updateBrushCursor(0, 0, false));
+  }
+
+  /**
+   * ブラシカーソル（円）を画面位置に追従させる
+   * 半径 = ブラシ径 × ズーム倍率（画面上の実寸）
+   */
+  private updateBrushCursor(sx: number, sy: number, visible: boolean): void {
+    const el = document.getElementById('brush-cursor');
+    if (!el) return;
+    // パン中やスポイト/バケツ時は非表示（描画系ツールのみ表示）
+    const drawing = this.state.currentTool === 'brush' || this.state.currentTool === 'eraser';
+    if (!visible || this.state.isPanning || !drawing) {
+      el.style.display = 'none';
+      return;
+    }
+    const size = this.strokeManager.getPressureConfig().maxSize;
+    const diameter = size * this.viewport.getTransform().scale;
+    el.style.width = `${diameter}px`;
+    el.style.height = `${diameter}px`;
+    el.style.left = `${sx}px`;
+    el.style.top = `${sy}px`;
+    el.style.display = 'block';
   }
 
   private setTool(tool: Tool): void {
@@ -1003,7 +1084,7 @@ class PhotonMixerApp {
     this.renderPipeline.resizeScreenSize(window.innerWidth, window.innerHeight);
     // リサイズ後もビューポートを更新
     const transform = this.viewport.getTransform();
-    this.renderPipeline.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation);
+    this.renderPipeline.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation, transform.flip);
   }
 
   private startRenderLoop(): void {
