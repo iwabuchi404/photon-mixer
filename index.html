@@ -200,6 +200,17 @@
       <input type="range" id="texture-scale" min="1" max="20" value="1" style="width: 50px;">
       <span id="texture-scale-val" class="ctrl-val">1</span>x
     </div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">許容値</span>
+      <input type="range" id="bucket-tolerance" min="0" max="100" value="0" style="width: 50px;">
+      <span id="bucket-tolerance-val" class="ctrl-val">0</span>%
+    </div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">背景</span>
+      <button id="bg-transparent" class="tool-btn active" style="flex:1;">透明</button>
+      <button id="bg-white" class="tool-btn" style="flex:1;">白</button>
+      <input type="color" id="bg-color" value="#ffffff" style="width: 28px; height: 18px; border: none; cursor: pointer;">
+    </div>
     <div class="ctrl-row" style="margin-top: 8px; border-top: 1px solid #333; padding-top: 8px;">
       <span class="ctrl-label">プリセット</span>
       <button id="save-preset-btn" class="tool-btn" style="flex: 1;">保存</button>

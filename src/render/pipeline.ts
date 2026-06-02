@@ -48,6 +48,8 @@ export class RenderPipeline {
 
   private currentStroke: StrokePoint[] = [];
   private eraseMode = false;
+  // 背景色（リニア・不透明）。null は透明（台紙が透ける）
+  private backgroundColor: { r: number; g: number; b: number } | null = null;
 
   private canvasWidth = 0;
   private canvasHeight = 0;
@@ -147,6 +149,21 @@ export class RenderPipeline {
     this.renderer.device.queue.submit([encoder.finish()]);
   }
 
+  /** 合成下地を背景色（不透明・プリマルチプライド=straight, a=1）or 透明でクリア */
+  private clearToBackground(texture: GPUTexture): void {
+    const bg = this.backgroundColor;
+    const clearValue = bg ? { r: bg.r, g: bg.g, b: bg.b, a: 1 } : { r: 0, g: 0, b: 0, a: 0 };
+    const encoder = this.renderer.device.createCommandEncoder();
+    encoder.beginRenderPass({
+      colorAttachments: [{ view: texture.createView(), clearValue, loadOp: 'clear', storeOp: 'store' }],
+    }).end();
+    this.renderer.device.queue.submit([encoder.finish()]);
+  }
+
+  setBackgroundColor(color: { r: number; g: number; b: number } | null): void {
+    this.backgroundColor = color;
+  }
+
   // --- 描画（アクティブレイヤー対象）---
 
   setCurrentStroke(points: StrokePoint[]): void {
@@ -195,8 +212,8 @@ export class RenderPipeline {
       activeSrc = this.activeComposite;
     }
 
-    // ping-pong 合成。acc を透明にクリアして下から重ねる
-    this.clearTextureContent(this.displayA);
+    // ping-pong 合成。acc を背景色（or 透明）にクリアして下から重ねる
+    this.clearToBackground(this.displayA);
     let acc = this.displayA;
     let other = this.displayB;
 

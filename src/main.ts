@@ -14,6 +14,7 @@ import { srgbToLinear, linearColorToSrgb } from './color/linear.js';
 import { linearToOklab, oklabToLinear, mixOklab } from './color/oklab.js';
 import { BrushPresetManager } from './brush-preset.js';
 import { savePmx, loadPmx } from './pmx.js';
+import { saveAutosave, loadAutosave } from './autosave.js';
 import type { LinearColor } from './color/types.js';
 import type { StrokePoint } from './pen/stroke.js';
 import type { BrushConfig } from './render/brush.js';
@@ -79,6 +80,7 @@ interface AppState {
   isPanning: boolean;
   useTexture: boolean;
   textureScale: number;
+  bucketTolerance: number; // 0-1（塗りつぶしの色差許容）
 }
 
 class PhotonMixerApp {
@@ -101,6 +103,7 @@ class PhotonMixerApp {
     isPanning: false,
     useTexture: false,
     textureScale: 1.0,
+    bucketTolerance: 0,
   };
 
   private rawPoints: import('./pen/input.js').PointerPoint[] = [];
@@ -164,9 +167,47 @@ class PhotonMixerApp {
       this.createNewCanvas(w, h);
       modal.style.display = 'none';
       this.startRenderLoop();
+      this.startAutosave();
     });
 
+    // 自動保存の復元提案（前回作業があれば）
+    try {
+      const auto = await loadAutosave();
+      if (auto) {
+        const when = new Date(auto.savedAt).toLocaleString();
+        if (confirm(`前回の作業（${when}）が見つかりました。復元しますか？`)) {
+          const file = new File([auto.blob], 'autosave.pmx');
+          await this.openPmxFile(file);
+          modal.style.display = 'none';
+          this.startRenderLoop();
+          this.startAutosave();
+        }
+      }
+    } catch (e) {
+      console.warn('autosave restore check failed:', e);
+    }
+
     console.log('PhotonMixer initialized (waiting for canvas creation)');
+  }
+
+  /**
+   * 自動保存ループ（一定間隔で現在のプロジェクトを IndexedDB に退避）
+   */
+  private autosaveTimer: number | null = null;
+  private startAutosave(): void {
+    if (this.autosaveTimer !== null) return;
+    const INTERVAL = 3 * 60 * 1000; // 3分
+    this.autosaveTimer = window.setInterval(async () => {
+      if (!this.renderPipeline) return;
+      try {
+        const { width, height } = this.renderPipeline.getCanvasSize();
+        const layers = await this.renderPipeline.readAllLayers();
+        const blob = savePmx(width, height, layers, this.renderPipeline.getActiveLayerId());
+        await saveAutosave(blob);
+      } catch (e) {
+        console.warn('autosave failed:', e);
+      }
+    }, INTERVAL);
   }
 
   private createNewCanvas(width: number, height: number): void {
@@ -636,28 +677,22 @@ class PhotonMixerApp {
       float32ToFloat16(ta),
     ]);
 
-    const start16 = new Uint16Array([
-      data[iy * uint16sPerRow + ix * 4],
-      data[iy * uint16sPerRow + ix * 4 + 1],
-      data[iy * uint16sPerRow + ix * 4 + 2],
-      data[iy * uint16sPerRow + ix * 4 + 3],
-    ]);
-
-    // 色が同じなら何もしない
-    if (target16.every((v, i) => v === start16[i])) return;
+    // 開始点の straight color（許容値比較の基準）
+    const startStraight = this.pixelStraight(data, ix, iy, uint16sPerRow);
+    const tol = this.state.bucketTolerance;
 
     // シンプルなシードフィル (スキャンライン)
     const stack: [number, number][] = [[ix, iy]];
     const processed = new Uint8Array(width * height);
-    
+
     while (stack.length > 0) {
       const [cx, cy] = stack.pop()!;
       let lx = cx;
-      while (lx > 0 && this.isSameColor(data, lx - 1, cy, start16, uint16sPerRow)) {
+      while (lx > 0 && this.isSameColor(data, lx - 1, cy, startStraight, tol, uint16sPerRow)) {
         lx--;
       }
       let rx = cx;
-      while (rx < width - 1 && this.isSameColor(data, rx + 1, cy, start16, uint16sPerRow)) {
+      while (rx < width - 1 && this.isSameColor(data, rx + 1, cy, startStraight, tol, uint16sPerRow)) {
         rx++;
       }
 
@@ -669,10 +704,10 @@ class PhotonMixerApp {
         data[idx + 3] = target16[3];
         processed[cy * width + i] = 1;
 
-        if (cy > 0 && !processed[(cy - 1) * width + i] && this.isSameColor(data, i, cy - 1, start16, uint16sPerRow)) {
+        if (cy > 0 && !processed[(cy - 1) * width + i] && this.isSameColor(data, i, cy - 1, startStraight, tol, uint16sPerRow)) {
           stack.push([i, cy - 1]);
         }
-        if (cy < height - 1 && !processed[(cy + 1) * width + i] && this.isSameColor(data, i, cy + 1, start16, uint16sPerRow)) {
+        if (cy < height - 1 && !processed[(cy + 1) * width + i] && this.isSameColor(data, i, cy + 1, startStraight, tol, uint16sPerRow)) {
           stack.push([i, cy + 1]);
         }
       }
@@ -683,10 +718,28 @@ class PhotonMixerApp {
     this.activeHistory().addRecord({ kind: 'fill', snapshot: data, bytesPerRow: snap.bytesPerRow });
   }
 
-  private isSameColor(data: Uint16Array, x: number, y: number, ref16: Uint16Array, uint16sPerRow: number): boolean {
+  /** ピクセルを straight color（アンプリマルチプライド）で取得 */
+  private pixelStraight(data: Uint16Array, x: number, y: number, uint16sPerRow: number): LinearColor {
     const idx = y * uint16sPerRow + x * 4;
-    // 許容誤差 (Tolerance) は一旦 0
-    return data[idx] === ref16[0] && data[idx + 1] === ref16[1] && data[idx + 2] === ref16[2] && data[idx + 3] === ref16[3];
+    const a = float16ToFloat32(data[idx + 3]);
+    const inv = a > 0.0001 ? 1 / a : 0;
+    return {
+      r: float16ToFloat32(data[idx]) * inv,
+      g: float16ToFloat32(data[idx + 1]) * inv,
+      b: float16ToFloat32(data[idx + 2]) * inv,
+      a,
+    };
+  }
+
+  /**
+   * 許容値つき同色判定。straight color の各チャンネル差と α 差が tol 以内なら同色
+   */
+  private isSameColor(data: Uint16Array, x: number, y: number, ref: LinearColor, tol: number, uint16sPerRow: number): boolean {
+    const c = this.pixelStraight(data, x, y, uint16sPerRow);
+    return Math.abs(c.r - ref.r) <= tol
+      && Math.abs(c.g - ref.g) <= tol
+      && Math.abs(c.b - ref.b) <= tol
+      && Math.abs(c.a - ref.a) <= tol;
   }
 
   /**
@@ -893,6 +946,40 @@ class PhotonMixerApp {
     document.getElementById('layer-down')?.addEventListener('click', () => {
       this.renderPipeline?.moveActiveLayer('down');
       this.rebuildLayerPanel();
+    });
+
+    // 塗りつぶし許容値
+    const tolSlider = document.getElementById('bucket-tolerance') as HTMLInputElement;
+    const tolVal = document.getElementById('bucket-tolerance-val')!;
+    tolSlider?.addEventListener('input', () => {
+      this.state.bucketTolerance = parseInt(tolSlider.value) / 100;
+      tolVal.textContent = tolSlider.value;
+    });
+
+    // 背景色
+    const bgTransparent = document.getElementById('bg-transparent');
+    const bgWhite = document.getElementById('bg-white');
+    const bgColor = document.getElementById('bg-color') as HTMLInputElement;
+    const setBgActive = (which: 'transparent' | 'white' | 'custom') => {
+      bgTransparent?.classList.toggle('active', which === 'transparent');
+      bgWhite?.classList.toggle('active', which === 'white');
+    };
+    bgTransparent?.addEventListener('click', () => {
+      this.renderPipeline?.setBackgroundColor(null);
+      setBgActive('transparent');
+    });
+    bgWhite?.addEventListener('click', () => {
+      this.renderPipeline?.setBackgroundColor({ r: 1, g: 1, b: 1 });
+      setBgActive('white');
+    });
+    bgColor?.addEventListener('input', () => {
+      const hex = bgColor.value;
+      this.renderPipeline?.setBackgroundColor({
+        r: srgbToLinear(parseInt(hex.substring(1, 3), 16) / 255),
+        g: srgbToLinear(parseInt(hex.substring(3, 5), 16) / 255),
+        b: srgbToLinear(parseInt(hex.substring(5, 7), 16) / 255),
+      });
+      setBgActive('custom');
     });
 
     // .pmx 保存 / 開く
