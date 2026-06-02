@@ -160,6 +160,8 @@
     <div class="ctrl-row">
       <button id="tool-brush" class="tool-btn active" title="ブラシ (B)">🖌️</button>
       <button id="tool-eraser" class="tool-btn" title="消しゴム (E)">🧹</button>
+      <button id="tool-blur" class="tool-btn" title="ぼかし (U)">💧</button>
+      <button id="tool-line" class="tool-btn" title="直線 (V)">📏</button>
       <button id="tool-spoit" class="tool-btn" title="スポイト (I)">🧪</button>
       <button id="tool-bucket" class="tool-btn" title="バケツ (G)">🪣</button>
     </div>
@@ -178,6 +180,20 @@
       <span class="ctrl-label">にじみ</span>
       <input type="range" id="brush-wet" min="0" max="100" value="0">
       <span id="brush-wet-val" class="ctrl-val">0</span>%
+    </div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">補正</span>
+      <input type="range" id="brush-stabilize" min="0" max="100" value="30">
+      <span id="brush-stabilize-val" class="ctrl-val">30</span>%
+    </div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">筆圧</span>
+      <select id="pressure-curve" style="width:80px;font-family:monospace;font-size:11px;background:#1a1a1a;color:#fff;border:1px solid #444;cursor:pointer;">
+        <option value="smooth">標準</option>
+        <option value="linear">リニア</option>
+        <option value="ease-in">入り遅</option>
+        <option value="ease-out">入り早</option>
+      </select>
     </div>
     <div class="ctrl-row">
       <span class="ctrl-label">方式</span>

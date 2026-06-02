@@ -69,7 +69,7 @@ function sampleSnapshot(
   };
 }
 
-type Tool = 'brush' | 'eraser' | 'spoit' | 'bucket';
+type Tool = 'brush' | 'eraser' | 'spoit' | 'bucket' | 'blur' | 'line';
 
 interface AppState {
   isDrawing: boolean;
@@ -184,7 +184,8 @@ class PhotonMixerApp {
         }
       }
     } catch (e) {
-      console.warn('autosave restore check failed:', e);
+      // 自動保存スロットが無い/未初期化でも致命的ではない
+      console.log('autosave restore skipped:', (e as Error)?.message ?? e);
     }
 
     console.log('PhotonMixer initialized (waiting for canvas creation)');
@@ -392,6 +393,16 @@ class PhotonMixerApp {
     return this.state.mixMode === 'progressive' && this.state.wetRatio > 0;
   }
 
+  /** 引きずり混色 or ぼかし筆（どちらも smudge ベースの点ごとの色処理を使う） */
+  private usesSmudge(): boolean {
+    return this.isProgressiveMixing() || this.state.currentTool === 'blur';
+  }
+
+  // 直線ツール用：始点（キャンバス座標）
+  private lineStart: { x: number; y: number } | null = null;
+  // Shift 押下状態（直線の角度スナップ用）
+  private shiftDown = false;
+
   private handlePenInput(event: import('./pen/input.js').PenInputEvent): void {
     if (this.state.isPanning) return;
 
@@ -411,6 +422,11 @@ class PhotonMixerApp {
           this.handleBucketFill(transformedPoint.x, transformedPoint.y);
           return;
         }
+        if (this.state.currentTool === 'line') {
+          this.state.isDrawing = true;
+          this.lineStart = { x: transformedPoint.x, y: transformedPoint.y };
+          return;
+        }
 
         this.state.isDrawing = true;
         this.rawPoints = [transformedPoint];
@@ -418,7 +434,7 @@ class PhotonMixerApp {
         // 消しゴムモードならパイプライン切り替え
         this.renderPipeline?.setEraseMode(this.state.currentTool === 'eraser');
 
-        if (this.isProgressiveMixing()) {
+        if (this.usesSmudge()) {
           // 点ごとの色を使うモードに切り替えてスナップショットを非同期取得
           this.renderPipeline?.updateBrushConfig({ usePointColor: true });
           this.committedSnapshot = null;
@@ -431,9 +447,13 @@ class PhotonMixerApp {
 
       case 'move': {
         if (!this.state.isDrawing) return;
+        if (this.state.currentTool === 'line') {
+          this.renderPipeline?.setCurrentStroke(this.buildLineStroke(transformedPoint.x, transformedPoint.y));
+          return;
+        }
         this.rawPoints.push(transformedPoint);
 
-        if (this.isProgressiveMixing()) {
+        if (this.usesSmudge()) {
           this.handleProgressiveMove();
         } else {
           this.handleStampMove();
@@ -447,8 +467,21 @@ class PhotonMixerApp {
       case 'up': {
         if (!this.state.isDrawing) return;
 
+        if (this.state.currentTool === 'line') {
+          const line = this.buildLineStroke(transformedPoint.x, transformedPoint.y);
+          if (line.length > 0) {
+            this.bakeColorIntoPoints(line);
+            this.renderPipeline?.commitStroke(line);
+            this.activeHistory().addRecord({ kind: 'stroke', points: line, erase: false });
+          }
+          this.renderPipeline?.setCurrentStroke([]);
+          this.lineStart = null;
+          this.state.isDrawing = false;
+          return;
+        }
+
         const erase = this.state.currentTool === 'eraser';
-        if (this.isProgressiveMixing()) {
+        if (this.usesSmudge()) {
           // 色付きの全点を over blend で committed へ確定（別ストロークと正しく合成）
           const colored = this.buildColoredStroke();
           if (colored.length > 0) {
@@ -540,11 +573,14 @@ class PhotonMixerApp {
         canvas.style.cursor = 'grab';
         return;
       }
+      if (e.key === 'Shift') this.shiftDown = true;
       switch (e.key) {
         case 'b': this.setTool('brush'); break;
         case 'e': this.setTool('eraser'); break;
         case 'i': this.setTool('spoit'); break;
         case 'g': this.setTool('bucket'); break;
+        case 'u': this.setTool('blur'); break;
+        case 'v': this.setTool('line'); break;
         case '[': this.adjustBrushSize(-2); break;
         case ']': this.adjustBrushSize(+2); break;
         case 'h': // 左右反転
@@ -573,6 +609,7 @@ class PhotonMixerApp {
         this.state.isPanning = false;
         canvas.style.cursor = 'crosshair';
       }
+      if (e.key === 'Shift') this.shiftDown = false;
       if (e.key === 'Alt' && this.prevTool) {
         this.setTool(this.prevTool);
         this.prevTool = null;
@@ -625,7 +662,7 @@ class PhotonMixerApp {
 
   private setTool(tool: Tool): void {
     this.state.currentTool = tool;
-    const tools: Tool[] = ['brush', 'eraser', 'spoit', 'bucket'];
+    const tools: Tool[] = ['brush', 'eraser', 'spoit', 'bucket', 'blur', 'line'];
     tools.forEach(t => {
       const btn = document.getElementById(`tool-${t}`);
       if (btn) btn.classList.toggle('active', t === tool);
@@ -772,7 +809,9 @@ class PhotonMixerApp {
     if (stroke.length === 0) return stroke;
 
     const orig = this.state.currentColor;
-    const wet = this.state.wetRatio;
+    // ぼかし筆: ブラシ色を注入せず既存色だけを引き伸ばす（deposit=smudge）
+    const blur = this.state.currentTool === 'blur';
+    const wet = blur ? 1.0 : this.state.wetRatio;
     const snap = this.committedSnapshot;
     const canvas = this.renderer!.canvas;
 
@@ -791,7 +830,8 @@ class PhotonMixerApp {
       const rate = 1 - Math.exp(-dist / SMUDGE_LEN);
 
       // ① smudge をドリフト
-      let targetOklab = origOklab; // 空白上はブラシ色へ戻る
+      // ブラシ混色は空白でブラシ色へ戻すが、ぼかしは空白では現状の smudge を保持
+      let targetOklab = blur ? linearToOklab(smudge) : origOklab;
       let driftT = rate;
       if (snap) {
         const cc = sampleSnapshot(snap.data, p.x, p.y, canvas.width, canvas.height, snap.bytesPerRow);
@@ -806,12 +846,40 @@ class PhotonMixerApp {
         smudge = { r: s.r, g: s.g, b: s.b, a: orig.a };
       }
 
-      // ② deposit = ブラシ色と smudge を wet で補間（ブラシ色を常に再注入）
+      // ② deposit = ブラシ色と smudge を wet で補間（ぼかしは wet=1 → smudge そのもの）
       const dep = oklabToLinear(mixOklab(origOklab, linearToOklab(smudge), wet));
       p.color = { r: dep.r, g: dep.g, b: dep.b, a: orig.a };
     }
 
     return stroke;
+  }
+
+  /**
+   * 始点→現在点の直線をストロークとして生成（Shift で角度スナップ）
+   */
+  private buildLineStroke(ex: number, ey: number): StrokePoint[] {
+    if (!this.lineStart) return [];
+    let { x: sx, y: sy } = this.lineStart;
+    let dx = ex - sx, dy = ey - sy;
+
+    // Shift: 0/45/90度にスナップ
+    if (this.shiftDown) {
+      const len = Math.hypot(dx, dy);
+      const ang = Math.atan2(dy, dx);
+      const snapped = Math.round(ang / (Math.PI / 4)) * (Math.PI / 4);
+      dx = Math.cos(snapped) * len;
+      dy = Math.sin(snapped) * len;
+    }
+
+    const len = Math.hypot(dx, dy);
+    const steps = Math.max(2, Math.ceil(len)); // 1px 間隔
+    const pressure = 0.7; // 直線は一定筆圧
+    const raw: import('./pen/input.js').PointerPoint[] = [];
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      raw.push({ x: sx + dx * t, y: sy + dy * t, pressure, tiltX: 0, tiltY: 0, timestamp: 0 });
+    }
+    return this.strokeManager.finalizeStroke(raw);
   }
 
   /**
@@ -845,6 +913,8 @@ class PhotonMixerApp {
     eraserBtn?.addEventListener('click', () => this.setTool('eraser'));
     spoitBtn?.addEventListener('click', () => this.setTool('spoit'));
     bucketBtn?.addEventListener('click', () => this.setTool('bucket'));
+    document.getElementById('tool-blur')?.addEventListener('click', () => this.setTool('blur'));
+    document.getElementById('tool-line')?.addEventListener('click', () => this.setTool('line'));
 
     const sizeSlider    = document.getElementById('brush-size')    as HTMLInputElement;
     const sizeNum       = document.getElementById('brush-size-num') as HTMLInputElement;
@@ -946,6 +1016,24 @@ class PhotonMixerApp {
     document.getElementById('layer-down')?.addEventListener('click', () => {
       this.renderPipeline?.moveActiveLayer('down');
       this.rebuildLayerPanel();
+    });
+
+    // 手ブレ補正の強度（0%=補正なし, 100%=最も滑らか）
+    const stabSlider = document.getElementById('brush-stabilize') as HTMLInputElement;
+    const stabVal = document.getElementById('brush-stabilize-val')!;
+    const applyStabilize = (pct: number) => {
+      stabVal.textContent = pct.toString();
+      // 0% → minAlpha=1.0（補正オフ）, 100% → minAlpha=0.1（強い補正）
+      const minAlpha = 1.0 - (pct / 100) * 0.9;
+      this.stabilizer.updateConfig({ minAlpha });
+    };
+    stabSlider?.addEventListener('input', () => applyStabilize(parseInt(stabSlider.value)));
+    applyStabilize(parseInt(stabSlider.value)); // 初期値を反映
+
+    // 筆圧カーブ
+    const curveSel = document.getElementById('pressure-curve') as HTMLSelectElement;
+    curveSel?.addEventListener('change', () => {
+      this.strokeManager.updatePressureConfig({ curve: curveSel.value as any });
     });
 
     // 塗りつぶし許容値
