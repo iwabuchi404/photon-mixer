@@ -266,6 +266,72 @@ export class RenderPipeline {
     if (l) l.visible = visible;
   }
 
+  getCanvasSize(): { width: number; height: number } {
+    return { width: this.canvasWidth, height: this.canvasHeight };
+  }
+
+  /**
+   * 全レイヤーのメタ情報とピクセルデータ（tight packed float16 RGBA）を読み出す
+   * .pmx 保存用
+   */
+  async readAllLayers(): Promise<{ info: LayerInfo; data: Uint16Array }[]> {
+    const { device } = this.renderer;
+    const w = this.canvasWidth, h = this.canvasHeight;
+    const bytesPerRow = Math.ceil(w * 8 / 256) * 256;
+    const alignedU16 = bytesPerRow / 2;
+
+    const out: { info: LayerInfo; data: Uint16Array }[] = [];
+    for (const layer of this.layers) {
+      const staging = device.createBuffer({ size: bytesPerRow * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      const enc = device.createCommandEncoder();
+      enc.copyTextureToBuffer({ texture: layer.committed }, { buffer: staging, bytesPerRow }, [w, h]);
+      device.queue.submit([enc.finish()]);
+      await staging.mapAsync(GPUMapMode.READ);
+      const aligned = new Uint16Array(staging.getMappedRange());
+      // 256アライン → tight（width*4 u16/row）に詰め直す
+      const tight = new Uint16Array(w * h * 4);
+      for (let y = 0; y < h; y++) {
+        tight.set(aligned.subarray(y * alignedU16, y * alignedU16 + w * 4), y * w * 4);
+      }
+      staging.unmap(); staging.destroy();
+      out.push({
+        info: { id: layer.id, name: layer.name, visible: layer.visible, opacity: layer.opacity, blendMode: layer.blendMode },
+        data: tight,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * .pmx 読込：キャンバスを作り直し、保存データから全レイヤーを復元する
+   */
+  loadLayers(width: number, height: number, layers: { info: LayerInfo; data: Uint16Array }[], activeId: string): void {
+    // テクスチャ群をサイズ変更（レイヤーは createTextures で1枚に初期化される）
+    this.resizeCanvasSize(width, height);
+    // 既存レイヤー（初期1枚）を破棄して保存データで再構築
+    for (const l of this.layers) l.committed.destroy();
+    this.layers = layers.map(({ info, data }) => {
+      const tex = this.makeLayerTexture();
+      this.writeLayerTight(tex, data);
+      return { ...info, committed: tex };
+    });
+    if (this.layers.length === 0) this.layers = [this.createLayer('レイヤー 1')];
+    const idx = this.layers.findIndex(l => l.id === activeId);
+    this.activeIndex = idx >= 0 ? idx : 0;
+  }
+
+  /** tight packed float16 データをテクスチャに書き込む */
+  private writeLayerTight(tex: GPUTexture, data: Uint16Array): void {
+    const { device } = this.renderer;
+    const w = this.canvasWidth, h = this.canvasHeight;
+    device.queue.writeTexture(
+      { texture: tex },
+      data as unknown as BufferSource,
+      { bytesPerRow: w * 8, rowsPerImage: h }, // writeTexture は 256 アライン不要
+      [w, h],
+    );
+  }
+
   setLayerOpacity(id: string, opacity: number): void {
     const l = this.layers.find(l => l.id === id);
     if (l) l.opacity = opacity;

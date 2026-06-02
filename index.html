@@ -205,11 +205,16 @@
       <button id="save-preset-btn" class="tool-btn" style="flex: 1;">保存</button>
       <button id="load-preset-btn" class="tool-btn" style="flex: 1;">読込</button>
     </div>
+    <div class="ctrl-row" style="margin-top: 4px;">
+      <button id="save-pmx-btn" class="tool-btn" style="flex: 1;">保存(.pmx)</button>
+      <button id="open-pmx-btn" class="tool-btn" style="flex: 1;">開く</button>
+    </div>
     <button id="export-png-btn" style="width: 100%; margin: 4px 0; padding: 4px 0; background: #2a2a2a; color: #ccc; border: 1px solid #444; border-radius: 3px; cursor: pointer; font-family: monospace; font-size: 11px;">PNG 書き出し</button>
     <button id="clear-btn">クリア</button>
   </div>
   <input type="file" id="texture-file-input" accept="image/*" style="display: none;">
   <input type="file" id="preset-file-input" accept=".zip" style="display: none;">
+  <input type="file" id="pmx-file-input" accept=".pmx" style="display: none;">
 
   <!-- レイヤーパネル（右下） -->
   <div id="layer-panel" style="position: fixed; right: 10px; bottom: 10px; width: 220px; background: rgba(0,0,0,0.85); border: 1px solid #444; border-radius: 5px; font-family: monospace; font-size: 11px; color: #ccc; z-index: 1000;">

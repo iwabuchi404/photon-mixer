@@ -13,6 +13,7 @@ import { Viewport } from './viewport.js';
 import { srgbToLinear, linearColorToSrgb } from './color/linear.js';
 import { linearToOklab, oklabToLinear, mixOklab } from './color/oklab.js';
 import { BrushPresetManager } from './brush-preset.js';
+import { savePmx, loadPmx } from './pmx.js';
 import type { LinearColor } from './color/types.js';
 import type { StrokePoint } from './pen/stroke.js';
 import type { BrushConfig } from './render/brush.js';
@@ -264,6 +265,50 @@ class PhotonMixerApp {
       row.appendChild(top);
       row.appendChild(ctl);
       list.appendChild(row);
+    }
+  }
+
+  /**
+   * 現在の全レイヤーを .pmx として保存
+   */
+  private async savePmxFile(): Promise<void> {
+    if (!this.renderPipeline) return;
+    try {
+      const { width, height } = this.renderPipeline.getCanvasSize();
+      const layers = await this.renderPipeline.readAllLayers();
+      const activeId = this.renderPipeline.getActiveLayerId();
+      const blob = savePmx(width, height, layers, activeId);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `photonmixer_${Date.now()}.pmx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error('Failed to save .pmx:', e);
+      alert('.pmx の保存に失敗しました。');
+    }
+  }
+
+  /**
+   * .pmx を読み込んで全レイヤーを復元
+   */
+  private async openPmxFile(file: File): Promise<void> {
+    if (!this.renderPipeline) return;
+    try {
+      const { width, height, activeId, layers } = await loadPmx(file);
+      this.renderPipeline.loadLayers(width, height, layers, activeId);
+      // ビューポートを作り直したキャンバスに合わせて再配置
+      this.viewport.reset(width, height, window.innerWidth, window.innerHeight);
+      const t = this.viewport.getTransform();
+      this.renderPipeline.updateViewport(t.scale, t.offsetX, t.offsetY, t.rotation);
+      // 履歴はピクセルから復元できないためクリア（読込後の Undo は不可）
+      this.layerHistories.clear();
+      this.rebuildLayerPanel();
+      this.updateZoomDisplay();
+    } catch (e) {
+      console.error('Failed to open .pmx:', e);
+      alert('.pmx の読み込みに失敗しました。');
     }
   }
 
@@ -767,6 +812,17 @@ class PhotonMixerApp {
     document.getElementById('layer-down')?.addEventListener('click', () => {
       this.renderPipeline?.moveActiveLayer('down');
       this.rebuildLayerPanel();
+    });
+
+    // .pmx 保存 / 開く
+    document.getElementById('save-pmx-btn')?.addEventListener('click', () => this.savePmxFile());
+    document.getElementById('open-pmx-btn')?.addEventListener('click', () => {
+      (document.getElementById('pmx-file-input') as HTMLInputElement).click();
+    });
+    (document.getElementById('pmx-file-input') as HTMLInputElement)?.addEventListener('change', async (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (file) await this.openPmxFile(file);
+      (e.target as HTMLInputElement).value = '';
     });
 
     // テクスチャブラシ関連
