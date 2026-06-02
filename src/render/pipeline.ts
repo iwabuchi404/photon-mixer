@@ -273,6 +273,20 @@ export class RenderPipeline {
     return blob;
   }
 
+  /**
+   * ブラシテクスチャをロード
+   */
+  async loadBrushTexture(image: ImageBitmap | HTMLImageElement): Promise<void> {
+    await this.brushRenderer.loadTexture(image);
+  }
+
+  /**
+   * ブラシテクスチャをクリア
+   */
+  clearBrushTexture(): void {
+    this.brushRenderer.clearTexture();
+  }
+
   dispose() {
     this.brushRenderer.dispose();
     this.brushTexture4x?.destroy(); this.committedTexture?.destroy(); this.isolatedTexture?.destroy();

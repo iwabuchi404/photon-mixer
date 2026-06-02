@@ -4,6 +4,13 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>PhotonMixer Phase 1</title>
+  <script type="importmap">
+  {
+    "imports": {
+      "fflate": "./node_modules/fflate/esm/browser.js"
+    }
+  }
+  </script>
   <style>
     * {
       margin: 0;
@@ -183,9 +190,26 @@
       <span class="ctrl-label">カラー</span>
       <input type="color" id="brush-color" value="#ffffff" style="width: 80px; height: 18px; border: none; cursor: pointer;">
     </div>
+    <div class="ctrl-row" style="margin-top: 8px; border-top: 1px solid #333; padding-top: 8px;">
+      <span class="ctrl-label">テクスチャ</span>
+      <button id="load-texture-btn" style="flex: 1; padding: 2px 8px; background: #2a2a2a; color: #ccc; border: 1px solid #444; border-radius: 3px; cursor: pointer; font-family: monospace; font-size: 10px;">読込</button>
+      <button id="clear-texture-btn" style="width: 32px; padding: 2px 4px; background: #2a2a2a; color: #888; border: 1px solid #444; border-radius: 3px; cursor: pointer; font-family: monospace; font-size: 10px;">×</button>
+    </div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">スケール</span>
+      <input type="range" id="texture-scale" min="1" max="20" value="1" style="width: 50px;">
+      <span id="texture-scale-val" class="ctrl-val">1</span>x
+    </div>
+    <div class="ctrl-row" style="margin-top: 8px; border-top: 1px solid #333; padding-top: 8px;">
+      <span class="ctrl-label">プリセット</span>
+      <button id="save-preset-btn" class="tool-btn" style="flex: 1;">保存</button>
+      <button id="load-preset-btn" class="tool-btn" style="flex: 1;">読込</button>
+    </div>
     <button id="export-png-btn" style="width: 100%; margin: 4px 0; padding: 4px 0; background: #2a2a2a; color: #ccc; border: 1px solid #444; border-radius: 3px; cursor: pointer; font-family: monospace; font-size: 11px;">PNG 書き出し</button>
     <button id="clear-btn">クリア</button>
   </div>
+  <input type="file" id="texture-file-input" accept="image/*" style="display: none;">
+  <input type="file" id="preset-file-input" accept=".zip" style="display: none;">
   <canvas id="canvas"></canvas>
   <script type="module" src="dist/src/main.js"></script>
 </body>

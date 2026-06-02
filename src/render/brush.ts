@@ -11,6 +11,8 @@ export interface BrushConfig {
   wetRatio: number;
   mixMode: BrushMixMode;
   usePointColor: boolean;
+  useTexture: boolean;
+  textureScale: number;
 }
 
 const DEFAULT_BRUSH_CONFIG: BrushConfig = {
@@ -18,6 +20,8 @@ const DEFAULT_BRUSH_CONFIG: BrushConfig = {
   wetRatio: 0.0,
   mixMode: 'stamp',
   usePointColor: false,
+  useTexture: false,
+  textureScale: 1.0,
 };
 
 export class BrushRenderer {
@@ -27,11 +31,16 @@ export class BrushRenderer {
   private uniformBuffer: GPUBuffer;
   private pointBuffer: GPUBuffer;
   private sampler: GPUSampler;
+  private brushSampler: GPUSampler;
   private bindGroup: GPUBindGroup | null = null;
   private bindGroupDirty = true;
   private config: BrushConfig;
   private shaderPath: string;
   private canvasSize = { width: 0, height: 0 };
+
+  // テクスチャブラシ用
+  private brushTexture: GPUTexture | null = null;
+  private dummyTexture: GPUTexture;
 
   private readonly maxPoints = 500000;
 
@@ -41,7 +50,7 @@ export class BrushRenderer {
     this.shaderPath = shaderPath;
 
     this.uniformBuffer = device.createBuffer({
-      size: 48,
+      size: 52, // テクスチャ関連パラメータ追加でサイズ増
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -51,6 +60,17 @@ export class BrushRenderer {
     });
 
     this.sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+    this.brushSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat' });
+
+    // ダミーテクスチャ（テクスチャ未使用時）
+    this.dummyTexture = device.createTexture({
+      size: [1, 1],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    // 白色1ピクセルを設定
+    const white = new Uint8Array([255, 255, 255, 255]);
+    device.queue.writeTexture({ texture: this.dummyTexture }, white, { bytesPerRow: 4 }, [1, 1]);
   }
 
   async init(canvasWidth: number, canvasHeight: number, format: GPUTextureFormat = 'rgba16float'): Promise<void> {
@@ -65,6 +85,8 @@ export class BrushRenderer {
         { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
         { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 5, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
       ],
     });
 
@@ -90,7 +112,7 @@ export class BrushRenderer {
   }
 
   private updateUniforms(canvasWidth: number, canvasHeight: number): void {
-    const buf = new ArrayBuffer(48);
+    const buf = new ArrayBuffer(52); // テクスチャ関連でサイズ増
     const f32 = new Float32Array(buf);
     const u32 = new Uint32Array(buf);
     f32[0] = canvasWidth;
@@ -102,6 +124,8 @@ export class BrushRenderer {
     f32[6] = this.config.color.b;
     f32[7] = this.config.color.a;
     u32[8] = this.config.usePointColor ? 1 : 0;
+    u32[9] = this.config.useTexture ? 1 : 0;
+    f32[10] = this.config.textureScale;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, buf);
   }
 
@@ -127,6 +151,7 @@ export class BrushRenderer {
     this.device.queue.writeBuffer(this.pointBuffer, 0, pointData);
 
     if (this.bindGroupDirty || !this.bindGroup || this.lastCommittedTexture !== committedTexture) {
+      const textureToUse = this.brushTexture ?? this.dummyTexture;
       this.bindGroup = this.device.createBindGroup({
         layout: this.bindGroupLayout!,
         entries: [
@@ -134,6 +159,8 @@ export class BrushRenderer {
           { binding: 1, resource: { buffer: this.pointBuffer } },
           { binding: 2, resource: committedTexture.createView() },
           { binding: 3, resource: this.sampler },
+          { binding: 4, resource: textureToUse.createView() },
+          { binding: 5, resource: this.brushSampler },
         ],
       });
       this.bindGroupDirty = false;
@@ -152,6 +179,45 @@ export class BrushRenderer {
     this.updateUniforms(this.canvasSize.width, this.canvasSize.height);
   }
 
+  /**
+   * テクスチャをロード
+   * @param imageSource 画像ソース（ImageBitmapまたはHTMLImageElement）
+   */
+  async loadTexture(imageSource: ImageBitmap | HTMLImageElement): Promise<void> {
+    // 既存のテクスチャを破棄
+    if (this.brushTexture) {
+      this.brushTexture.destroy();
+      this.brushTexture = null;
+    }
+
+    const texture = this.device.createTexture({
+      size: [imageSource.width, imageSource.height, 1],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+
+    // ImageBitmap からテクスチャへコピー
+    this.device.queue.copyExternalImageToTexture(
+      { source: imageSource },
+      { texture },
+      [imageSource.width, imageSource.height]
+    );
+
+    this.brushTexture = texture;
+    this.bindGroupDirty = true;
+  }
+
+  /**
+   * テクスチャをクリア（円形ブラシに戻す）
+   */
+  clearTexture(): void {
+    if (this.brushTexture) {
+      this.brushTexture.destroy();
+      this.brushTexture = null;
+    }
+    this.bindGroupDirty = true;
+  }
+
   resize(canvasWidth: number, canvasHeight: number): void {
     this.canvasSize = { width: canvasWidth, height: canvasHeight };
     this.updateUniforms(canvasWidth, canvasHeight);
@@ -161,5 +227,7 @@ export class BrushRenderer {
   dispose(): void {
     this.uniformBuffer.destroy();
     this.pointBuffer.destroy();
+    if (this.brushTexture) this.brushTexture.destroy();
+    this.dummyTexture.destroy();
   }
 }
