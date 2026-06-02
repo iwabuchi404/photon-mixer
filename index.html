@@ -210,6 +210,19 @@
   </div>
   <input type="file" id="texture-file-input" accept="image/*" style="display: none;">
   <input type="file" id="preset-file-input" accept=".zip" style="display: none;">
+
+  <!-- レイヤーパネル（右下） -->
+  <div id="layer-panel" style="position: fixed; right: 10px; bottom: 10px; width: 220px; background: rgba(0,0,0,0.85); border: 1px solid #444; border-radius: 5px; font-family: monospace; font-size: 11px; color: #ccc; z-index: 1000;">
+    <div style="display: flex; align-items: center; gap: 4px; padding: 6px 8px; border-bottom: 1px solid #444;">
+      <span style="flex: 1;">レイヤー</span>
+      <button id="layer-add" class="tool-btn" style="width: 24px; padding: 2px 0;" title="追加">＋</button>
+      <button id="layer-del" class="tool-btn" style="width: 24px; padding: 2px 0;" title="削除">－</button>
+      <button id="layer-up" class="tool-btn" style="width: 24px; padding: 2px 0;" title="上へ">▲</button>
+      <button id="layer-down" class="tool-btn" style="width: 24px; padding: 2px 0;" title="下へ">▼</button>
+    </div>
+    <div id="layer-list" style="max-height: 240px; overflow-y: auto;"></div>
+  </div>
+
   <canvas id="canvas"></canvas>
   <script type="module" src="dist/src/main.js"></script>
 </body>

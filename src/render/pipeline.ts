@@ -1,5 +1,9 @@
 /**
- * 描画パイプライン
+ * 描画パイプライン（レイヤー対応）
+ *
+ * 各レイヤーは独立した committed テクスチャを持つ。描画系メソッドは
+ * アクティブレイヤーの committed（committedTexture ゲッター）を対象に動作する。
+ * render() は全レイヤーをブレンドモードで合成して画面に出す。
  */
 
 import type { Renderer } from '../core/renderer.js';
@@ -7,23 +11,44 @@ import type { StrokePoint, StrokeRecord } from '../pen/stroke.js';
 import { BrushRenderer, type BrushConfig } from './brush.js';
 import { CompositeRenderer } from './composite.js';
 import { DownsampleRenderer } from './downsample.js';
+import { BlendRenderer, type BlendMode } from './blend-renderer.js';
 
 const BUFFER_FORMAT: GPUTextureFormat = 'rgba16float';
+
+export interface LayerInfo {
+  id: string;
+  name: string;
+  visible: boolean;
+  opacity: number;
+  blendMode: BlendMode;
+}
+
+interface LayerTex extends LayerInfo {
+  committed: GPUTexture;
+}
+
+let layerIdCounter = 0;
 
 export class RenderPipeline {
   private renderer: Renderer;
   private brushRenderer: BrushRenderer;
   private compositeRenderer: CompositeRenderer;
   private downsampleRenderer: DownsampleRenderer;
+  private blendRenderer: BlendRenderer;
 
   private brushTexture4x!: GPUTexture;
-  private committedTexture!: GPUTexture;
   private isolatedTexture!: GPUTexture;
+  // レイヤー合成用
+  private displayA!: GPUTexture;
+  private displayB!: GPUTexture;
+  private activeComposite!: GPUTexture; // アクティブレイヤー committed + 現在ストローク
+
+  private layers: LayerTex[] = [];
+  private activeIndex = 0;
 
   private currentStroke: StrokePoint[] = [];
   private eraseMode = false;
 
-  // キャンバスサイズ（描画対象のサイズ）
   private canvasWidth = 0;
   private canvasHeight = 0;
 
@@ -32,6 +57,12 @@ export class RenderPipeline {
     this.brushRenderer = new BrushRenderer(renderer.device);
     this.compositeRenderer = new CompositeRenderer(renderer.device);
     this.downsampleRenderer = new DownsampleRenderer(renderer.device);
+    this.blendRenderer = new BlendRenderer(renderer.device);
+  }
+
+  // アクティブレイヤーの committed テクスチャ（既存の描画系メソッドが参照する）
+  private get committedTexture(): GPUTexture {
+    return this.layers[this.activeIndex].committed;
   }
 
   async init(): Promise<void> {
@@ -39,13 +70,12 @@ export class RenderPipeline {
     await this.brushRenderer.init(canvas.width * 4, canvas.height * 4, BUFFER_FORMAT);
     await this.compositeRenderer.init(format);
     await this.downsampleRenderer.init();
+    await this.blendRenderer.init(BUFFER_FORMAT);
     this.createTextures(canvas.width, canvas.height);
     this.updateViewport(1.0, 0, 0, 0);
   }
 
   updateViewport(scale: number, offsetX: number, offsetY: number, rotation: number): void {
-    // 紙の四角形のサイズはアートキャンバスのサイズ（committed texture と一致）を渡す。
-    // 画面サイズ（renderer.canvas）を渡すと toCanvas の中心と不一致になり座標がずれる。
     this.compositeRenderer.updateViewport(
       scale, offsetX, offsetY, rotation,
       this.canvasWidth, this.canvasHeight,
@@ -57,8 +87,19 @@ export class RenderPipeline {
     this.eraseMode = enabled;
   }
 
+  // --- テクスチャ生成 ---
+
+  private makeLayerTexture(): GPUTexture {
+    const tex = this.renderer.device.createTexture({
+      size: [this.canvasWidth, this.canvasHeight],
+      format: BUFFER_FORMAT,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST,
+    });
+    this.clearTextureContent(tex);
+    return tex;
+  }
+
   private createTextures(width: number, height: number): void {
-    // キャンバスサイズを保存
     this.canvasWidth = width;
     this.canvasHeight = height;
 
@@ -67,19 +108,34 @@ export class RenderPipeline {
       format: BUFFER_FORMAT,
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
-    this.committedTexture = this.renderer.device.createTexture({
-      size: [width, height],
-      format: BUFFER_FORMAT,
-      // COPY_SRC: スナップショット読み出し / COPY_DST: バケツ塗りの書き戻し
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST,
-    });
     this.isolatedTexture = this.renderer.device.createTexture({
       size: [width, height],
       format: BUFFER_FORMAT,
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
     });
-    this.clearTextureContent(this.committedTexture);
-    this.clearTextureContent(this.isolatedTexture);
+    const dispUsage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC;
+    this.displayA = this.renderer.device.createTexture({ size: [width, height], format: BUFFER_FORMAT, usage: dispUsage });
+    this.displayB = this.renderer.device.createTexture({ size: [width, height], format: BUFFER_FORMAT, usage: dispUsage });
+    this.activeComposite = this.renderer.device.createTexture({
+      size: [width, height], format: BUFFER_FORMAT,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+
+    // レイヤーを初期化（1枚）
+    for (const l of this.layers) l.committed.destroy();
+    this.layers = [this.createLayer('レイヤー 1')];
+    this.activeIndex = 0;
+  }
+
+  private createLayer(name: string): LayerTex {
+    return {
+      id: `layer-${++layerIdCounter}`,
+      name,
+      visible: true,
+      opacity: 1.0,
+      blendMode: 'normal',
+      committed: this.makeLayerTexture(),
+    };
   }
 
   private clearTextureContent(texture: GPUTexture): void {
@@ -89,6 +145,8 @@ export class RenderPipeline {
     }).end();
     this.renderer.device.queue.submit([encoder.finish()]);
   }
+
+  // --- 描画（アクティブレイヤー対象）---
 
   setCurrentStroke(points: StrokePoint[]): void {
     this.currentStroke = points;
@@ -114,27 +172,114 @@ export class RenderPipeline {
     this.downsampleRenderer.downsample(this.brushTexture4x, this.isolatedTexture);
   }
 
+  /**
+   * 全レイヤーを下から合成して結果テクスチャを返す
+   * @param includeLiveStroke true ならアクティブレイヤーに現在ストロークを重ねる
+   */
+  private compositeLayers(includeLiveStroke: boolean): GPUTexture {
+    const { device } = this.renderer;
+
+    // アクティブレイヤー用のソース（現在ストロークを焼き込んだ一時テクスチャ）
+    let activeSrc: GPUTexture | null = null;
+    if (includeLiveStroke && this.currentStroke.length > 0) {
+      this.drawToIsolated(this.currentStroke);
+      // active.committed をコピーしてから isolated を over/erase で重ねる
+      const copyEnc = device.createCommandEncoder();
+      copyEnc.copyTextureToTexture(
+        { texture: this.committedTexture }, { texture: this.activeComposite },
+        [this.canvasWidth, this.canvasHeight],
+      );
+      device.queue.submit([copyEnc.finish()]);
+      this.compositeRenderer.bake(this.isolatedTexture, this.activeComposite, this.eraseMode);
+      activeSrc = this.activeComposite;
+    }
+
+    // ping-pong 合成。acc を透明にクリアして下から重ねる
+    this.clearTextureContent(this.displayA);
+    let acc = this.displayA;
+    let other = this.displayB;
+
+    for (let i = 0; i < this.layers.length; i++) {
+      const layer = this.layers[i];
+      if (!layer.visible || layer.opacity <= 0) continue;
+      const src = (i === this.activeIndex && activeSrc) ? activeSrc : layer.committed;
+      this.blendRenderer.blend(acc, src, other, layer.blendMode, layer.opacity);
+      const tmp = acc; acc = other; other = tmp;
+    }
+    return acc;
+  }
+
   render(): void {
     const { device, context } = this.renderer;
-    if (this.currentStroke.length > 0) {
-      this.drawToIsolated(this.currentStroke);
-    } else {
-      this.clearTextureContent(this.isolatedTexture);
-    }
+    const result = this.compositeLayers(true);
 
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
       colorAttachments: [{ view: context.getCurrentTexture().createView(), clearValue: { r: 0.05, g: 0.05, b: 0.05, a: 1.0 }, loadOp: 'clear', storeOp: 'store' }],
     });
     this.compositeRenderer.drawPaper(pass);
-    this.compositeRenderer.draw(pass, this.committedTexture);
-    this.compositeRenderer.draw(pass, this.isolatedTexture, this.eraseMode);
+    this.compositeRenderer.draw(pass, result);
     pass.end();
     device.queue.submit([encoder.finish()]);
   }
 
-  // ... (その他のメソッド)
+  // --- レイヤー操作 ---
+
+  getLayers(): LayerInfo[] {
+    return this.layers.map(({ id, name, visible, opacity, blendMode }) => ({ id, name, visible, opacity, blendMode }));
+  }
+
+  getActiveLayerId(): string {
+    return this.layers[this.activeIndex].id;
+  }
+
+  setActiveLayer(id: string): void {
+    const idx = this.layers.findIndex(l => l.id === id);
+    if (idx >= 0) this.activeIndex = idx;
+  }
+
+  addLayer(): string {
+    const layer = this.createLayer(`レイヤー ${this.layers.length + 1}`);
+    // アクティブレイヤーの上に挿入
+    this.layers.splice(this.activeIndex + 1, 0, layer);
+    this.activeIndex += 1;
+    return layer.id;
+  }
+
+  removeActiveLayer(): void {
+    if (this.layers.length <= 1) return; // 最低1枚は残す
+    this.layers[this.activeIndex].committed.destroy();
+    this.layers.splice(this.activeIndex, 1);
+    if (this.activeIndex >= this.layers.length) this.activeIndex = this.layers.length - 1;
+  }
+
+  moveActiveLayer(dir: 'up' | 'down'): void {
+    const to = dir === 'up' ? this.activeIndex + 1 : this.activeIndex - 1;
+    if (to < 0 || to >= this.layers.length) return;
+    const [l] = this.layers.splice(this.activeIndex, 1);
+    this.layers.splice(to, 0, l);
+    this.activeIndex = to;
+  }
+
+  setLayerVisible(id: string, visible: boolean): void {
+    const l = this.layers.find(l => l.id === id);
+    if (l) l.visible = visible;
+  }
+
+  setLayerOpacity(id: string, opacity: number): void {
+    const l = this.layers.find(l => l.id === id);
+    if (l) l.opacity = opacity;
+  }
+
+  setLayerBlendMode(id: string, mode: BlendMode): void {
+    const l = this.layers.find(l => l.id === id);
+    if (l) l.blendMode = mode;
+  }
+
+  // --- ブラシ・スナップショット系（アクティブレイヤー対象）---
+
   updateBrushConfig(config: Partial<BrushConfig>): void { this.brushRenderer.updateConfig(config); }
+
   async requestCommittedSnapshot() {
     const { device } = this.renderer;
     const width = this.canvasWidth;
@@ -149,14 +294,12 @@ export class RenderPipeline {
     staging.unmap(); staging.destroy();
     return { data, bytesPerRow };
   }
+
   /**
-   * 履歴レコードから committedTexture を再構築する（Undo/Redo 用）
-   * - stroke: 点に焼き込んだ色を使って描画（usePointColor=true）、erase フラグを尊重
-   * - fill  : スナップショットで committed を上書き（それ以前の内容を吸収）
+   * 履歴レコードからアクティブレイヤーの committed を再構築（Undo/Redo 用）
    */
   rebakeFromRecords(records: StrokeRecord[]): void {
     this.clearTextureContent(this.committedTexture);
-    // 焼き込んだ色を忠実に再現するため点ごとの色モードで描く
     this.brushRenderer.updateConfig({ usePointColor: true });
     for (const rec of records) {
       if (rec.kind === 'fill') {
@@ -166,9 +309,9 @@ export class RenderPipeline {
         this.compositeRenderer.bake(this.isolatedTexture, this.committedTexture, rec.erase);
       }
     }
-    // ライブ描画はデフォルト（uniform 色）に戻す。progressive は pen-down で再設定される
     this.brushRenderer.updateConfig({ usePointColor: false });
   }
+
   updateCommittedTexture(data: Uint16Array): void {
     const { device } = this.renderer;
     const width = this.canvasWidth;
@@ -181,32 +324,28 @@ export class RenderPipeline {
       [width, height]
     );
   }
+
+  /** アクティブレイヤーをクリア */
   clear() {
     this.currentStroke = [];
     this.clearTextureContent(this.committedTexture);
-    this.clearTextureContent(this.isolatedTexture);
   }
 
-  /**
-   * キャンバスサイズを変更（canvas.width/height は変更しない）
-   */
   resizeCanvasSize(w: number, h: number) {
     this.brushRenderer.resize(w * 4, h * 4);
-    this.brushTexture4x.destroy(); this.committedTexture.destroy(); this.isolatedTexture.destroy();
+    this.brushTexture4x.destroy();
+    this.isolatedTexture.destroy();
+    this.displayA.destroy(); this.displayB.destroy(); this.activeComposite.destroy();
     this.createTextures(w, h);
   }
 
-  /**
-   * スクリーンサイズを変更（canvas.width/height のみ変更）
-   */
   resizeScreenSize(w: number, h: number) {
     this.renderer.canvas.width = w;
     this.renderer.canvas.height = h;
   }
 
   /**
-   * コミット済テクスチャを PNG としてエクスポート
-   * float16 リニアデータを読み取り、sRGB 変換して Canvas 経由で PNG に変換
+   * 全レイヤーを合成した結果を PNG としてエクスポート
    */
   async exportToPNG(): Promise<Blob> {
     const { device } = this.renderer;
@@ -214,17 +353,12 @@ export class RenderPipeline {
     const height = this.canvasHeight;
     const bytesPerRow = Math.ceil(width * 8 / 256) * 256;
 
-    // テクスチャからバッファにコピー
-    const staging = device.createBuffer({
-      size: bytesPerRow * height,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-    });
+    // 現在ストロークなしで全レイヤーを合成
+    const result = this.compositeLayers(false);
+
+    const staging = device.createBuffer({ size: bytesPerRow * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const encoder = device.createCommandEncoder();
-    encoder.copyTextureToBuffer(
-      { texture: this.committedTexture },
-      { buffer: staging, bytesPerRow },
-      [width, height]
-    );
+    encoder.copyTextureToBuffer({ texture: result }, { buffer: staging, bytesPerRow }, [width, height]);
     device.queue.submit([encoder.finish()]);
 
     await staging.mapAsync(GPUMapMode.READ);
@@ -232,14 +366,12 @@ export class RenderPipeline {
     staging.unmap();
     staging.destroy();
 
-    // 一時 Canvas に描画して sRGB PNG を生成
     const tempCanvas = document.createElement('canvas');
     tempCanvas.width = width;
     tempCanvas.height = height;
     const ctx = tempCanvas.getContext('2d')!;
     const imageData = ctx.createImageData(width, height);
 
-    // Float16 → sRGB 変換
     const uint16sPerRow = bytesPerRow / 2;
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
@@ -251,50 +383,34 @@ export class RenderPipeline {
 
         const pxIdx = (y * width + x) * 4;
         if (a < 0.0001) {
-          imageData.data[pxIdx] = 0;
-          imageData.data[pxIdx + 1] = 0;
-          imageData.data[pxIdx + 2] = 0;
-          imageData.data[pxIdx + 3] = 0;
+          imageData.data[pxIdx] = 0; imageData.data[pxIdx + 1] = 0;
+          imageData.data[pxIdx + 2] = 0; imageData.data[pxIdx + 3] = 0;
         } else {
-          // プリマルチプライドαを元に戻して sRGB 変換
-          const straightR = r / a;
-          const straightG = g / a;
-          const straightB = b / a;
-          imageData.data[pxIdx] = Math.round(linearToSrgbByte(straightR));
-          imageData.data[pxIdx + 1] = Math.round(linearToSrgbByte(straightG));
-          imageData.data[pxIdx + 2] = Math.round(linearToSrgbByte(straightB));
+          imageData.data[pxIdx] = Math.round(linearToSrgbByte(r / a));
+          imageData.data[pxIdx + 1] = Math.round(linearToSrgbByte(g / a));
+          imageData.data[pxIdx + 2] = Math.round(linearToSrgbByte(b / a));
           imageData.data[pxIdx + 3] = Math.round(a * 255);
         }
       }
     }
-
     ctx.putImageData(imageData, 0, 0);
-
-    // Canvas を PNG Blob に変換
-    const blob = await new Promise<Blob>((resolve) => {
-      tempCanvas.toBlob((b) => resolve(b!), 'image/png');
-    });
-
-    return blob;
+    return await new Promise<Blob>((resolve) => tempCanvas.toBlob((b) => resolve(b!), 'image/png'));
   }
 
-  /**
-   * ブラシテクスチャをロード
-   */
   async loadBrushTexture(image: ImageBitmap | HTMLImageElement): Promise<void> {
     await this.brushRenderer.loadTexture(image);
   }
 
-  /**
-   * ブラシテクスチャをクリア
-   */
   clearBrushTexture(): void {
     this.brushRenderer.clearTexture();
   }
 
   dispose() {
     this.brushRenderer.dispose();
-    this.brushTexture4x?.destroy(); this.committedTexture?.destroy(); this.isolatedTexture?.destroy();
+    this.brushTexture4x?.destroy();
+    this.isolatedTexture?.destroy();
+    this.displayA?.destroy(); this.displayB?.destroy(); this.activeComposite?.destroy();
+    for (const l of this.layers) l.committed.destroy();
   }
 }
 

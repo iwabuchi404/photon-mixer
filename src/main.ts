@@ -86,7 +86,8 @@ class PhotonMixerApp {
   private stabilizer: Stabilizer;
   private interpolator: Interpolator;
   private strokeManager: StrokeManager;
-  private strokeHistory: StrokeHistory;
+  // レイヤーごとの Undo 履歴（Undo はアクティブレイヤーに作用）
+  private layerHistories = new Map<string, StrokeHistory>();
   private renderPipeline: RenderPipeline | null = null;
   private viewport: Viewport;
   private perfMonitor: PerfMonitor;
@@ -116,7 +117,6 @@ class PhotonMixerApp {
     // 半透明ブラシで点線にならないためスタンプを密に配置する
     this.interpolator = new Interpolator({ spacing: 1, speedThreshold: 2000 });
     this.strokeManager = new StrokeManager({ baseSize: 2, maxSize: 20, curve: 'smooth' });
-    this.strokeHistory = new StrokeHistory();
     this.viewport = new Viewport();
     this.perfMonitor = new PerfMonitor();
   }
@@ -174,8 +174,97 @@ class PhotonMixerApp {
     this.viewport.reset(width, height, window.innerWidth, window.innerHeight);
     const transform = this.viewport.getTransform();
     this.renderPipeline.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation);
-    this.strokeHistory.clear();
+    this.layerHistories.clear();
+    this.rebuildLayerPanel();
     this.updateZoomDisplay();
+  }
+
+  /**
+   * アクティブレイヤーの Undo 履歴を取得（なければ作成）
+   */
+  private activeHistory(): StrokeHistory {
+    const id = this.renderPipeline!.getActiveLayerId();
+    let h = this.layerHistories.get(id);
+    if (!h) { h = new StrokeHistory(); this.layerHistories.set(id, h); }
+    return h;
+  }
+
+  /**
+   * レイヤーパネルを現在の状態から再構築する
+   * 上が前面になるようリスト逆順で表示
+   */
+  private rebuildLayerPanel(): void {
+    const list = document.getElementById('layer-list');
+    if (!list || !this.renderPipeline) return;
+    const layers = this.renderPipeline.getLayers();
+    const activeId = this.renderPipeline.getActiveLayerId();
+    const blendModes: { v: string; label: string }[] = [
+      { v: 'normal', label: '通常' },
+      { v: 'multiply', label: '乗算' },
+      { v: 'screen', label: 'スクリーン' },
+      { v: 'overlay', label: 'オーバーレイ' },
+      { v: 'add', label: '加算' },
+    ];
+
+    list.innerHTML = '';
+    // 前面（配列末尾）が上に来るよう逆順
+    for (let i = layers.length - 1; i >= 0; i--) {
+      const layer = layers[i];
+      const isActive = layer.id === activeId;
+      const row = document.createElement('div');
+      row.style.cssText = `padding: 5px 8px; border-bottom: 1px solid #333; cursor: pointer; ${isActive ? 'background:#1c3a1c;' : ''}`;
+      row.addEventListener('click', () => {
+        this.renderPipeline?.setActiveLayer(layer.id);
+        this.rebuildLayerPanel();
+      });
+
+      // 1行目: 表示トグル + 名前
+      const top = document.createElement('div');
+      top.style.cssText = 'display:flex; align-items:center; gap:6px;';
+      const eye = document.createElement('span');
+      eye.textContent = layer.visible ? '👁' : '—';
+      eye.style.cssText = 'cursor:pointer; width:16px;';
+      eye.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.renderPipeline?.setLayerVisible(layer.id, !layer.visible);
+        this.rebuildLayerPanel();
+      });
+      const nameEl = document.createElement('span');
+      nameEl.textContent = layer.name;
+      nameEl.style.cssText = 'flex:1; color:' + (isActive ? '#9f9' : '#ccc');
+      top.appendChild(eye);
+      top.appendChild(nameEl);
+
+      // 2行目: 合成モード + 不透明度
+      const ctl = document.createElement('div');
+      ctl.style.cssText = 'display:flex; align-items:center; gap:4px; margin-top:3px;';
+      const sel = document.createElement('select');
+      sel.style.cssText = 'flex:1; background:#1a1a1a; color:#fff; border:1px solid #444; font-family:monospace; font-size:10px;';
+      for (const m of blendModes) {
+        const opt = document.createElement('option');
+        opt.value = m.v; opt.textContent = m.label;
+        if (m.v === layer.blendMode) opt.selected = true;
+        sel.appendChild(opt);
+      }
+      sel.addEventListener('click', (e) => e.stopPropagation());
+      sel.addEventListener('change', () => {
+        this.renderPipeline?.setLayerBlendMode(layer.id, sel.value as any);
+      });
+      const op = document.createElement('input');
+      op.type = 'range'; op.min = '0'; op.max = '100';
+      op.value = Math.round(layer.opacity * 100).toString();
+      op.style.cssText = 'width:60px;';
+      op.addEventListener('click', (e) => e.stopPropagation());
+      op.addEventListener('input', () => {
+        this.renderPipeline?.setLayerOpacity(layer.id, parseInt(op.value) / 100);
+      });
+      ctl.appendChild(sel);
+      ctl.appendChild(op);
+
+      row.appendChild(top);
+      row.appendChild(ctl);
+      list.appendChild(row);
+    }
   }
 
   private updateZoomDisplay(): void {
@@ -250,7 +339,7 @@ class PhotonMixerApp {
           const colored = this.buildColoredStroke();
           if (colored.length > 0) {
             this.renderPipeline?.commitStroke(colored);
-            this.strokeHistory.addRecord({ kind: 'stroke', points: colored, erase });
+            this.activeHistory().addRecord({ kind: 'stroke', points: colored, erase });
           }
           // 点ごとの色モードを解除
           this.renderPipeline?.updateBrushConfig({ usePointColor: false });
@@ -262,7 +351,7 @@ class PhotonMixerApp {
             // rebake 時に色を忠実に再現するため、各点に現在のブラシ色を焼き込む
             this.bakeColorIntoPoints(finalStroke);
             this.renderPipeline?.commitStroke(finalStroke);
-            this.strokeHistory.addRecord({ kind: 'stroke', points: finalStroke, erase });
+            this.activeHistory().addRecord({ kind: 'stroke', points: finalStroke, erase });
           }
         }
 
@@ -309,14 +398,14 @@ class PhotonMixerApp {
       // Undo/Redo
       if (e.ctrlKey && e.key === 'z') {
         e.preventDefault();
-        if (this.strokeHistory.undo()) {
-          this.renderPipeline?.rebakeFromRecords(this.strokeHistory.getAllRecords());
+        if (this.activeHistory().undo()) {
+          this.renderPipeline?.rebakeFromRecords(this.activeHistory().getAllRecords());
         }
       }
       if (e.ctrlKey && (e.key === 'y' || (e.shiftKey && e.key === 'Z'))) {
         e.preventDefault();
-        if (this.strokeHistory.redo()) {
-          this.renderPipeline?.rebakeFromRecords(this.strokeHistory.getAllRecords());
+        if (this.activeHistory().redo()) {
+          this.renderPipeline?.rebakeFromRecords(this.activeHistory().getAllRecords());
         }
       }
       // ツール切り替えショートカット
@@ -465,7 +554,7 @@ class PhotonMixerApp {
 
     this.renderPipeline.updateCommittedTexture(data);
     // 塗りつぶし直後のスナップショットを履歴に積む（rebake で上書き再現＝Undo 可能）
-    this.strokeHistory.addRecord({ kind: 'fill', snapshot: data, bytesPerRow: snap.bytesPerRow });
+    this.activeHistory().addRecord({ kind: 'fill', snapshot: data, bytesPerRow: snap.bytesPerRow });
   }
 
   private isSameColor(data: Uint16Array, x: number, y: number, ref16: Uint16Array, uint16sPerRow: number): boolean {
@@ -657,7 +746,27 @@ class PhotonMixerApp {
 
     clearBtn.addEventListener('click', () => {
       this.renderPipeline?.clear();
-      this.strokeHistory.clear();
+      this.activeHistory().clear();
+    });
+
+    // レイヤー操作
+    document.getElementById('layer-add')?.addEventListener('click', () => {
+      this.renderPipeline?.addLayer();
+      this.rebuildLayerPanel();
+    });
+    document.getElementById('layer-del')?.addEventListener('click', () => {
+      const id = this.renderPipeline?.getActiveLayerId();
+      this.renderPipeline?.removeActiveLayer();
+      if (id) this.layerHistories.delete(id);
+      this.rebuildLayerPanel();
+    });
+    document.getElementById('layer-up')?.addEventListener('click', () => {
+      this.renderPipeline?.moveActiveLayer('up');
+      this.rebuildLayerPanel();
+    });
+    document.getElementById('layer-down')?.addEventListener('click', () => {
+      this.renderPipeline?.moveActiveLayer('down');
+      this.rebuildLayerPanel();
     });
 
     // テクスチャブラシ関連
