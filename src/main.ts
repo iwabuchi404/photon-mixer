@@ -15,6 +15,7 @@ import { linearToOklab, oklabToLinear, mixOklab } from './color/oklab.js';
 import { BrushPresetManager } from './brush-preset.js';
 import { savePmx, loadPmx } from './pmx.js';
 import { saveAutosave, loadAutosave } from './autosave.js';
+import { ColorPicker } from './ui/color-picker.js';
 import type { LinearColor } from './color/types.js';
 import type { StrokePoint } from './pen/stroke.js';
 import type { BrushConfig } from './render/brush.js';
@@ -111,6 +112,7 @@ class PhotonMixerApp {
 
   // テクスチャブラシの元画像（プリセット保存で再利用するため保持）
   private currentTextureBitmap: ImageBitmap | null = null;
+  private colorPicker: ColorPicker | null = null;
 
   // 引きずり混色（progressive）用: pen-down 時の committed スナップショット
   private committedSnapshot: { data: Uint16Array; bytesPerRow: number } | null = null;
@@ -699,6 +701,8 @@ class PhotonMixerApp {
 
     const colorPicker = document.getElementById('brush-color') as HTMLInputElement;
     if (colorPicker) colorPicker.value = hex;
+    // HSV ピッカーも同期（スポイト/プリセット適用時）
+    this.colorPicker?.setRgb({ r: srgb.r, g: srgb.g, b: srgb.b });
     this.renderPipeline?.updateBrushConfig({ color });
   }
 
@@ -974,11 +978,15 @@ class PhotonMixerApp {
       this.renderPipeline?.updateBrushConfig({ wetRatio: this.state.wetRatio });
     });
 
-    colorPicker.addEventListener('input', () => {
-      const hex = colorPicker.value;
-      this.state.currentColor.r = srgbToLinear(parseInt(hex.substring(1, 3), 16) / 255);
-      this.state.currentColor.g = srgbToLinear(parseInt(hex.substring(3, 5), 16) / 255);
-      this.state.currentColor.b = srgbToLinear(parseInt(hex.substring(5, 7), 16) / 255);
+    // HSV カラーピッカー（input type=color は隠し互換用として残す）
+    const pickerContainer = document.getElementById('color-picker')!;
+    this.colorPicker = new ColorPicker(pickerContainer, (rgb) => {
+      // rgb は sRGB。リニアに変換して currentColor を更新（α は維持）
+      this.state.currentColor.r = srgbToLinear(rgb.r);
+      this.state.currentColor.g = srgbToLinear(rgb.g);
+      this.state.currentColor.b = srgbToLinear(rgb.b);
+      const hex = '#' + [rgb.r, rgb.g, rgb.b].map(v => Math.max(0, Math.min(255, Math.round(v * 255))).toString(16).padStart(2, '0')).join('');
+      colorPicker.value = hex;
       this.renderPipeline?.updateBrushConfig({ color: { ...this.state.currentColor } });
     });
 
