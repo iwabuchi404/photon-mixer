@@ -275,8 +275,19 @@ class PhotonMixerApp {
       const nameEl = document.createElement('span');
       nameEl.textContent = layer.name;
       nameEl.style.cssText = 'flex:1; color:' + (isActive ? '#9f9' : '#ccc');
+      // アルファロック（透明部分保護）トグル
+      const lock = document.createElement('span');
+      lock.textContent = layer.alphaLock ? '🔒' : '🔓';
+      lock.title = '透明部分を保護';
+      lock.style.cssText = `cursor:pointer; width:16px; ${layer.alphaLock ? '' : 'opacity:0.4;'}`;
+      lock.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.renderPipeline?.setLayerAlphaLock(layer.id, !layer.alphaLock);
+        this.rebuildLayerPanel();
+      });
       top.appendChild(eye);
       top.appendChild(nameEl);
+      top.appendChild(lock);
 
       // 2行目: 合成モード + 不透明度
       const ctl = document.createElement('div');
@@ -472,7 +483,7 @@ class PhotonMixerApp {
           if (line.length > 0) {
             this.bakeColorIntoPoints(line);
             this.renderPipeline?.commitStroke(line);
-            this.activeHistory().addRecord({ kind: 'stroke', points: line, erase: false });
+            this.activeHistory().addRecord({ kind: 'stroke', points: line, erase: false, alphaLock: this.renderPipeline?.getActiveLayerAlphaLock() ?? false });
           }
           this.renderPipeline?.setCurrentStroke([]);
           this.lineStart = null;
@@ -486,7 +497,7 @@ class PhotonMixerApp {
           const colored = this.buildColoredStroke();
           if (colored.length > 0) {
             this.renderPipeline?.commitStroke(colored);
-            this.activeHistory().addRecord({ kind: 'stroke', points: colored, erase });
+            this.activeHistory().addRecord({ kind: 'stroke', points: colored, erase, alphaLock: this.renderPipeline?.getActiveLayerAlphaLock() ?? false });
           }
           // 点ごとの色モードを解除
           this.renderPipeline?.updateBrushConfig({ usePointColor: false });
@@ -498,7 +509,7 @@ class PhotonMixerApp {
             // rebake 時に色を忠実に再現するため、各点に現在のブラシ色を焼き込む
             this.bakeColorIntoPoints(finalStroke);
             this.renderPipeline?.commitStroke(finalStroke);
-            this.activeHistory().addRecord({ kind: 'stroke', points: finalStroke, erase });
+            this.activeHistory().addRecord({ kind: 'stroke', points: finalStroke, erase, alphaLock: this.renderPipeline?.getActiveLayerAlphaLock() ?? false });
           }
         }
 
@@ -1210,6 +1221,7 @@ class PhotonMixerApp {
       usePointColor: false,
       useTexture: this.state.useTexture,
       textureScale: this.state.textureScale,
+      alphaLock: false,
     };
   }
 

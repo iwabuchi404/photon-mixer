@@ -12,7 +12,7 @@ struct Uniforms {
   use_point_color: u32,  // 1=点ごとの色を使う(progressive), 0=uniform brush_color
   use_texture: u32,      // 1=テクスチャブラシ, 0=円形ブラシ
   texture_scale: f32,    // テクスチャのスケール（繰り返し回数）
-  _pad0: u32,
+  use_alpha_lock: u32,   // 1=透明部分保護（既存αでマスク）
 }
 
 // 点ごとのデータ: data=(x, y, size, pressure), color=(r, g, b, a)
@@ -154,6 +154,12 @@ fn fragment_main(input: FragmentInput) -> @location(0) vec4<f32> {
       let mixed_oklab = mix(brush_oklab, canvas_oklab, uniforms.wet_ratio * existing.a);
       target_color = oklab_to_linear(mixed_oklab);
     }
+  }
+
+  // アルファロック: 既存の不透明部分にのみ描画（透明部分はマスク）
+  if (uniforms.use_alpha_lock != 0u) {
+    let existing = textureSampleLevel(committed_texture, committed_sampler, input.canvas_uv, 0.0);
+    stamp_alpha = stamp_alpha * existing.a;
   }
 
   return vec4<f32>(target_color * stamp_alpha, stamp_alpha);

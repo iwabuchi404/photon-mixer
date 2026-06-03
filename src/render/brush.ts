@@ -13,6 +13,7 @@ export interface BrushConfig {
   usePointColor: boolean;
   useTexture: boolean;
   textureScale: number;
+  alphaLock: boolean; // 透明部分保護（既存の不透明部分にのみ描画）
 }
 
 const DEFAULT_BRUSH_CONFIG: BrushConfig = {
@@ -22,6 +23,7 @@ const DEFAULT_BRUSH_CONFIG: BrushConfig = {
   usePointColor: false,
   useTexture: false,
   textureScale: 1.0,
+  alphaLock: false,
 };
 
 export class BrushRenderer {
@@ -126,6 +128,7 @@ export class BrushRenderer {
     u32[8] = this.config.usePointColor ? 1 : 0;
     u32[9] = this.config.useTexture ? 1 : 0;
     f32[10] = this.config.textureScale;
+    u32[11] = this.config.alphaLock ? 1 : 0;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, buf);
   }
 

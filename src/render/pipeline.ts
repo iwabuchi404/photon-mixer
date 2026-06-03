@@ -21,6 +21,7 @@ export interface LayerInfo {
   visible: boolean;
   opacity: number;
   blendMode: BlendMode;
+  alphaLock: boolean;
 }
 
 interface LayerTex extends LayerInfo {
@@ -137,6 +138,7 @@ export class RenderPipeline {
       visible: true,
       opacity: 1.0,
       blendMode: 'normal',
+      alphaLock: false,
       committed: this.makeLayerTexture(),
     };
   }
@@ -172,14 +174,20 @@ export class RenderPipeline {
 
   commitStroke(points: StrokePoint[]): void {
     if (points.length > 0) {
+      this.drawAlphaLock = this.layers[this.activeIndex].alphaLock;
       this.drawToIsolated(points);
       this.compositeRenderer.bake(this.isolatedTexture, this.committedTexture, this.eraseMode);
     }
     this.currentStroke = [];
   }
 
+  // 次の drawToIsolated で適用するアルファロック（描画経路ごとに設定）
+  private drawAlphaLock = false;
+
   private drawToIsolated(points: StrokePoint[]): void {
     const { device } = this.renderer;
+    // アルファロックをブラシに反映（既存 committed.a でマスク）
+    this.brushRenderer.updateConfig({ alphaLock: this.drawAlphaLock });
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
       colorAttachments: [{ view: this.brushTexture4x.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' }],
@@ -200,6 +208,7 @@ export class RenderPipeline {
     // アクティブレイヤー用のソース（現在ストロークを焼き込んだ一時テクスチャ）
     let activeSrc: GPUTexture | null = null;
     if (includeLiveStroke && this.currentStroke.length > 0) {
+      this.drawAlphaLock = this.layers[this.activeIndex].alphaLock;
       this.drawToIsolated(this.currentStroke);
       // active.committed をコピーしてから isolated を over/erase で重ねる
       const copyEnc = device.createCommandEncoder();
@@ -244,7 +253,16 @@ export class RenderPipeline {
   // --- レイヤー操作 ---
 
   getLayers(): LayerInfo[] {
-    return this.layers.map(({ id, name, visible, opacity, blendMode }) => ({ id, name, visible, opacity, blendMode }));
+    return this.layers.map(({ id, name, visible, opacity, blendMode, alphaLock }) => ({ id, name, visible, opacity, blendMode, alphaLock }));
+  }
+
+  setLayerAlphaLock(id: string, locked: boolean): void {
+    const l = this.layers.find(l => l.id === id);
+    if (l) l.alphaLock = locked;
+  }
+
+  getActiveLayerAlphaLock(): boolean {
+    return this.layers[this.activeIndex].alphaLock;
   }
 
   getActiveLayerId(): string {
@@ -313,7 +331,7 @@ export class RenderPipeline {
       }
       staging.unmap(); staging.destroy();
       out.push({
-        info: { id: layer.id, name: layer.name, visible: layer.visible, opacity: layer.opacity, blendMode: layer.blendMode },
+        info: { id: layer.id, name: layer.name, visible: layer.visible, opacity: layer.opacity, blendMode: layer.blendMode, alphaLock: layer.alphaLock },
         data: tight,
       });
     }
@@ -331,7 +349,8 @@ export class RenderPipeline {
     this.layers = layers.map(({ info, data }) => {
       const tex = this.makeLayerTexture();
       this.writeLayerTight(tex, data);
-      return { ...info, committed: tex };
+      // 旧 .pmx には alphaLock が無いので既定 false
+      return { ...info, alphaLock: info.alphaLock ?? false, committed: tex };
     });
     if (this.layers.length === 0) this.layers = [this.createLayer('レイヤー 1')];
     const idx = this.layers.findIndex(l => l.id === activeId);
@@ -389,6 +408,8 @@ export class RenderPipeline {
       if (rec.kind === 'fill') {
         this.updateCommittedTexture(rec.snapshot);
       } else if (rec.points.length > 0) {
+        // レコードに保存した alphaLock で再現（描画順は元と同じなのでマスクも一致）
+        this.drawAlphaLock = rec.alphaLock ?? false;
         this.drawToIsolated(rec.points);
         this.compositeRenderer.bake(this.isolatedTexture, this.committedTexture, rec.erase);
       }
