@@ -43,6 +43,9 @@ export class BrushRenderer {
   // テクスチャブラシ用
   private brushTexture: GPUTexture | null = null;
   private dummyTexture: GPUTexture;
+  // 選択マスク（null=選択なし）
+  private selectionTexture: GPUTexture | null = null;
+  private selectionSampler!: GPUSampler;
 
   private readonly maxPoints = 500000;
 
@@ -52,7 +55,7 @@ export class BrushRenderer {
     this.shaderPath = shaderPath;
 
     this.uniformBuffer = device.createBuffer({
-      size: 52, // テクスチャ関連パラメータ追加でサイズ増
+      size: 64, // 16 floats（テクスチャ・選択フラグ）
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -73,6 +76,9 @@ export class BrushRenderer {
     // 白色1ピクセルを設定
     const white = new Uint8Array([255, 255, 255, 255]);
     device.queue.writeTexture({ texture: this.dummyTexture }, white, { bytesPerRow: 4 }, [1, 1]);
+
+    // 選択マスク用サンプラー
+    this.selectionSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
   }
 
   async init(canvasWidth: number, canvasHeight: number, format: GPUTextureFormat = 'rgba16float'): Promise<void> {
@@ -89,6 +95,8 @@ export class BrushRenderer {
         { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
         { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
         { binding: 5, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        { binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 7, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
       ],
     });
 
@@ -114,7 +122,7 @@ export class BrushRenderer {
   }
 
   private updateUniforms(canvasWidth: number, canvasHeight: number): void {
-    const buf = new ArrayBuffer(52); // テクスチャ関連でサイズ増
+    const buf = new ArrayBuffer(64); // 16 floats（選択フラグ追加で 16-align）
     const f32 = new Float32Array(buf);
     const u32 = new Uint32Array(buf);
     f32[0] = canvasWidth;
@@ -129,6 +137,7 @@ export class BrushRenderer {
     u32[9] = this.config.useTexture ? 1 : 0;
     f32[10] = this.config.textureScale;
     u32[11] = this.config.alphaLock ? 1 : 0;
+    u32[12] = this.selectionTexture ? 1 : 0; // use_selection
     this.device.queue.writeBuffer(this.uniformBuffer, 0, buf);
   }
 
@@ -164,6 +173,8 @@ export class BrushRenderer {
           { binding: 3, resource: this.sampler },
           { binding: 4, resource: textureToUse.createView() },
           { binding: 5, resource: this.brushSampler },
+          { binding: 6, resource: (this.selectionTexture ?? this.dummyTexture).createView() },
+          { binding: 7, resource: this.selectionSampler },
         ],
       });
       this.bindGroupDirty = false;
@@ -219,6 +230,15 @@ export class BrushRenderer {
       this.brushTexture = null;
     }
     this.bindGroupDirty = true;
+  }
+
+  /**
+   * 選択マスクテクスチャを設定（null=選択なし）。所有権は呼び出し側。
+   */
+  setSelectionTexture(tex: GPUTexture | null): void {
+    this.selectionTexture = tex;
+    this.bindGroupDirty = true;
+    this.updateUniforms(this.canvasSize.width, this.canvasSize.height);
   }
 
   resize(canvasWidth: number, canvasHeight: number): void {

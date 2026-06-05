@@ -24,6 +24,22 @@ export class Viewport {
   private readonly maxScale = 32.0;
 
   /**
+   * キャンバス座標 -> スクリーン座標（vs_display と同じ順変換）
+   * 中心を引く → 反転 → スケール → 回転 → パン
+   */
+  toScreen(cx: number, cy: number): { x: number; y: number } {
+    let px = cx - this.canvasWidth / 2;
+    let py = cy - this.canvasHeight / 2;
+    if (this.flipX) px = -px;
+    px *= this.scale; py *= this.scale;
+    const cos = Math.cos(this.rotation);
+    const sin = Math.sin(this.rotation);
+    const rx = px * cos - py * sin;
+    const ry = px * sin + py * cos;
+    return { x: rx + this.offsetX, y: ry + this.offsetY };
+  }
+
+  /**
    * スクリーン座標 -> キャンバス座標
    * シェーダーの逆変換：パンを引く → 回転の逆 → スケールで割る → キャンバス中心を戻す
    */

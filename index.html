@@ -164,6 +164,19 @@
       <button id="tool-line" class="tool-btn" title="直線 (V)">📏</button>
       <button id="tool-spoit" class="tool-btn" title="スポイト (I)">🧪</button>
       <button id="tool-bucket" class="tool-btn" title="バケツ (G)">🪣</button>
+      <button id="tool-select" class="tool-btn" title="矩形選択 (M)">⬚</button>
+      <button id="tool-move" class="tool-btn" title="移動 (W)">✥</button>
+      <button id="tool-transform" class="tool-btn" title="変形 (T)">⤢</button>
+    </div>
+    <div class="ctrl-row" id="transform-controls" style="display:none;">
+      <span class="ctrl-label">変形</span>
+      <button id="transform-commit" class="tool-btn" style="flex:1;" title="確定 (Enter)">確定</button>
+      <button id="transform-cancel" class="tool-btn" style="flex:1;" title="キャンセル (Esc)">取消</button>
+    </div>
+    <div class="ctrl-row" id="select-controls" style="display:none;">
+      <span class="ctrl-label">選択</span>
+      <button id="select-all" class="tool-btn" style="flex:1;">全選択</button>
+      <button id="select-clear" class="tool-btn" style="flex:1;">解除</button>
     </div>
     <div class="ctrl-row" style="margin-top: 10px;">
       <span class="ctrl-label">サイズ</span>
@@ -256,6 +269,8 @@
   </div>
 
   <canvas id="canvas"></canvas>
+  <!-- 選択範囲オーバーレイ（点線枠をスクリーン座標で描画） -->
+  <canvas id="selection-overlay" style="position: fixed; left: 0; top: 0; pointer-events: none; z-index: 1400;"></canvas>
   <div id="brush-cursor" style="position: fixed; border: 1px solid rgba(255,255,255,0.7); border-radius: 50%; pointer-events: none; transform: translate(-50%, -50%); z-index: 1500; display: none; mix-blend-mode: difference;"></div>
   <script type="module" src="dist/src/main.js"></script>
 </body>

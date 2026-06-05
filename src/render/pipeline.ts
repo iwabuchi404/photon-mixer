@@ -12,6 +12,7 @@ import { BrushRenderer, type BrushConfig } from './brush.js';
 import { CompositeRenderer } from './composite.js';
 import { DownsampleRenderer } from './downsample.js';
 import { BlendRenderer, type BlendMode } from './blend-renderer.js';
+import { TransformRenderer } from './transform.js';
 
 const BUFFER_FORMAT: GPUTextureFormat = 'rgba16float';
 
@@ -36,6 +37,7 @@ export class RenderPipeline {
   private compositeRenderer: CompositeRenderer;
   private downsampleRenderer: DownsampleRenderer;
   private blendRenderer: BlendRenderer;
+  private transformRenderer: TransformRenderer;
 
   private brushTexture4x!: GPUTexture;
   private isolatedTexture!: GPUTexture;
@@ -61,6 +63,7 @@ export class RenderPipeline {
     this.compositeRenderer = new CompositeRenderer(renderer.device);
     this.downsampleRenderer = new DownsampleRenderer(renderer.device);
     this.blendRenderer = new BlendRenderer(renderer.device);
+    this.transformRenderer = new TransformRenderer(renderer.device);
   }
 
   // アクティブレイヤーの committed テクスチャ（既存の描画系メソッドが参照する）
@@ -74,6 +77,7 @@ export class RenderPipeline {
     await this.compositeRenderer.init(format);
     await this.downsampleRenderer.init();
     await this.blendRenderer.init(BUFFER_FORMAT);
+    await this.transformRenderer.init(BUFFER_FORMAT);
     this.createTextures(canvas.width, canvas.height);
     this.updateViewport(1.0, 0, 0, 0);
   }
@@ -261,6 +265,270 @@ export class RenderPipeline {
     if (l) l.alphaLock = locked;
   }
 
+  // --- 選択範囲 ---
+  private selectionMask: GPUTexture | null = null;
+  // 選択範囲の bounds（キャンバスピクセル座標）。beginMove が参照する
+  private selectionBounds: { lx: number; ty: number; rx: number; by: number } | null = null;
+
+  hasSelection(): boolean { return this.selectionMask !== null; }
+
+  /** 矩形選択（キャンバス座標）。選択内=1, 外=0 のマスクを r8 で作る */
+  setRectSelection(x0: number, y0: number, x1: number, y1: number): void {
+    const w = this.canvasWidth, h = this.canvasHeight;
+    const lx = Math.max(0, Math.min(w, Math.round(Math.min(x0, x1))));
+    const rx = Math.max(0, Math.min(w, Math.round(Math.max(x0, x1))));
+    const ty = Math.max(0, Math.min(h, Math.round(Math.min(y0, y1))));
+    const by = Math.max(0, Math.min(h, Math.round(Math.max(y0, y1))));
+    if (rx - lx < 1 || by - ty < 1) { this.clearSelection(); return; }
+
+    if (!this.selectionMask) {
+      this.selectionMask = this.renderer.device.createTexture({
+        size: [w, h], format: 'r8unorm',
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      });
+    }
+    // r8 は bytesPerRow 256 アラインが必要
+    const bpr = Math.ceil(w / 256) * 256;
+    const data = new Uint8Array(bpr * h); // 0 で初期化
+    for (let y = ty; y < by; y++) {
+      data.fill(255, y * bpr + lx, y * bpr + rx);
+    }
+    this.renderer.device.queue.writeTexture(
+      { texture: this.selectionMask },
+      data, { bytesPerRow: bpr, rowsPerImage: h }, [w, h],
+    );
+    this.brushRenderer.setSelectionTexture(this.selectionMask);
+    this.selectionBounds = { lx, ty, rx, by };
+  }
+
+  clearSelection(): void {
+    if (this.selectionMask) { this.selectionMask.destroy(); this.selectionMask = null; }
+    this.brushRenderer.setSelectionTexture(null);
+    this.selectionBounds = null;
+  }
+
+  // --- 変形ツール ---
+  private txActive = false;
+  private txSnapshot: Uint16Array | null = null;   // Undo 用（移動前全体）
+  private txSrcTexture: GPUTexture | null = null;   // 切り出したコンテンツ
+  private txBaseTexture: GPUTexture | null = null;  // 穴あき版
+  private txBounds: { lx: number; ty: number; rx: number; by: number } | null = null;
+
+  isTransformActive(): boolean { return this.txActive; }
+
+  /**
+   * 変形開始: コンテンツを切り出し、穴あき版を committed に書き込む。
+   * bounds（bounds のキャンバス座標）を返す。
+   */
+  async beginTransform(): Promise<{ lx: number; ty: number; rx: number; by: number } | null> {
+    if (this.txActive) return null;
+
+    const snap = await this.requestCommittedSnapshot();
+    this.txSnapshot = snap.data.slice(0);
+
+    let lx = 0, ty = 0, rx = this.canvasWidth, by = this.canvasHeight;
+    if (this.selectionBounds) ({ lx, ty, rx, by } = this.selectionBounds);
+    const cw = rx - lx, ch = by - ty;
+    if (cw < 1 || ch < 1) return null;
+
+    // src テクスチャにコンテンツをコピー（GPU コピー、CPU 往復なし）
+    this.txSrcTexture = this.renderer.device.createTexture({
+      size: [cw, ch], format: BUFFER_FORMAT,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    const enc1 = this.renderer.device.createCommandEncoder();
+    enc1.copyTextureToTexture(
+      { texture: this.committedTexture, origin: { x: lx, y: ty } },
+      { texture: this.txSrcTexture },
+      { width: cw, height: ch },
+    );
+    this.renderer.device.queue.submit([enc1.finish()]);
+
+    // base テクスチャ: committed をコピーして bounds 部分を 0 でクリア（穴あき化）
+    this.txBaseTexture = this.renderer.device.createTexture({
+      size: [this.canvasWidth, this.canvasHeight], format: BUFFER_FORMAT,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    const enc2 = this.renderer.device.createCommandEncoder();
+    enc2.copyTextureToTexture(
+      { texture: this.committedTexture },
+      { texture: this.txBaseTexture },
+      [this.canvasWidth, this.canvasHeight],
+    );
+    this.renderer.device.queue.submit([enc2.finish()]);
+
+    // bounds 部分を 0 でクリア（writeTexture で sub-region に書き込む）
+    const bprSub = Math.ceil(cw * 8 / 256) * 256;
+    const zeros = new Uint8Array(bprSub * ch);
+    this.renderer.device.queue.writeTexture(
+      { texture: this.txBaseTexture, origin: { x: lx, y: ty } },
+      zeros,
+      { bytesPerRow: bprSub, rowsPerImage: ch },
+      { width: cw, height: ch },
+    );
+
+    this.txBounds = { lx, ty, rx, by };
+    this.txActive = true;
+    return { lx, ty, rx, by };
+  }
+
+  /**
+   * 変形を適用して committed を更新（ドラッグ中の毎フレーム呼ぶ）。
+   * invMatrix: row-major 3x3 を array<vec4f,3> 形式の 12 floats で渡す。
+   */
+  updateTransform(invMatrix: Float32Array): void {
+    if (!this.txActive || !this.txSrcTexture || !this.txBaseTexture || !this.txBounds) return;
+    const { lx, ty, rx, by } = this.txBounds;
+    this.transformRenderer.render(
+      this.txSrcTexture,
+      this.txBaseTexture,
+      this.committedTexture,
+      invMatrix,
+      rx - lx, by - ty,
+      this.canvasWidth, this.canvasHeight,
+    );
+  }
+
+  /** 変形確定。Undo 用スナップショットを返す */
+  commitTransform(): { snapshot: Uint16Array; bytesPerRow: number } | null {
+    if (!this.txActive || !this.txSnapshot) return null;
+    const snapshot = this.txSnapshot;
+    const bytesPerRow = Math.ceil(this.canvasWidth * 8 / 256) * 256;
+    this._clearTransformState();
+    return { snapshot, bytesPerRow };
+  }
+
+  /** 変形キャンセル: committed を元の状態に戻す */
+  cancelTransform(): void {
+    if (!this.txActive || !this.txSnapshot) return;
+    this.updateCommittedTexture(this.txSnapshot);
+    this._clearTransformState();
+  }
+
+  private _clearTransformState(): void {
+    this.txActive = false;
+    this.txSnapshot = null;
+    this.txSrcTexture?.destroy(); this.txSrcTexture = null;
+    this.txBaseTexture?.destroy(); this.txBaseTexture = null;
+    this.txBounds = null;
+  }
+
+  // --- 移動ツール ---
+  private moveActive = false;
+  // 移動前スナップショット（Undo 用）aligned Uint16Array
+  private moveSnapshot: Uint16Array | null = null;
+  // 穴あき版（コンテンツを除いた aligned Uint16Array）
+  private moveBase: Uint16Array | null = null;
+  // 切り出したコンテンツ（tight packed u16: cw*ch*4）と元位置
+  private moveContent: { data: Uint16Array; x: number; y: number; w: number; h: number } | null = null;
+  // applyMoveOffset で使い回すバッファ
+  private moveResult: Uint16Array | null = null;
+
+  isMoveActive(): boolean { return this.moveActive; }
+
+  /** 移動開始: アクティブレイヤーの対象領域を切り出し、穴あき版を committed に書き込む */
+  async beginMove(): Promise<void> {
+    if (this.moveActive) return;
+    const snap = await this.requestCommittedSnapshot();
+    const w = this.canvasWidth, h = this.canvasHeight;
+    const u16pr = snap.bytesPerRow / 2;
+
+    this.moveSnapshot = snap.data.slice(0);
+
+    // 移動対象の bounds（選択範囲があればその範囲、なければ全体）
+    let lx = 0, ty = 0, rx = w, by = h;
+    if (this.selectionBounds) {
+      ({ lx, ty, rx, by } = this.selectionBounds);
+    }
+    const cw = rx - lx, ch = by - ty;
+
+    // コンテンツを tight packed で切り出す
+    const content = new Uint16Array(cw * ch * 4);
+    for (let ry = 0; ry < ch; ry++) {
+      const srcOff = (ty + ry) * u16pr + lx * 4;
+      content.set(snap.data.subarray(srcOff, srcOff + cw * 4), ry * cw * 4);
+    }
+    this.moveContent = { data: content, x: lx, y: ty, w: cw, h: ch };
+
+    // 穴あき版: コンテンツ領域を 0 にした aligned snapshot
+    const base = snap.data.slice(0);
+    for (let ry = 0; ry < ch; ry++) {
+      base.fill(0, (ty + ry) * u16pr + lx * 4, (ty + ry) * u16pr + (lx + cw) * 4);
+    }
+    this.moveBase = base;
+    this.moveResult = new Uint16Array(base.length);
+
+    this.updateCommittedTexture(base);
+    this.moveActive = true;
+  }
+
+  /**
+   * ドラッグ中のオフセット適用（穴あき版 + コンテンツをオフセット位置に合成）。
+   * キャンバス外にはみ出た部分はクリップする。
+   */
+  applyMoveOffset(dx: number, dy: number): void {
+    if (!this.moveActive || !this.moveBase || !this.moveContent || !this.moveResult) return;
+    const w = this.canvasWidth, h = this.canvasHeight;
+    const u16pr = Math.ceil(w * 8 / 256) * 256 / 2;
+    const { data: cnt, x: cx, y: cy, w: cw, h: ch } = this.moveContent;
+    const ndx = Math.round(dx), ndy = Math.round(dy);
+
+    // 穴あき版をベースにコピー
+    this.moveResult.set(this.moveBase);
+
+    for (let ry = 0; ry < ch; ry++) {
+      const wy = cy + ry + ndy;
+      if (wy < 0 || wy >= h) continue;
+      const wx0 = cx + ndx;
+      const srcOff = ry * cw * 4;
+
+      if (wx0 >= 0 && wx0 + cw <= w) {
+        // 全列が範囲内 → TypedArray.set で行一括コピー（最速）
+        this.moveResult.set(cnt.subarray(srcOff, srcOff + cw * 4), wy * u16pr + wx0 * 4);
+      } else {
+        // 部分クリップ
+        for (let rx2 = 0; rx2 < cw; rx2++) {
+          const wx = wx0 + rx2;
+          if (wx < 0 || wx >= w) continue;
+          const si = srcOff + rx2 * 4;
+          const di = wy * u16pr + wx * 4;
+          this.moveResult[di] = cnt[si];
+          this.moveResult[di + 1] = cnt[si + 1];
+          this.moveResult[di + 2] = cnt[si + 2];
+          this.moveResult[di + 3] = cnt[si + 3];
+        }
+      }
+    }
+
+    this.updateCommittedTexture(this.moveResult);
+  }
+
+  /**
+   * 移動確定。Undo 用の移動前スナップショットと bytesPerRow を返す。
+   */
+  commitMove(): { snapshot: Uint16Array; bytesPerRow: number } | null {
+    if (!this.moveActive || !this.moveSnapshot) return null;
+    const snapshot = this.moveSnapshot;
+    const bytesPerRow = Math.ceil(this.canvasWidth * 8 / 256) * 256;
+    this.moveActive = false;
+    this.moveSnapshot = null;
+    this.moveBase = null;
+    this.moveContent = null;
+    this.moveResult = null;
+    return { snapshot, bytesPerRow };
+  }
+
+  /** 移動キャンセル: committed を移動前の状態に戻す */
+  cancelMove(): void {
+    if (!this.moveActive || !this.moveSnapshot) return;
+    this.updateCommittedTexture(this.moveSnapshot);
+    this.moveActive = false;
+    this.moveSnapshot = null;
+    this.moveBase = null;
+    this.moveContent = null;
+    this.moveResult = null;
+  }
+
   getActiveLayerAlphaLock(): boolean {
     return this.layers[this.activeIndex].alphaLock;
   }
@@ -437,6 +705,9 @@ export class RenderPipeline {
   }
 
   resizeCanvasSize(w: number, h: number) {
+    // リサイズ前に変形・移動操作があればキャンセル
+    if (this.txActive) this.cancelTransform();
+    if (this.moveActive) this.cancelMove();
     this.brushRenderer.resize(w * 4, h * 4);
     this.brushTexture4x.destroy();
     this.isolatedTexture.destroy();
@@ -512,6 +783,8 @@ export class RenderPipeline {
 
   dispose() {
     this.brushRenderer.dispose();
+    this.transformRenderer.dispose();
+    this._clearTransformState();
     this.brushTexture4x?.destroy();
     this.isolatedTexture?.destroy();
     this.displayA?.destroy(); this.displayB?.destroy(); this.activeComposite?.destroy();

@@ -13,6 +13,10 @@ struct Uniforms {
   use_texture: u32,      // 1=テクスチャブラシ, 0=円形ブラシ
   texture_scale: f32,    // テクスチャのスケール（繰り返し回数）
   use_alpha_lock: u32,   // 1=透明部分保護（既存αでマスク）
+  use_selection: u32,    // 1=選択範囲マスクを適用
+  _pad1: u32,
+  _pad2: u32,
+  _pad3: u32,
 }
 
 // 点ごとのデータ: data=(x, y, size, pressure), color=(r, g, b, a)
@@ -51,6 +55,12 @@ var brush_texture: texture_2d<f32>;
 
 @group(0) @binding(5)
 var brush_sampler: sampler;
+
+@group(0) @binding(6)
+var selection_texture: texture_2d<f32>;
+
+@group(0) @binding(7)
+var selection_sampler: sampler;
 
 // --- Color Conversion (from color.wgsl) ---
 fn linear_to_oklab(c: vec3f) -> vec3f {
@@ -160,6 +170,12 @@ fn fragment_main(input: FragmentInput) -> @location(0) vec4<f32> {
   if (uniforms.use_alpha_lock != 0u) {
     let existing = textureSampleLevel(committed_texture, committed_sampler, input.canvas_uv, 0.0);
     stamp_alpha = stamp_alpha * existing.a;
+  }
+
+  // 選択範囲: マスク外には描画しない
+  if (uniforms.use_selection != 0u) {
+    let sel = textureSampleLevel(selection_texture, selection_sampler, input.canvas_uv, 0.0);
+    stamp_alpha = stamp_alpha * sel.r;
   }
 
   return vec4<f32>(target_color * stamp_alpha, stamp_alpha);

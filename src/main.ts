@@ -70,7 +70,7 @@ function sampleSnapshot(
   };
 }
 
-type Tool = 'brush' | 'eraser' | 'spoit' | 'bucket' | 'blur' | 'line';
+type Tool = 'brush' | 'eraser' | 'spoit' | 'bucket' | 'blur' | 'line' | 'select' | 'move' | 'transform';
 
 interface AppState {
   isDrawing: boolean;
@@ -136,6 +136,10 @@ class PhotonMixerApp {
     // 画面サイズに追従（キャンバスではなく描画領域）
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
+
+    // 選択オーバーレイも画面サイズに合わせる
+    const overlay = document.getElementById('selection-overlay') as HTMLCanvasElement | null;
+    if (overlay) { overlay.width = window.innerWidth; overlay.height = window.innerHeight; }
 
     try {
       this.renderer = await initRenderer(canvas);
@@ -220,6 +224,7 @@ class PhotonMixerApp {
     const transform = this.viewport.getTransform();
     this.renderPipeline.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation, transform.flip);
     this.layerHistories.clear();
+    this.clearSelectionUI(); // 旧キャンバスサイズの選択マスクを破棄
     this.rebuildLayerPanel();
     this.updateZoomDisplay();
   }
@@ -378,6 +383,8 @@ class PhotonMixerApp {
   private applyViewport(): void {
     const t = this.viewport.getTransform();
     this.renderPipeline?.updateViewport(t.scale, t.offsetX, t.offsetY, t.rotation, t.flip);
+    this.drawSelectionOverlay();
+    this.drawTransformOverlay();
   }
 
   /** UI パネルの表示/非表示をトグル（Tab） */
@@ -416,6 +423,32 @@ class PhotonMixerApp {
   // Shift 押下状態（直線の角度スナップ用）
   private shiftDown = false;
 
+  // --- 変形ツール用 ---
+  private txStarting = false;   // beginTransform 非同期待ち
+  private txActive = false;     // 変形操作中
+  // 変形パラメータ（bounds 中心を変形中心として使用）
+  private txBounds: { lx: number; ty: number; rx: number; by: number } | null = null;
+  private txSx = 1;     // x スケール
+  private txSy = 1;     // y スケール
+  private txTheta = 0;  // 回転角（ラジアン）
+  private txTx = 0;     // x 平行移動（キャンバス座標）
+  private txTy = 0;     // y 平行移動（キャンバス座標）
+  // ドラッグ中のハンドル（0-7: スケール, 8: 回転, 9: 全体平行移動, -1: なし）
+  private txHandleIndex = -1;
+  private txDragOrigin: { x: number; y: number; sx: number; sy: number; theta: number; tx: number; ty: number; dist: number; angle: number } | null = null;
+
+  // --- 移動ツール用 ---
+  private isMoveActive = false;   // beginMove が完了して移動中
+  private moveStarting = false;   // beginMove の非同期待ち中
+  private moveOrigin: { x: number; y: number } | null = null; // down 時のキャンバス座標
+
+  // --- 矩形選択ツール用 ---
+  private isSelecting = false;
+  private selectAnchor: { x: number; y: number } | null = null;  // 始点（キャンバス座標）
+  private selectCurrent: { x: number; y: number } | null = null; // 現在点（キャンバス座標）
+  // 確定済み選択範囲（キャンバス座標）。null=選択なし
+  private selectionRect: { x0: number; y0: number; x1: number; y1: number } | null = null;
+
   private handlePenInput(event: import('./pen/input.js').PenInputEvent): void {
     if (this.state.isPanning) return;
 
@@ -427,6 +460,43 @@ class PhotonMixerApp {
 
     switch (type) {
       case 'down': {
+        if (this.state.currentTool === 'transform') {
+          if (this.txStarting || !this.txActive) return; // beginTransform 待ち or 未開始
+          const handles = this.getTransformHandles();
+          const hitIdx = this.hitTestHandle(point.x, point.y, handles);
+          // 変形中心のスクリーン座標
+          const b = this.txBounds!;
+          const cx = (b.lx + b.rx) / 2 + this.txTx;
+          const cy = (b.ty + b.by) / 2 + this.txTy;
+          const center = this.viewport.toScreen(cx, cy);
+          const ddx = point.x - center.x, ddy = point.y - center.y;
+          this.txHandleIndex = hitIdx;
+          this.txDragOrigin = {
+            x: point.x, y: point.y,
+            sx: this.txSx, sy: this.txSy,
+            theta: this.txTheta, tx: this.txTx, ty: this.txTy,
+            dist: Math.hypot(ddx, ddy),
+            angle: Math.atan2(ddy, ddx),
+          };
+          return;
+        }
+        if (this.state.currentTool === 'move') {
+          // beginMove は非同期（GPU→CPU 読み出し）なのでフラグで待ち状態を管理
+          this.moveStarting = true;
+          this.renderPipeline?.beginMove().then(() => {
+            this.isMoveActive = true;
+            this.moveStarting = false;
+            this.moveOrigin = { x: transformedPoint.x, y: transformedPoint.y };
+          });
+          return;
+        }
+        if (this.state.currentTool === 'select') {
+          // 矩形選択：始点をキャンバス座標で記録
+          this.isSelecting = true;
+          this.selectAnchor = { x: transformedPoint.x, y: transformedPoint.y };
+          this.selectCurrent = { x: transformedPoint.x, y: transformedPoint.y };
+          return;
+        }
         if (this.state.currentTool === 'spoit') {
           this.handleSpoit(transformedPoint.x, transformedPoint.y);
           return;
@@ -459,6 +529,58 @@ class PhotonMixerApp {
       }
 
       case 'move': {
+        if (this.state.currentTool === 'transform') {
+          if (!this.txActive || !this.txDragOrigin || !this.txBounds) return;
+          const b = this.txBounds;
+          const cx = (b.lx + b.rx) / 2, cy = (b.ty + b.by) / 2;
+          const centerScreen = this.viewport.toScreen(cx + this.txTx, cy + this.txTy);
+          const ddx = point.x - centerScreen.x, ddy = point.y - centerScreen.y;
+          const idx = this.txHandleIndex;
+
+          if (idx === 8) {
+            // 回転ハンドル
+            this.txTheta = this.txDragOrigin.theta + (Math.atan2(ddy, ddx) - this.txDragOrigin.angle);
+          } else if (idx % 2 === 0 && idx >= 0 && idx <= 7) {
+            // コーナーハンドル: 等比スケール（中心からの距離比）
+            const d1 = Math.hypot(ddx, ddy);
+            const factor = d1 / (this.txDragOrigin.dist || 1);
+            this.txSx = Math.max(0.05, this.txDragOrigin.sx * factor);
+            this.txSy = Math.max(0.05, this.txDragOrigin.sy * factor);
+          } else if (idx === 1 || idx === 5) {
+            // 上/下辺中点: y スケール
+            const d1 = Math.abs(ddy);
+            const factor = d1 / (Math.abs(this.txDragOrigin.dist) || 1);
+            this.txSy = Math.max(0.05, this.txDragOrigin.sy * factor);
+          } else if (idx === 3 || idx === 7) {
+            // 右/左辺中点: x スケール
+            const d1 = Math.abs(ddx);
+            const factor = d1 / (Math.abs(this.txDragOrigin.dist) || 1);
+            this.txSx = Math.max(0.05, this.txDragOrigin.sx * factor);
+          } else {
+            // ハンドル外 or idx=-1: 全体平行移動
+            // スクリーン差をキャンバス差に変換（スケールのみ考慮、回転は省略でOK）
+            const scale = this.viewport.getTransform().scale;
+            this.txTx = this.txDragOrigin.tx + (point.x - this.txDragOrigin.x) / scale;
+            this.txTy = this.txDragOrigin.ty + (point.y - this.txDragOrigin.y) / scale;
+          }
+
+          this.renderPipeline?.updateTransform(this.buildInvMatrix());
+          this.drawTransformOverlay();
+          return;
+        }
+        if (this.state.currentTool === 'move') {
+          if (!this.isMoveActive || !this.moveOrigin) return;
+          const dx = transformedPoint.x - this.moveOrigin.x;
+          const dy = transformedPoint.y - this.moveOrigin.y;
+          this.renderPipeline?.applyMoveOffset(dx, dy);
+          return;
+        }
+        if (this.state.currentTool === 'select') {
+          if (!this.isSelecting) return;
+          this.selectCurrent = { x: transformedPoint.x, y: transformedPoint.y };
+          this.drawSelectionOverlay();
+          return;
+        }
         if (!this.state.isDrawing) return;
         if (this.state.currentTool === 'line') {
           this.renderPipeline?.setCurrentStroke(this.buildLineStroke(transformedPoint.x, transformedPoint.y));
@@ -478,6 +600,46 @@ class PhotonMixerApp {
       }
 
       case 'up': {
+        if (this.state.currentTool === 'transform') {
+          this.txHandleIndex = -1;
+          this.txDragOrigin = null;
+          return;
+        }
+        if (this.state.currentTool === 'move') {
+          if (this.moveStarting) {
+            // beginMove がまだ完了していない場合はキャンセル扱い
+            this.moveStarting = false;
+            this.renderPipeline?.cancelMove();
+            return;
+          }
+          if (!this.isMoveActive) return;
+          const moved = this.renderPipeline?.commitMove();
+          if (moved) {
+            this.activeHistory().addRecord({ kind: 'fill', snapshot: moved.snapshot, bytesPerRow: moved.bytesPerRow });
+          }
+          this.isMoveActive = false;
+          this.moveOrigin = null;
+          return;
+        }
+        if (this.state.currentTool === 'select') {
+          if (!this.isSelecting) return;
+          this.isSelecting = false;
+          const a = this.selectAnchor, b = this.selectCurrent;
+          this.selectAnchor = null;
+          this.selectCurrent = null;
+          if (!a || !b) return;
+          // クリックのみ（ドラッグ量が小さい）＝選択解除
+          if (Math.abs(a.x - b.x) < 2 || Math.abs(a.y - b.y) < 2) {
+            this.clearSelectionUI();
+          } else {
+            this.renderPipeline?.setRectSelection(a.x, a.y, b.x, b.y);
+            this.selectionRect = this.renderPipeline?.hasSelection()
+              ? { x0: a.x, y0: a.y, x1: b.x, y1: b.y }
+              : null;
+            this.drawSelectionOverlay();
+          }
+          return;
+        }
         if (!this.state.isDrawing) return;
 
         if (this.state.currentTool === 'line') {
@@ -544,6 +706,8 @@ class PhotonMixerApp {
       const transform = this.viewport.getTransform();
       this.renderPipeline?.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation, transform.flip);
       this.updateZoomDisplay();
+      this.drawSelectionOverlay();
+      this.drawTransformOverlay();
     }, { passive: false });
 
     // パン操作 (Space + ドラッグ)
@@ -594,6 +758,9 @@ class PhotonMixerApp {
         case 'g': this.setTool('bucket'); break;
         case 'u': this.setTool('blur'); break;
         case 'v': this.setTool('line'); break;
+        case 'm': this.setTool('select'); break;
+        case 'w': this.setTool('move'); break;
+        case 't': this.setTool('transform'); break;
         case '[': this.adjustBrushSize(-2); break;
         case ']': this.adjustBrushSize(+2); break;
         case 'h': // 左右反転
@@ -608,6 +775,18 @@ class PhotonMixerApp {
         case 'Tab': // UIパネルの表示/非表示
           e.preventDefault();
           this.toggleUI();
+          break;
+        case 'Enter': // 変形確定
+          if (this.state.currentTool === 'transform' && this.txActive) {
+            e.preventDefault();
+            this.commitTransformUI();
+          }
+          break;
+        case 'Escape': // 変形キャンセル
+          if (this.state.currentTool === 'transform') {
+            e.preventDefault();
+            this.cancelTransformUI();
+          }
           break;
       }
       if (e.key === 'Alt') {
@@ -643,6 +822,8 @@ class PhotonMixerApp {
         this.renderPipeline?.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation, transform.flip);
         lastX = e.clientX;
         lastY = e.clientY;
+        this.drawSelectionOverlay();
+        this.drawTransformOverlay();
       }
       this.updateBrushCursor(e.clientX, e.clientY, true);
     });
@@ -673,13 +854,238 @@ class PhotonMixerApp {
     el.style.display = 'block';
   }
 
+  /**
+   * 選択範囲オーバーレイを描画（点線枠）。
+   * 矩形の4隅をスクリーン座標へ変換するので、ズーム/回転/反転に追従する。
+   */
+  private drawSelectionOverlay(): void {
+    const cv = document.getElementById('selection-overlay') as HTMLCanvasElement | null;
+    if (!cv) return;
+    const ctx = cv.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, cv.width, cv.height);
+
+    // ドラッグ中は anchor→current、確定後は selectionRect を描く
+    let rect = this.selectionRect;
+    if (this.isSelecting && this.selectAnchor && this.selectCurrent) {
+      rect = { x0: this.selectAnchor.x, y0: this.selectAnchor.y, x1: this.selectCurrent.x, y1: this.selectCurrent.y };
+    }
+    if (!rect) return;
+
+    const c = [
+      this.viewport.toScreen(rect.x0, rect.y0),
+      this.viewport.toScreen(rect.x1, rect.y0),
+      this.viewport.toScreen(rect.x1, rect.y1),
+      this.viewport.toScreen(rect.x0, rect.y1),
+    ];
+    ctx.beginPath();
+    ctx.moveTo(c[0].x, c[0].y);
+    for (let i = 1; i < 4; i++) ctx.lineTo(c[i].x, c[i].y);
+    ctx.closePath();
+    // 黒下地＋白点線でマーチングアント風（背景色を問わず視認できる）
+    ctx.lineWidth = 1;
+    ctx.setLineDash([]);
+    ctx.strokeStyle = 'rgba(0,0,0,0.8)';
+    ctx.stroke();
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = 'rgba(255,255,255,0.95)';
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  /** 選択解除（マスク破棄＋オーバーレイクリア） */
+  private clearSelectionUI(): void {
+    this.renderPipeline?.clearSelection();
+    this.selectionRect = null;
+    this.drawSelectionOverlay();
+  }
+
+  // ─────────────────────────────── 変形ツール ───────────────────────────────
+
+  /**
+   * 逆変換行列を計算（dst キャンバス座標 → src テクスチャ座標）
+   * 結果は row-major 3x3 を array<vec4f,3> 形式の 12 floats で返す。
+   */
+  private buildInvMatrix(): Float32Array {
+    const b = this.txBounds!;
+    const cx = (b.lx + b.rx) / 2, cy = (b.ty + b.by) / 2;
+    const cosT = Math.cos(this.txTheta), sinT = Math.sin(this.txTheta);
+    const invSx = 1 / this.txSx, invSy = 1 / this.txSy;
+    const dx = cx + this.txTx, dy = cy + this.txTy;
+    // row 0: dst → src_u
+    const r00 = cosT * invSx, r01 = sinT * invSx;
+    const r02 = cx - b.lx - (cosT * dx + sinT * dy) * invSx;
+    // row 1: dst → src_v
+    const r10 = -sinT * invSy, r11 = cosT * invSy;
+    const r12 = cy - b.ty - (-sinT * dx + cosT * dy) * invSy;
+    return new Float32Array([r00, r01, r02, 0, r10, r11, r12, 0, 0, 0, 1, 0]);
+  }
+
+  /** 変形後のハンドル座標（スクリーン座標）を返す。最後の要素が回転ハンドル */
+  private getTransformHandles(): { x: number; y: number }[] {
+    if (!this.txBounds) return [];
+    const { lx, ty, rx, by } = this.txBounds;
+    const cx = (lx + rx) / 2, cy = (ty + by) / 2;
+    const hw = (rx - lx) / 2, hh = (by - ty) / 2;
+    const cosT = Math.cos(this.txTheta), sinT = Math.sin(this.txTheta);
+
+    const applyForward = (px: number, py: number): { x: number; y: number } => {
+      const lx2 = px - cx, ly2 = py - cy;
+      const qx = cosT * this.txSx * lx2 - sinT * this.txSy * ly2 + cx + this.txTx;
+      const qy = sinT * this.txSx * lx2 + cosT * this.txSy * ly2 + cy + this.txTy;
+      return this.viewport.toScreen(qx, qy);
+    };
+
+    const pts = [
+      applyForward(lx, ty),     applyForward(lx + hw, ty),  applyForward(rx, ty),
+      applyForward(rx, ty + hh),
+      applyForward(rx, by),     applyForward(lx + hw, by),  applyForward(lx, by),
+      applyForward(lx, ty + hh),
+    ];
+
+    // 回転ハンドル: 上辺中点から外向き 28px
+    const topL = pts[0], topR = pts[2];
+    const edgeX = topR.x - topL.x, edgeY = topR.y - topL.y;
+    const len = Math.hypot(edgeX, edgeY) || 1;
+    const nx = -edgeY / len, ny = edgeX / len; // 上辺の外向き法線
+    const topMid = pts[1];
+    pts.push({ x: topMid.x + nx * 28, y: topMid.y + ny * 28 });
+
+    return pts;
+  }
+
+  private hitTestHandle(sx: number, sy: number, handles: { x: number; y: number }[], r = 7): number {
+    for (let i = 0; i < handles.length; i++) {
+      const dx = sx - handles[i].x, dy = sy - handles[i].y;
+      if (dx * dx + dy * dy <= r * r) return i;
+    }
+    return -1;
+  }
+
+  /** 変形ハンドルと選択枠を overlay canvas に描画 */
+  private drawTransformOverlay(): void {
+    const cv = document.getElementById('selection-overlay') as HTMLCanvasElement | null;
+    if (!cv) return;
+    const ctx = cv.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    if (!this.txActive || !this.txBounds) return;
+
+    const handles = this.getTransformHandles();
+    if (handles.length < 8) return;
+    const corners = [handles[0], handles[2], handles[4], handles[6]];
+
+    // 変形後の矩形枠（4隅を繋ぐ）
+    ctx.beginPath();
+    ctx.moveTo(corners[0].x, corners[0].y);
+    for (let i = 1; i < 4; i++) ctx.lineTo(corners[i].x, corners[i].y);
+    ctx.closePath();
+    ctx.lineWidth = 1;
+    ctx.setLineDash([]);
+    ctx.strokeStyle = 'rgba(0,0,0,0.8)'; ctx.stroke();
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = 'rgba(255,255,255,0.95)'; ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 回転ハンドル〜上辺中点の線
+    const rot = handles[8];
+    ctx.beginPath();
+    ctx.moveTo(handles[1].x, handles[1].y);
+    ctx.lineTo(rot.x, rot.y);
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+    ctx.stroke();
+
+    // ハンドル円（コーナー=白塗り, 辺中点=小円, 回転=∘）
+    handles.forEach((h, i) => {
+      ctx.beginPath();
+      ctx.arc(h.x, h.y, i === 8 ? 5 : i % 2 === 0 ? 5 : 4, 0, Math.PI * 2);
+      ctx.fillStyle = i === 8 ? 'rgba(80,200,255,0.9)' : 'rgba(255,255,255,0.95)';
+      ctx.fill();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = '#000';
+      ctx.stroke();
+    });
+  }
+
+  /** 変形パラメータをリセットして pipeline に初期状態を反映 */
+  private txResetParams(): void {
+    this.txSx = 1; this.txSy = 1; this.txTheta = 0; this.txTx = 0; this.txTy = 0;
+  }
+
+  /** 変形確定 */
+  private commitTransformUI(): void {
+    if (!this.txActive) return;
+    const result = this.renderPipeline?.commitTransform();
+    if (result) {
+      this.activeHistory().addRecord({ kind: 'fill', snapshot: result.snapshot, bytesPerRow: result.bytesPerRow });
+    }
+    this.txActive = false;
+    this.txBounds = null;
+    this.txHandleIndex = -1;
+    this.txDragOrigin = null;
+    this.drawTransformOverlay();
+  }
+
+  /** 変形キャンセル */
+  private cancelTransformUI(): void {
+    this.renderPipeline?.cancelTransform();
+    this.txActive = false;
+    this.txStarting = false;
+    this.txBounds = null;
+    this.txHandleIndex = -1;
+    this.txDragOrigin = null;
+    this.drawTransformOverlay();
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /** 全選択（キャンバス全体を選択範囲にする） */
+  private selectAll(): void {
+    const { width, height } = this.viewport.getCanvasSize();
+    this.renderPipeline?.setRectSelection(0, 0, width, height);
+    this.selectionRect = { x0: 0, y0: 0, x1: width, y1: height };
+    this.drawSelectionOverlay();
+  }
+
   private setTool(tool: Tool): void {
+    const prev = this.state.currentTool;
+    // move ツールから離脱時: キャンセル
+    if (prev === 'move' && tool !== 'move') {
+      if (this.isMoveActive) { this.renderPipeline?.cancelMove(); this.isMoveActive = false; this.moveOrigin = null; }
+      this.moveStarting = false;
+    }
+    // transform ツールから離脱時: キャンセル
+    if (prev === 'transform' && tool !== 'transform') {
+      this.cancelTransformUI();
+    }
+
     this.state.currentTool = tool;
-    const tools: Tool[] = ['brush', 'eraser', 'spoit', 'bucket', 'blur', 'line'];
+    const tools: Tool[] = ['brush', 'eraser', 'spoit', 'bucket', 'blur', 'line', 'select', 'move', 'transform'];
     tools.forEach(t => {
       const btn = document.getElementById(`tool-${t}`);
       if (btn) btn.classList.toggle('active', t === tool);
     });
+    // 選択ツール時のみ全選択/解除コントロールを表示
+    const selCtrl = document.getElementById('select-controls');
+    if (selCtrl) selCtrl.style.display = tool === 'select' ? '' : 'none';
+    // 変形ツール時のみ確定/取消コントロールを表示
+    const txCtrl = document.getElementById('transform-controls');
+    if (txCtrl) txCtrl.style.display = tool === 'transform' ? '' : 'none';
+
+    // transform ツール選択時: beginTransform を自動開始
+    if (tool === 'transform') {
+      this.txStarting = true;
+      this.txResetParams();
+      this.renderPipeline?.beginTransform().then(bounds => {
+        if (!bounds || this.state.currentTool !== 'transform') return;
+        this.txBounds = bounds;
+        this.txActive = true;
+        this.txStarting = false;
+        this.renderPipeline?.updateTransform(this.buildInvMatrix());
+        this.drawTransformOverlay();
+      });
+    }
   }
 
   private async handleSpoit(x: number, y: number): Promise<void> {
@@ -930,6 +1336,13 @@ class PhotonMixerApp {
     bucketBtn?.addEventListener('click', () => this.setTool('bucket'));
     document.getElementById('tool-blur')?.addEventListener('click', () => this.setTool('blur'));
     document.getElementById('tool-line')?.addEventListener('click', () => this.setTool('line'));
+    document.getElementById('tool-select')?.addEventListener('click', () => this.setTool('select'));
+    document.getElementById('select-all')?.addEventListener('click', () => this.selectAll());
+    document.getElementById('select-clear')?.addEventListener('click', () => this.clearSelectionUI());
+    document.getElementById('tool-move')?.addEventListener('click', () => this.setTool('move'));
+    document.getElementById('tool-transform')?.addEventListener('click', () => this.setTool('transform'));
+    document.getElementById('transform-commit')?.addEventListener('click', () => this.commitTransformUI());
+    document.getElementById('transform-cancel')?.addEventListener('click', () => this.cancelTransformUI());
 
     const sizeSlider    = document.getElementById('brush-size')    as HTMLInputElement;
     const sizeNum       = document.getElementById('brush-size-num') as HTMLInputElement;
@@ -1277,9 +1690,14 @@ class PhotonMixerApp {
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
     this.renderPipeline.resizeScreenSize(window.innerWidth, window.innerHeight);
+    // 選択オーバーレイもウィンドウサイズに合わせる
+    const overlay = document.getElementById('selection-overlay') as HTMLCanvasElement | null;
+    if (overlay) { overlay.width = window.innerWidth; overlay.height = window.innerHeight; }
     // リサイズ後もビューポートを更新
     const transform = this.viewport.getTransform();
     this.renderPipeline.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation, transform.flip);
+    this.drawSelectionOverlay();
+    this.drawTransformOverlay();
   }
 
   private startRenderLoop(): void {
