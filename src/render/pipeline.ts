@@ -265,21 +265,41 @@ export class RenderPipeline {
     if (l) l.alphaLock = locked;
   }
 
-  // --- 選択範囲 ---
+  // --- 選択範囲（任意形状マスク）---
   private selectionMask: GPUTexture | null = null;
-  // 選択範囲の bounds（キャンバスピクセル座標）。beginMove が参照する
+  // 選択マスクの実データ（tight w*h, 0 or 255）。move/transform と輪郭表示が参照する
+  private selectionMaskData: Uint8Array | null = null;
+  // 選択範囲の bounds（キャンバスピクセル座標）。beginMove/beginTransform が参照する
   private selectionBounds: { lx: number; ty: number; rx: number; by: number } | null = null;
 
   hasSelection(): boolean { return this.selectionMask !== null; }
 
-  /** 矩形選択（キャンバス座標）。選択内=1, 外=0 のマスクを r8 で作る */
-  setRectSelection(x0: number, y0: number, x1: number, y1: number): void {
+  /** 選択マスクデータ（tight w*h coverage）を返す。輪郭オーバーレイ用 */
+  getSelectionMaskData(): { data: Uint8Array; w: number; h: number } | null {
+    if (!this.selectionMaskData) return null;
+    return { data: this.selectionMaskData, w: this.canvasWidth, h: this.canvasHeight };
+  }
+
+  /**
+   * tight な coverage マスク（w*h, 0..255）を受け取り、bounds を算出して
+   * GPU テクスチャへアップロードする。空マスクなら選択解除する。
+   */
+  private applySelectionMask(data: Uint8Array): void {
     const w = this.canvasWidth, h = this.canvasHeight;
-    const lx = Math.max(0, Math.min(w, Math.round(Math.min(x0, x1))));
-    const rx = Math.max(0, Math.min(w, Math.round(Math.max(x0, x1))));
-    const ty = Math.max(0, Math.min(h, Math.round(Math.min(y0, y1))));
-    const by = Math.max(0, Math.min(h, Math.round(Math.max(y0, y1))));
-    if (rx - lx < 1 || by - ty < 1) { this.clearSelection(); return; }
+    let lx = w, ty = h, rx = 0, by = 0, any = false;
+    for (let y = 0; y < h; y++) {
+      const row = y * w;
+      for (let x = 0; x < w; x++) {
+        if (data[row + x] !== 0) {
+          any = true;
+          if (x < lx) lx = x;
+          if (x + 1 > rx) rx = x + 1;
+          if (y < ty) ty = y;
+          if (y + 1 > by) by = y + 1;
+        }
+      }
+    }
+    if (!any) { this.clearSelection(); return; }
 
     if (!this.selectionMask) {
       this.selectionMask = this.renderer.device.createTexture({
@@ -289,21 +309,114 @@ export class RenderPipeline {
     }
     // r8 は bytesPerRow 256 アラインが必要
     const bpr = Math.ceil(w / 256) * 256;
-    const data = new Uint8Array(bpr * h); // 0 で初期化
-    for (let y = ty; y < by; y++) {
-      data.fill(255, y * bpr + lx, y * bpr + rx);
-    }
+    const aligned = new Uint8Array(bpr * h);
+    for (let y = 0; y < h; y++) aligned.set(data.subarray(y * w, y * w + w), y * bpr);
     this.renderer.device.queue.writeTexture(
       { texture: this.selectionMask },
-      data, { bytesPerRow: bpr, rowsPerImage: h }, [w, h],
+      aligned, { bytesPerRow: bpr, rowsPerImage: h }, [w, h],
     );
     this.brushRenderer.setSelectionTexture(this.selectionMask);
+    this.selectionMaskData = data;
     this.selectionBounds = { lx, ty, rx, by };
+  }
+
+  /** 矩形選択（キャンバス座標） */
+  setRectSelection(x0: number, y0: number, x1: number, y1: number): void {
+    const w = this.canvasWidth, h = this.canvasHeight;
+    const lx = Math.max(0, Math.min(w, Math.round(Math.min(x0, x1))));
+    const rx = Math.max(0, Math.min(w, Math.round(Math.max(x0, x1))));
+    const ty = Math.max(0, Math.min(h, Math.round(Math.min(y0, y1))));
+    const by = Math.max(0, Math.min(h, Math.round(Math.max(y0, y1))));
+    if (rx - lx < 1 || by - ty < 1) { this.clearSelection(); return; }
+    const data = new Uint8Array(w * h);
+    for (let y = ty; y < by; y++) data.fill(255, y * w + lx, y * w + rx);
+    this.applySelectionMask(data);
+  }
+
+  /** 投げ縄選択（キャンバス座標の多角形）。even-odd 走査線でラスタライズ */
+  setLassoSelection(points: { x: number; y: number }[]): void {
+    const w = this.canvasWidth, h = this.canvasHeight;
+    if (points.length < 3) { this.clearSelection(); return; }
+    const data = new Uint8Array(w * h);
+    let minY = h, maxY = 0;
+    for (const p of points) { if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y; }
+    const y0 = Math.max(0, Math.floor(minY)), y1 = Math.min(h - 1, Math.ceil(maxY));
+    const n = points.length;
+    const xs: number[] = [];
+    for (let y = y0; y <= y1; y++) {
+      const yc = y + 0.5;
+      xs.length = 0;
+      for (let i = 0, j = n - 1; i < n; j = i++) {
+        const pi = points[i], pj = points[j];
+        if ((pi.y <= yc && pj.y > yc) || (pj.y <= yc && pi.y > yc)) {
+          xs.push(pi.x + (yc - pi.y) / (pj.y - pi.y) * (pj.x - pi.x));
+        }
+      }
+      xs.sort((a, b) => a - b);
+      for (let k = 0; k + 1 < xs.length; k += 2) {
+        const xa = Math.max(0, Math.round(xs[k]));
+        const xb = Math.min(w, Math.round(xs[k + 1]));
+        if (xb > xa) data.fill(255, y * w + xa, y * w + xb);
+      }
+    }
+    this.applySelectionMask(data);
+  }
+
+  /** 自動選択（committed の連結同色領域）。tolerance: 0..1（straight color 差） */
+  async setMagicWandSelection(x: number, y: number, tolerance: number): Promise<void> {
+    const w = this.canvasWidth, h = this.canvasHeight;
+    const ix = Math.round(x), iy = Math.round(y);
+    if (ix < 0 || ix >= w || iy < 0 || iy >= h) return;
+    const snap = await this.requestCommittedSnapshot();
+    const u16pr = snap.bytesPerRow / 2;
+    const straight = (px: number, py: number) => {
+      const idx = py * u16pr + px * 4;
+      const a = float16ToFloat32(snap.data[idx + 3]);
+      const inv = a > 0.0001 ? 1 / a : 0;
+      return {
+        r: float16ToFloat32(snap.data[idx]) * inv,
+        g: float16ToFloat32(snap.data[idx + 1]) * inv,
+        b: float16ToFloat32(snap.data[idx + 2]) * inv,
+        a,
+      };
+    };
+    const ref = straight(ix, iy);
+    const same = (px: number, py: number) => {
+      const c = straight(px, py);
+      return Math.abs(c.r - ref.r) <= tolerance && Math.abs(c.g - ref.g) <= tolerance
+        && Math.abs(c.b - ref.b) <= tolerance && Math.abs(c.a - ref.a) <= tolerance;
+    };
+    const data = new Uint8Array(w * h);
+    const stack: [number, number][] = [[ix, iy]];
+    while (stack.length > 0) {
+      const [cx, cy] = stack.pop()!;
+      if (data[cy * w + cx] !== 0) continue;
+      let lx = cx;
+      while (lx > 0 && data[cy * w + (lx - 1)] === 0 && same(lx - 1, cy)) lx--;
+      let rx = cx;
+      while (rx < w - 1 && data[cy * w + (rx + 1)] === 0 && same(rx + 1, cy)) rx++;
+      for (let i = lx; i <= rx; i++) {
+        data[cy * w + i] = 255;
+        if (cy > 0 && data[(cy - 1) * w + i] === 0 && same(i, cy - 1)) stack.push([i, cy - 1]);
+        if (cy < h - 1 && data[(cy + 1) * w + i] === 0 && same(i, cy + 1)) stack.push([i, cy + 1]);
+      }
+    }
+    this.applySelectionMask(data);
+  }
+
+  /** 選択範囲を反転（未選択なら全選択になる） */
+  invertSelection(): void {
+    const w = this.canvasWidth, h = this.canvasHeight;
+    const cur = this.selectionMaskData;
+    const data = new Uint8Array(w * h);
+    for (let i = 0; i < data.length; i++) data[i] = (cur && cur[i]) ? 0 : 255;
+    this.applySelectionMask(data);
   }
 
   clearSelection(): void {
     if (this.selectionMask) { this.selectionMask.destroy(); this.selectionMask = null; }
     this.brushRenderer.setSelectionTexture(null);
+    this.selectionMaskData = null;
     this.selectionBounds = null;
   }
 
@@ -325,46 +438,61 @@ export class RenderPipeline {
 
     const snap = await this.requestCommittedSnapshot();
     this.txSnapshot = snap.data.slice(0);
+    const w = this.canvasWidth, h = this.canvasHeight;
+    const u16pr = snap.bytesPerRow / 2;
 
-    let lx = 0, ty = 0, rx = this.canvasWidth, by = this.canvasHeight;
+    let lx = 0, ty = 0, rx = w, by = h;
     if (this.selectionBounds) ({ lx, ty, rx, by } = this.selectionBounds);
     const cw = rx - lx, ch = by - ty;
     if (cw < 1 || ch < 1) return null;
 
-    // src テクスチャにコンテンツをコピー（GPU コピー、CPU 往復なし）
+    const mask = this.selectionMaskData; // null = 全選択（bounds = 全体）
+
+    // base: committed を tight にコピー。src: 切り出すコンテンツ（選択外は 0）。
+    // 選択ピクセルは base から抜く（穴あき化）。
+    const baseTight = new Uint16Array(w * h * 4);
+    for (let y = 0; y < h; y++) {
+      const srow = y * u16pr;
+      const drow = y * w * 4;
+      for (let x = 0; x < w; x++) {
+        const si = srow + x * 4, di = drow + x * 4;
+        baseTight[di] = snap.data[si]; baseTight[di + 1] = snap.data[si + 1];
+        baseTight[di + 2] = snap.data[si + 2]; baseTight[di + 3] = snap.data[si + 3];
+      }
+    }
+    const srcTight = new Uint16Array(cw * ch * 4);
+    for (let ry = 0; ry < ch; ry++) {
+      const sy = ty + ry;
+      for (let rxi = 0; rxi < cw; rxi++) {
+        const sx = lx + rxi;
+        if (mask && mask[sy * w + sx] === 0) continue;
+        const si = sy * u16pr + sx * 4;
+        const ci = (ry * cw + rxi) * 4;
+        srcTight[ci] = snap.data[si]; srcTight[ci + 1] = snap.data[si + 1];
+        srcTight[ci + 2] = snap.data[si + 2]; srcTight[ci + 3] = snap.data[si + 3];
+        const bi = (sy * w + sx) * 4;
+        baseTight[bi] = 0; baseTight[bi + 1] = 0; baseTight[bi + 2] = 0; baseTight[bi + 3] = 0;
+      }
+    }
+
     this.txSrcTexture = this.renderer.device.createTexture({
       size: [cw, ch], format: BUFFER_FORMAT,
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
-    const enc1 = this.renderer.device.createCommandEncoder();
-    enc1.copyTextureToTexture(
-      { texture: this.committedTexture, origin: { x: lx, y: ty } },
+    this.renderer.device.queue.writeTexture(
       { texture: this.txSrcTexture },
-      { width: cw, height: ch },
+      srcTight as unknown as BufferSource,
+      { bytesPerRow: cw * 8, rowsPerImage: ch }, [cw, ch],
     );
-    this.renderer.device.queue.submit([enc1.finish()]);
 
-    // base テクスチャ: committed をコピーして bounds 部分を 0 でクリア（穴あき化）
     this.txBaseTexture = this.renderer.device.createTexture({
-      size: [this.canvasWidth, this.canvasHeight], format: BUFFER_FORMAT,
+      size: [w, h], format: BUFFER_FORMAT,
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
-    const enc2 = this.renderer.device.createCommandEncoder();
-    enc2.copyTextureToTexture(
-      { texture: this.committedTexture },
-      { texture: this.txBaseTexture },
-      [this.canvasWidth, this.canvasHeight],
-    );
-    this.renderer.device.queue.submit([enc2.finish()]);
-
-    // bounds 部分を 0 でクリア（writeTexture で sub-region に書き込む）
-    const bprSub = Math.ceil(cw * 8 / 256) * 256;
-    const zeros = new Uint8Array(bprSub * ch);
     this.renderer.device.queue.writeTexture(
-      { texture: this.txBaseTexture, origin: { x: lx, y: ty } },
-      zeros,
-      { bytesPerRow: bprSub, rowsPerImage: ch },
-      { width: cw, height: ch },
+      { texture: this.txBaseTexture },
+      baseTight as unknown as BufferSource,
+      { bytesPerRow: w * 8, rowsPerImage: h }, [w, h],
     );
 
     this.txBounds = { lx, ty, rx, by };
@@ -419,8 +547,10 @@ export class RenderPipeline {
   private moveSnapshot: Uint16Array | null = null;
   // 穴あき版（コンテンツを除いた aligned Uint16Array）
   private moveBase: Uint16Array | null = null;
-  // 切り出したコンテンツ（tight packed u16: cw*ch*4）と元位置
-  private moveContent: { data: Uint16Array; x: number; y: number; w: number; h: number } | null = null;
+  // 切り出したコンテンツ（tight packed u16: cw*ch*4）+ 形状マスク（tight cw*ch）と元位置
+  private moveContent: { data: Uint16Array; mask: Uint8Array; x: number; y: number; w: number; h: number } | null = null;
+  // 選択マスクが矩形全体（穴なし）なら高速な行一括コピーが使える
+  private moveMaskFull = false;
   // applyMoveOffset で使い回すバッファ
   private moveResult: Uint16Array | null = null;
 
@@ -442,19 +572,27 @@ export class RenderPipeline {
     }
     const cw = rx - lx, ch = by - ty;
 
-    // コンテンツを tight packed で切り出す
+    const mask = this.selectionMaskData; // null = 全選択（bounds 全体）
+    // コンテンツ（選択ピクセルのみ・他は 0）と形状マスクを切り出し、base から抜く
     const content = new Uint16Array(cw * ch * 4);
-    for (let ry = 0; ry < ch; ry++) {
-      const srcOff = (ty + ry) * u16pr + lx * 4;
-      content.set(snap.data.subarray(srcOff, srcOff + cw * 4), ry * cw * 4);
-    }
-    this.moveContent = { data: content, x: lx, y: ty, w: cw, h: ch };
-
-    // 穴あき版: コンテンツ領域を 0 にした aligned snapshot
+    const moveMask = new Uint8Array(cw * ch);
     const base = snap.data.slice(0);
+    let maskFull = true;
     for (let ry = 0; ry < ch; ry++) {
-      base.fill(0, (ty + ry) * u16pr + lx * 4, (ty + ry) * u16pr + (lx + cw) * 4);
+      const sy = ty + ry;
+      for (let rxi = 0; rxi < cw; rxi++) {
+        const sx = lx + rxi;
+        if (mask && mask[sy * w + sx] === 0) { maskFull = false; continue; }
+        const si = sy * u16pr + sx * 4;
+        const ci = (ry * cw + rxi) * 4;
+        content[ci] = base[si]; content[ci + 1] = base[si + 1];
+        content[ci + 2] = base[si + 2]; content[ci + 3] = base[si + 3];
+        moveMask[ry * cw + rxi] = 255;
+        base[si] = 0; base[si + 1] = 0; base[si + 2] = 0; base[si + 3] = 0;
+      }
     }
+    this.moveContent = { data: content, mask: moveMask, x: lx, y: ty, w: cw, h: ch };
+    this.moveMaskFull = maskFull;
     this.moveBase = base;
     this.moveResult = new Uint16Array(base.length);
 
@@ -470,7 +608,7 @@ export class RenderPipeline {
     if (!this.moveActive || !this.moveBase || !this.moveContent || !this.moveResult) return;
     const w = this.canvasWidth, h = this.canvasHeight;
     const u16pr = Math.ceil(w * 8 / 256) * 256 / 2;
-    const { data: cnt, x: cx, y: cy, w: cw, h: ch } = this.moveContent;
+    const { data: cnt, mask, x: cx, y: cy, w: cw, h: ch } = this.moveContent;
     const ndx = Math.round(dx), ndy = Math.round(dy);
 
     // 穴あき版をベースにコピー
@@ -482,12 +620,14 @@ export class RenderPipeline {
       const wx0 = cx + ndx;
       const srcOff = ry * cw * 4;
 
-      if (wx0 >= 0 && wx0 + cw <= w) {
-        // 全列が範囲内 → TypedArray.set で行一括コピー（最速）
+      if (this.moveMaskFull && wx0 >= 0 && wx0 + cw <= w) {
+        // 矩形選択かつ全列が範囲内 → TypedArray.set で行一括コピー（最速）
         this.moveResult.set(cnt.subarray(srcOff, srcOff + cw * 4), wy * u16pr + wx0 * 4);
       } else {
-        // 部分クリップ
+        // 形状マスク or 部分クリップ：選択ピクセルのみ書き込む
+        const mrow = ry * cw;
         for (let rx2 = 0; rx2 < cw; rx2++) {
+          if (mask[mrow + rx2] === 0) continue;
           const wx = wx0 + rx2;
           if (wx < 0 || wx >= w) continue;
           const si = srcOff + rx2 * 4;

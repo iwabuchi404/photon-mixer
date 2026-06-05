@@ -70,6 +70,27 @@ function sampleSnapshot(
   };
 }
 
+/**
+ * coverage マスク（tight w*h, 0/非0）の境界線分を抽出する。
+ * 選択ピクセルと未選択ピクセルの境界（穴の縁を含む）を、ピクセル角の単位線分
+ * [x0,y0,x1,y1, ...]（キャンバス座標）で返す。投げ縄/自動選択の任意形状に対応。
+ */
+function buildMaskContour(data: Uint8Array, w: number, h: number): number[] {
+  const seg: number[] = [];
+  const sel = (x: number, y: number): boolean =>
+    x >= 0 && x < w && y >= 0 && y < h && data[y * w + x] !== 0;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (!sel(x, y)) continue;
+      if (!sel(x - 1, y)) seg.push(x, y, x, y + 1);             // 左辺
+      if (!sel(x + 1, y)) seg.push(x + 1, y, x + 1, y + 1);     // 右辺
+      if (!sel(x, y - 1)) seg.push(x, y, x + 1, y);             // 上辺
+      if (!sel(x, y + 1)) seg.push(x, y + 1, x + 1, y + 1);     // 下辺
+    }
+  }
+  return seg;
+}
+
 type Tool = 'brush' | 'eraser' | 'spoit' | 'bucket' | 'blur' | 'line' | 'select' | 'move' | 'transform';
 
 interface AppState {
@@ -81,7 +102,8 @@ interface AppState {
   isPanning: boolean;
   useTexture: boolean;
   textureScale: number;
-  bucketTolerance: number; // 0-1（塗りつぶしの色差許容）
+  bucketTolerance: number; // 0-1（塗りつぶし／自動選択の色差許容）
+  selectMode: 'rect' | 'lasso' | 'wand'; // 選択ツールのモード
 }
 
 class PhotonMixerApp {
@@ -105,6 +127,7 @@ class PhotonMixerApp {
     useTexture: false,
     textureScale: 1.0,
     bucketTolerance: 0,
+    selectMode: 'rect',
   };
 
   private rawPoints: import('./pen/input.js').PointerPoint[] = [];
@@ -384,7 +407,6 @@ class PhotonMixerApp {
     const t = this.viewport.getTransform();
     this.renderPipeline?.updateViewport(t.scale, t.offsetX, t.offsetY, t.rotation, t.flip);
     this.drawSelectionOverlay();
-    this.drawTransformOverlay();
   }
 
   /** UI パネルの表示/非表示をトグル（Tab） */
@@ -442,12 +464,14 @@ class PhotonMixerApp {
   private moveStarting = false;   // beginMove の非同期待ち中
   private moveOrigin: { x: number; y: number } | null = null; // down 時のキャンバス座標
 
-  // --- 矩形選択ツール用 ---
+  // --- 選択ツール用 ---
   private isSelecting = false;
-  private selectAnchor: { x: number; y: number } | null = null;  // 始点（キャンバス座標）
-  private selectCurrent: { x: number; y: number } | null = null; // 現在点（キャンバス座標）
-  // 確定済み選択範囲（キャンバス座標）。null=選択なし
-  private selectionRect: { x0: number; y0: number; x1: number; y1: number } | null = null;
+  private selectAnchor: { x: number; y: number } | null = null;  // 矩形始点（キャンバス座標）
+  private selectCurrent: { x: number; y: number } | null = null; // 矩形現在点（キャンバス座標）
+  // 投げ縄ドラッグ中の頂点列（キャンバス座標）
+  private lassoPoints: { x: number; y: number }[] | null = null;
+  // 確定済み選択範囲の輪郭（キャンバス座標の線分列 [x0,y0,x1,y1,...]）。null=選択なし
+  private selectionSegments: number[] | null = null;
 
   private handlePenInput(event: import('./pen/input.js').PenInputEvent): void {
     if (this.state.isPanning) return;
@@ -491,6 +515,17 @@ class PhotonMixerApp {
           return;
         }
         if (this.state.currentTool === 'select') {
+          if (this.state.selectMode === 'wand') {
+            // 自動選択：クリック地点の連結同色領域を選択（非同期）
+            this.renderPipeline?.setMagicWandSelection(transformedPoint.x, transformedPoint.y, this.state.bucketTolerance)
+              .then(() => this.refreshSelectionContour());
+            return;
+          }
+          if (this.state.selectMode === 'lasso') {
+            this.isSelecting = true;
+            this.lassoPoints = [{ x: transformedPoint.x, y: transformedPoint.y }];
+            return;
+          }
           // 矩形選択：始点をキャンバス座標で記録
           this.isSelecting = true;
           this.selectAnchor = { x: transformedPoint.x, y: transformedPoint.y };
@@ -577,7 +612,11 @@ class PhotonMixerApp {
         }
         if (this.state.currentTool === 'select') {
           if (!this.isSelecting) return;
-          this.selectCurrent = { x: transformedPoint.x, y: transformedPoint.y };
+          if (this.state.selectMode === 'lasso' && this.lassoPoints) {
+            this.lassoPoints.push({ x: transformedPoint.x, y: transformedPoint.y });
+          } else {
+            this.selectCurrent = { x: transformedPoint.x, y: transformedPoint.y };
+          }
           this.drawSelectionOverlay();
           return;
         }
@@ -624,6 +663,17 @@ class PhotonMixerApp {
         if (this.state.currentTool === 'select') {
           if (!this.isSelecting) return;
           this.isSelecting = false;
+          if (this.state.selectMode === 'lasso') {
+            const pts = this.lassoPoints;
+            this.lassoPoints = null;
+            if (pts && pts.length >= 3) {
+              this.renderPipeline?.setLassoSelection(pts);
+              this.refreshSelectionContour();
+            } else {
+              this.clearSelectionUI();
+            }
+            return;
+          }
           const a = this.selectAnchor, b = this.selectCurrent;
           this.selectAnchor = null;
           this.selectCurrent = null;
@@ -633,10 +683,7 @@ class PhotonMixerApp {
             this.clearSelectionUI();
           } else {
             this.renderPipeline?.setRectSelection(a.x, a.y, b.x, b.y);
-            this.selectionRect = this.renderPipeline?.hasSelection()
-              ? { x0: a.x, y0: a.y, x1: b.x, y1: b.y }
-              : null;
-            this.drawSelectionOverlay();
+            this.refreshSelectionContour();
           }
           return;
         }
@@ -707,7 +754,6 @@ class PhotonMixerApp {
       this.renderPipeline?.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation, transform.flip);
       this.updateZoomDisplay();
       this.drawSelectionOverlay();
-      this.drawTransformOverlay();
     }, { passive: false });
 
     // パン操作 (Space + ドラッグ)
@@ -823,7 +869,6 @@ class PhotonMixerApp {
         lastX = e.clientX;
         lastY = e.clientY;
         this.drawSelectionOverlay();
-        this.drawTransformOverlay();
       }
       this.updateBrushCursor(e.clientX, e.clientY, true);
     });
@@ -855,8 +900,8 @@ class PhotonMixerApp {
   }
 
   /**
-   * 選択範囲オーバーレイを描画（点線枠）。
-   * 矩形の4隅をスクリーン座標へ変換するので、ズーム/回転/反転に追従する。
+   * オーバーレイを描画。変形中は変形ハンドル、それ以外は選択範囲（ライブプレビュー
+   * または確定済み輪郭）を描く。すべてスクリーン座標へ変換するのでズーム/回転/反転に追従。
    */
   private drawSelectionOverlay(): void {
     const cv = document.getElementById('selection-overlay') as HTMLCanvasElement | null;
@@ -865,25 +910,60 @@ class PhotonMixerApp {
     if (!ctx) return;
     ctx.clearRect(0, 0, cv.width, cv.height);
 
-    // ドラッグ中は anchor→current、確定後は selectionRect を描く
-    let rect = this.selectionRect;
-    if (this.isSelecting && this.selectAnchor && this.selectCurrent) {
-      rect = { x0: this.selectAnchor.x, y0: this.selectAnchor.y, x1: this.selectCurrent.x, y1: this.selectCurrent.y };
+    // 変形中は変形ハンドルのみ
+    if (this.txActive && this.txBounds) {
+      this.drawTransformHandles(ctx);
+      return;
     }
-    if (!rect) return;
 
-    const c = [
-      this.viewport.toScreen(rect.x0, rect.y0),
-      this.viewport.toScreen(rect.x1, rect.y0),
-      this.viewport.toScreen(rect.x1, rect.y1),
-      this.viewport.toScreen(rect.x0, rect.y1),
-    ];
-    ctx.beginPath();
-    ctx.moveTo(c[0].x, c[0].y);
-    for (let i = 1; i < 4; i++) ctx.lineTo(c[i].x, c[i].y);
-    ctx.closePath();
-    // 黒下地＋白点線でマーチングアント風（背景色を問わず視認できる）
+    // ライブプレビュー：矩形ドラッグ中
+    if (this.isSelecting && this.state.selectMode === 'rect' && this.selectAnchor && this.selectCurrent) {
+      const a = this.selectAnchor, b = this.selectCurrent;
+      const c = [
+        this.viewport.toScreen(a.x, a.y), this.viewport.toScreen(b.x, a.y),
+        this.viewport.toScreen(b.x, b.y), this.viewport.toScreen(a.x, b.y),
+      ];
+      this.strokeMarchingAnts(ctx, () => {
+        ctx.moveTo(c[0].x, c[0].y);
+        for (let i = 1; i < 4; i++) ctx.lineTo(c[i].x, c[i].y);
+        ctx.closePath();
+      });
+      return;
+    }
+
+    // ライブプレビュー：投げ縄ドラッグ中
+    if (this.isSelecting && this.state.selectMode === 'lasso' && this.lassoPoints && this.lassoPoints.length > 1) {
+      const pts = this.lassoPoints;
+      this.strokeMarchingAnts(ctx, () => {
+        const p0 = this.viewport.toScreen(pts[0].x, pts[0].y);
+        ctx.moveTo(p0.x, p0.y);
+        for (let i = 1; i < pts.length; i++) {
+          const p = this.viewport.toScreen(pts[i].x, pts[i].y);
+          ctx.lineTo(p.x, p.y);
+        }
+        ctx.closePath();
+      });
+      return;
+    }
+
+    // 確定済み選択範囲の輪郭（線分列）
+    const seg = this.selectionSegments;
+    if (seg && seg.length > 0) {
+      this.strokeMarchingAnts(ctx, () => {
+        for (let i = 0; i < seg.length; i += 4) {
+          const p0 = this.viewport.toScreen(seg[i], seg[i + 1]);
+          const p1 = this.viewport.toScreen(seg[i + 2], seg[i + 3]);
+          ctx.moveTo(p0.x, p0.y);
+          ctx.lineTo(p1.x, p1.y);
+        }
+      });
+    }
+  }
+
+  /** 黒下地＋白点線でマーチングアント風に描く（背景色を問わず視認できる） */
+  private strokeMarchingAnts(ctx: CanvasRenderingContext2D, buildPath: () => void): void {
     ctx.lineWidth = 1;
+    ctx.beginPath(); buildPath();
     ctx.setLineDash([]);
     ctx.strokeStyle = 'rgba(0,0,0,0.8)';
     ctx.stroke();
@@ -896,8 +976,29 @@ class PhotonMixerApp {
   /** 選択解除（マスク破棄＋オーバーレイクリア） */
   private clearSelectionUI(): void {
     this.renderPipeline?.clearSelection();
-    this.selectionRect = null;
+    this.selectionSegments = null;
     this.drawSelectionOverlay();
+  }
+
+  /** 選択マスクから輪郭線分を再計算し、オーバーレイを更新する */
+  private refreshSelectionContour(): void {
+    const sel = this.renderPipeline?.getSelectionMaskData();
+    this.selectionSegments = sel ? buildMaskContour(sel.data, sel.w, sel.h) : null;
+    this.drawSelectionOverlay();
+  }
+
+  /** 選択モード切替（矩形/投げ縄/自動） */
+  private setSelectMode(mode: 'rect' | 'lasso' | 'wand'): void {
+    this.state.selectMode = mode;
+    (['rect', 'lasso', 'wand'] as const).forEach(m => {
+      document.getElementById(`select-mode-${m}`)?.classList.toggle('active', m === mode);
+    });
+  }
+
+  /** 選択範囲を反転 */
+  private invertSelectionUI(): void {
+    this.renderPipeline?.invertSelection();
+    this.refreshSelectionContour();
   }
 
   // ─────────────────────────────── 変形ツール ───────────────────────────────
@@ -962,15 +1063,13 @@ class PhotonMixerApp {
     return -1;
   }
 
-  /** 変形ハンドルと選択枠を overlay canvas に描画 */
+  /** オーバーレイ全体を再描画（変形ハンドル含む）。drawSelectionOverlay に委譲 */
   private drawTransformOverlay(): void {
-    const cv = document.getElementById('selection-overlay') as HTMLCanvasElement | null;
-    if (!cv) return;
-    const ctx = cv.getContext('2d');
-    if (!ctx) return;
-    ctx.clearRect(0, 0, cv.width, cv.height);
-    if (!this.txActive || !this.txBounds) return;
+    this.drawSelectionOverlay();
+  }
 
+  /** 変形ハンドルと選択枠を描画（txActive 前提。クリアは呼び出し側） */
+  private drawTransformHandles(ctx: CanvasRenderingContext2D): void {
     const handles = this.getTransformHandles();
     if (handles.length < 8) return;
     const corners = [handles[0], handles[2], handles[4], handles[6]];
@@ -1044,8 +1143,7 @@ class PhotonMixerApp {
   private selectAll(): void {
     const { width, height } = this.viewport.getCanvasSize();
     this.renderPipeline?.setRectSelection(0, 0, width, height);
-    this.selectionRect = { x0: 0, y0: 0, x1: width, y1: height };
-    this.drawSelectionOverlay();
+    this.refreshSelectionContour();
   }
 
   private setTool(tool: Tool): void {
@@ -1066,9 +1164,11 @@ class PhotonMixerApp {
       const btn = document.getElementById(`tool-${t}`);
       if (btn) btn.classList.toggle('active', t === tool);
     });
-    // 選択ツール時のみ全選択/解除コントロールを表示
+    // 選択ツール時のみ全選択/解除・モード切替コントロールを表示
     const selCtrl = document.getElementById('select-controls');
     if (selCtrl) selCtrl.style.display = tool === 'select' ? '' : 'none';
+    const selModeCtrl = document.getElementById('select-mode-controls');
+    if (selModeCtrl) selModeCtrl.style.display = tool === 'select' ? '' : 'none';
     // 変形ツール時のみ確定/取消コントロールを表示
     const txCtrl = document.getElementById('transform-controls');
     if (txCtrl) txCtrl.style.display = tool === 'transform' ? '' : 'none';
@@ -1339,6 +1439,10 @@ class PhotonMixerApp {
     document.getElementById('tool-select')?.addEventListener('click', () => this.setTool('select'));
     document.getElementById('select-all')?.addEventListener('click', () => this.selectAll());
     document.getElementById('select-clear')?.addEventListener('click', () => this.clearSelectionUI());
+    document.getElementById('select-mode-rect')?.addEventListener('click', () => this.setSelectMode('rect'));
+    document.getElementById('select-mode-lasso')?.addEventListener('click', () => this.setSelectMode('lasso'));
+    document.getElementById('select-mode-wand')?.addEventListener('click', () => this.setSelectMode('wand'));
+    document.getElementById('select-invert')?.addEventListener('click', () => this.invertSelectionUI());
     document.getElementById('tool-move')?.addEventListener('click', () => this.setTool('move'));
     document.getElementById('tool-transform')?.addEventListener('click', () => this.setTool('transform'));
     document.getElementById('transform-commit')?.addEventListener('click', () => this.commitTransformUI());
@@ -1697,7 +1801,6 @@ class PhotonMixerApp {
     const transform = this.viewport.getTransform();
     this.renderPipeline.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation, transform.flip);
     this.drawSelectionOverlay();
-    this.drawTransformOverlay();
   }
 
   private startRenderLoop(): void {
