@@ -17,6 +17,9 @@ import { savePmx, loadPmx } from './pmx.js';
 import { saveAutosave, loadAutosave } from './autosave.js';
 import { ColorPicker } from './ui/color-picker.js';
 import { buildMaskContour } from './selection/mask.js';
+import { createEngineCtx, type EngineCtx } from './ui/engine-ctx.js';
+import type { Tool } from './ui/tool-config.js';
+import { ToolBar } from './ui/components/tool-bar.js';
 import type { LinearColor } from './color/types.js';
 import type { StrokePoint } from './pen/stroke.js';
 import type { BrushConfig } from './render/brush.js';
@@ -72,8 +75,6 @@ function sampleSnapshot(
 }
 
 
-type Tool = 'brush' | 'eraser' | 'spoit' | 'bucket' | 'blur' | 'line' | 'select' | 'move' | 'transform';
-
 interface AppState {
   isDrawing: boolean;
   currentColor: LinearColor;
@@ -98,6 +99,10 @@ class PhotonMixerApp {
   private renderPipeline: RenderPipeline | null = null;
   private viewport: Viewport;
   private perfMonitor: PerfMonitor;
+  // UI→エンジン反映の唯一の窓口（setupControls で生成）
+  private engineCtx!: EngineCtx;
+  // 左の縦ツールバー（Lit コンポーネント）
+  private toolBar: ToolBar | null = null;
   private state: AppState = {
     isDrawing: false,
     currentColor: { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
@@ -826,7 +831,7 @@ class PhotonMixerApp {
     window.addEventListener('keyup', (e) => {
       if (e.code === 'Space') {
         this.state.isPanning = false;
-        canvas.style.cursor = 'crosshair';
+        this.applyToolCursor(); // パン解除後はツールに応じたカーソルへ戻す
       }
       if (e.key === 'Shift') this.shiftDown = false;
       if (e.key === 'Alt' && this.prevTool) {
@@ -878,6 +883,22 @@ class PhotonMixerApp {
     el.style.left = `${sx}px`;
     el.style.top = `${sy}px`;
     el.style.display = 'block';
+  }
+
+  // ツールごとのネイティブカーソル（移動などの編集ツールでも形状で判別できるように）
+  private static readonly TOOL_CURSORS: Record<Tool, string> = {
+    brush: 'crosshair', eraser: 'crosshair', blur: 'crosshair', line: 'crosshair',
+    spoit: 'crosshair', bucket: 'crosshair', select: 'crosshair',
+    move: 'move', transform: 'move',
+  };
+
+  /** 現在のツールに応じてキャンバスのカーソル形状を設定する */
+  private applyToolCursor(): void {
+    const canvas = this.renderer?.canvas;
+    if (!canvas) return;
+    // パン中は手のひら（grab）を優先
+    if (this.state.isPanning) { canvas.style.cursor = 'grab'; return; }
+    canvas.style.cursor = PhotonMixerApp.TOOL_CURSORS[this.state.currentTool] ?? 'crosshair';
   }
 
   /**
@@ -1140,11 +1161,8 @@ class PhotonMixerApp {
     }
 
     this.state.currentTool = tool;
-    const tools: Tool[] = ['brush', 'eraser', 'spoit', 'bucket', 'blur', 'line', 'select', 'move', 'transform'];
-    tools.forEach(t => {
-      const btn = document.getElementById(`tool-${t}`);
-      if (btn) btn.classList.toggle('active', t === tool);
-    });
+    this.applyToolCursor();
+    this.toolBar?.setActive(tool);
     // 選択ツール時のみ全選択/解除・モード切替コントロールを表示
     const selCtrl = document.getElementById('select-controls');
     if (selCtrl) selCtrl.style.display = tool === 'select' ? '' : 'none';
@@ -1406,26 +1424,26 @@ class PhotonMixerApp {
   }
 
   private setupControls(): void {
-    const brushBtn = document.getElementById('tool-brush');
-    const eraserBtn = document.getElementById('tool-eraser');
-    const spoitBtn = document.getElementById('tool-spoit');
-    const bucketBtn = document.getElementById('tool-bucket');
-    
-    brushBtn?.addEventListener('click', () => this.setTool('brush'));
-    eraserBtn?.addEventListener('click', () => this.setTool('eraser'));
-    spoitBtn?.addEventListener('click', () => this.setTool('spoit'));
-    bucketBtn?.addEventListener('click', () => this.setTool('bucket'));
-    document.getElementById('tool-blur')?.addEventListener('click', () => this.setTool('blur'));
-    document.getElementById('tool-line')?.addEventListener('click', () => this.setTool('line'));
-    document.getElementById('tool-select')?.addEventListener('click', () => this.setTool('select'));
+    // UI→エンジン反映の窓口を生成（strokeManager/stabilizer は構築済み、pipeline は遅延参照）
+    this.engineCtx = createEngineCtx({
+      strokeManager: this.strokeManager,
+      stabilizer: this.stabilizer,
+      getPipeline: () => this.renderPipeline,
+      state: this.state,
+    });
+
+    // 左の縦ツールバー（定義から自動生成）。クリックは onSelect 経由で setTool へ。
+    this.toolBar = document.getElementById('tool-bar') as ToolBar | null;
+    if (this.toolBar) {
+      this.toolBar.onSelect = (id) => this.setTool(id);
+      this.toolBar.setActive(this.state.currentTool);
+    }
     document.getElementById('select-all')?.addEventListener('click', () => this.selectAll());
     document.getElementById('select-clear')?.addEventListener('click', () => this.clearSelectionUI());
     document.getElementById('select-mode-rect')?.addEventListener('click', () => this.setSelectMode('rect'));
     document.getElementById('select-mode-lasso')?.addEventListener('click', () => this.setSelectMode('lasso'));
     document.getElementById('select-mode-wand')?.addEventListener('click', () => this.setSelectMode('wand'));
     document.getElementById('select-invert')?.addEventListener('click', () => this.invertSelectionUI());
-    document.getElementById('tool-move')?.addEventListener('click', () => this.setTool('move'));
-    document.getElementById('tool-transform')?.addEventListener('click', () => this.setTool('transform'));
     document.getElementById('transform-commit')?.addEventListener('click', () => this.commitTransformUI());
     document.getElementById('transform-cancel')?.addEventListener('click', () => this.cancelTransformUI());
 
@@ -1439,14 +1457,12 @@ class PhotonMixerApp {
     const mixModeSelect = document.getElementById('mix-mode')      as HTMLSelectElement;
     const clearBtn      = document.getElementById('clear-btn')!;
 
-    // ブラシサイズ同期ヘルパー
+    // ブラシサイズ同期ヘルパー（DOM同期＋エンジン反映）
     const updateBrushSize = (size: number) => {
       const clamped = Math.max(1, Math.min(100, size));
       sizeSlider.value = clamped.toString();
       sizeNum.value = clamped.toString();
-      const maxSize = clamped;
-      const baseSize = Math.max(1, Math.round(maxSize * 0.1));
-      this.strokeManager.updatePressureConfig({ maxSize, baseSize });
+      this.engineCtx.setSize(clamped);
     };
 
     sizeSlider.addEventListener('input', () => {
@@ -1464,16 +1480,13 @@ class PhotonMixerApp {
     });
 
     alphaSlider.addEventListener('input', () => {
-      const alpha = parseInt(alphaSlider.value) / 100;
       alphaVal.textContent = alphaSlider.value;
-      this.state.currentColor.a = alpha;
-      this.renderPipeline?.updateBrushConfig({ color: { ...this.state.currentColor } });
+      this.engineCtx.setOpacity(parseInt(alphaSlider.value) / 100);
     });
 
     wetSlider.addEventListener('input', () => {
-      this.state.wetRatio = parseInt(wetSlider.value) / 100;
-      wetVal.textContent  = wetSlider.value;
-      this.renderPipeline?.updateBrushConfig({ wetRatio: this.state.wetRatio });
+      wetVal.textContent = wetSlider.value;
+      this.engineCtx.setWet(parseInt(wetSlider.value) / 100);
     });
 
     // HSV カラーピッカー（input type=color は隠し互換用として残す）
@@ -1489,8 +1502,7 @@ class PhotonMixerApp {
     });
 
     mixModeSelect.addEventListener('change', () => {
-      this.state.mixMode = mixModeSelect.value as BrushMixMode;
-      this.renderPipeline?.updateBrushConfig({ mixMode: this.state.mixMode });
+      this.engineCtx.setMixMode(mixModeSelect.value as BrushMixMode);
     });
 
     const exportPngBtn = document.getElementById('export-png-btn');
@@ -1540,9 +1552,7 @@ class PhotonMixerApp {
     const stabVal = document.getElementById('brush-stabilize-val')!;
     const applyStabilize = (pct: number) => {
       stabVal.textContent = pct.toString();
-      // 0% → minAlpha=1.0（補正オフ）, 100% → minAlpha=0.1（強い補正）
-      const minAlpha = 1.0 - (pct / 100) * 0.9;
-      this.stabilizer.updateConfig({ minAlpha });
+      this.engineCtx.setStabilize(pct);
     };
     stabSlider?.addEventListener('input', () => applyStabilize(parseInt(stabSlider.value)));
     applyStabilize(parseInt(stabSlider.value)); // 初期値を反映
@@ -1550,15 +1560,15 @@ class PhotonMixerApp {
     // 筆圧カーブ
     const curveSel = document.getElementById('pressure-curve') as HTMLSelectElement;
     curveSel?.addEventListener('change', () => {
-      this.strokeManager.updatePressureConfig({ curve: curveSel.value as any });
+      this.engineCtx.setPressureCurve(curveSel.value as any);
     });
 
     // 塗りつぶし許容値
     const tolSlider = document.getElementById('bucket-tolerance') as HTMLInputElement;
     const tolVal = document.getElementById('bucket-tolerance-val')!;
     tolSlider?.addEventListener('input', () => {
-      this.state.bucketTolerance = parseInt(tolSlider.value) / 100;
       tolVal.textContent = tolSlider.value;
+      this.engineCtx.setTolerance(parseInt(tolSlider.value) / 100);
     });
 
     // 背景色
@@ -1640,8 +1650,7 @@ class PhotonMixerApp {
     textureScaleSlider.addEventListener('input', () => {
       const scale = parseFloat(textureScaleSlider.value);
       textureScaleVal.textContent = scale.toString();
-      this.state.textureScale = scale;
-      this.renderPipeline?.updateBrushConfig({ textureScale: scale });
+      this.engineCtx.setTextureScale(scale);
     });
 
     // プリセット関連

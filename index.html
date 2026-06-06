@@ -7,7 +7,15 @@
   <script type="importmap">
   {
     "imports": {
-      "fflate": "./node_modules/fflate/esm/browser.js"
+      "fflate": "./node_modules/fflate/esm/browser.js",
+      "lit": "./node_modules/lit/index.js",
+      "lit/": "./node_modules/lit/",
+      "lit-html": "./node_modules/lit-html/lit-html.js",
+      "lit-html/": "./node_modules/lit-html/",
+      "lit-element": "./node_modules/lit-element/index.js",
+      "lit-element/": "./node_modules/lit-element/",
+      "@lit/reactive-element": "./node_modules/@lit/reactive-element/reactive-element.js",
+      "@lit/reactive-element/": "./node_modules/@lit/reactive-element/"
     }
   }
   </script>
@@ -129,6 +137,47 @@
       color: #000;
       border-color: #0f0;
     }
+
+    /* 左の縦ツールバー（カテゴリ別） */
+    #tool-bar {
+      position: fixed;
+      left: 10px;
+      top: 96px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      background: rgba(0, 0, 0, 0.8);
+      padding: 8px;
+      border-radius: 6px;
+      z-index: 1000;
+      user-select: none;
+    }
+    .pm-tool-group {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .pm-tool-group + .pm-tool-group {
+      border-top: 1px solid #444;
+      padding-top: 8px;
+    }
+    #tool-bar .tool-btn {
+      flex: none;
+      width: 40px;
+      height: 40px;
+      font-size: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #tool-bar .tool-btn:hover {
+      background: #383838;
+      color: #fff;
+    }
+    #tool-bar .tool-btn.active:hover {
+      background: #0f0;
+      color: #000;
+    }
   </style>
 </head>
 <body>
@@ -156,18 +205,10 @@
       </div>
     </div>
   </div>
+  <!-- 左の縦ツールバー（TOOLS 定義から Lit が自動生成） -->
+  <pm-tool-bar id="tool-bar"></pm-tool-bar>
+
   <div id="brush-controls">
-    <div class="ctrl-row">
-      <button id="tool-brush" class="tool-btn active" title="ブラシ (B)">🖌️</button>
-      <button id="tool-eraser" class="tool-btn" title="消しゴム (E)">🧹</button>
-      <button id="tool-blur" class="tool-btn" title="ぼかし (U)">💧</button>
-      <button id="tool-line" class="tool-btn" title="直線 (V)">📏</button>
-      <button id="tool-spoit" class="tool-btn" title="スポイト (I)">🧪</button>
-      <button id="tool-bucket" class="tool-btn" title="バケツ (G)">🪣</button>
-      <button id="tool-select" class="tool-btn" title="矩形選択 (M)">⬚</button>
-      <button id="tool-move" class="tool-btn" title="移動 (W)">✥</button>
-      <button id="tool-transform" class="tool-btn" title="変形 (T)">⤢</button>
-    </div>
     <div class="ctrl-row" id="transform-controls" style="display:none;">
       <span class="ctrl-label">変形</span>
       <button id="transform-commit" class="tool-btn" style="flex:1;" title="確定 (Enter)">確定</button>

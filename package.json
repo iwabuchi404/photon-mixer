@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "fflate": "^0.8.3",
+    "lit": "^3.3.3",
     "playwright-core": "^1.60.0"
   }
 }

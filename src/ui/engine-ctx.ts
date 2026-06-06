@@ -1,0 +1,92 @@
+/**
+ * EngineCtx — UI から描画エンジンへ値を反映する唯一の窓口（facade）。
+ *
+ * 目的: パラメータの「反映ロジック」を1か所に集約し、イベントハンドラやツール切替の
+ * 復元処理が共通の経路（このオブジェクト）だけを呼ぶようにする。
+ * これにより反映の二重実装・取りこぼし・ツール間の状態混線といったバグを防ぐ。
+ *
+ * 注意: DOM には触れない（コントロールの値同期は呼び出し側 UI の責務）。
+ */
+
+import type { StrokeManager, PressureSizeConfig } from '../pen/stroke.js';
+import type { Stabilizer } from '../pen/stabilization.js';
+import type { RenderPipeline } from '../render/pipeline.js';
+import type { BrushMixMode } from '../render/brush.js';
+import type { LinearColor } from '../color/types.js';
+
+export type PressureCurve = PressureSizeConfig['curve'];
+
+/** EngineCtx が参照する共有状態（main の AppState の一部） */
+export interface SharedState {
+  currentColor: LinearColor;
+  wetRatio: number;
+  mixMode: BrushMixMode;
+  textureScale: number;
+  bucketTolerance: number;
+  useTexture: boolean;
+}
+
+export interface EngineDeps {
+  strokeManager: StrokeManager;
+  stabilizer: Stabilizer;
+  getPipeline: () => RenderPipeline | null;
+  state: SharedState;
+}
+
+/** パラメータごとの反映メソッド。値域は呼び出し側で正規化済みを前提とする */
+export interface EngineCtx {
+  /** ブラシ径(px)。base は max の約10% */
+  setSize(px: number): void;
+  /** 不透明度 0..1（描画色のα。色自体は共有） */
+  setOpacity(a01: number): void;
+  /** にじみ 0..1 */
+  setWet(w01: number): void;
+  /** 手ブレ補正 0..100(%)。0=補正なし, 100=最も滑らか */
+  setStabilize(pct: number): void;
+  /** 混色方式 */
+  setMixMode(mode: BrushMixMode): void;
+  /** 筆圧カーブ */
+  setPressureCurve(curve: PressureCurve): void;
+  /** テクスチャ繰り返しスケール */
+  setTextureScale(x: number): void;
+  /** 塗り/自動選択の許容値 0..1 */
+  setTolerance(t01: number): void;
+}
+
+export function createEngineCtx(deps: EngineDeps): EngineCtx {
+  const { strokeManager, stabilizer, getPipeline, state } = deps;
+  return {
+    setSize(px) {
+      const maxSize = Math.max(1, Math.min(100, Math.round(px)));
+      const baseSize = Math.max(1, Math.round(maxSize * 0.1));
+      strokeManager.updatePressureConfig({ maxSize, baseSize });
+    },
+    setOpacity(a01) {
+      state.currentColor.a = a01;
+      getPipeline()?.updateBrushConfig({ color: { ...state.currentColor } });
+    },
+    setWet(w01) {
+      state.wetRatio = w01;
+      getPipeline()?.updateBrushConfig({ wetRatio: w01 });
+    },
+    setStabilize(pct) {
+      // 0% → minAlpha=1.0（補正オフ）, 100% → minAlpha=0.1（強い補正）
+      const minAlpha = 1.0 - (pct / 100) * 0.9;
+      stabilizer.updateConfig({ minAlpha });
+    },
+    setMixMode(mode) {
+      state.mixMode = mode;
+      getPipeline()?.updateBrushConfig({ mixMode: mode });
+    },
+    setPressureCurve(curve) {
+      strokeManager.updatePressureConfig({ curve });
+    },
+    setTextureScale(x) {
+      state.textureScale = x;
+      getPipeline()?.updateBrushConfig({ textureScale: x });
+    },
+    setTolerance(t01) {
+      state.bucketTolerance = t01;
+    },
+  };
+}
