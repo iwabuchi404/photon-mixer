@@ -524,6 +524,11 @@ export class RenderPipeline {
     return true;
   }
 
+  /** トーンカーブ LUT を設定（main 側でカーブ編集時に呼ぶ） */
+  setCurveLut(data: Uint8Array): void {
+    this.filterRenderer.setCurveLut(data);
+  }
+
   /** プレビュー更新: 原本にフィルターを適用し committed に書く（選択範囲があればその内側のみ） */
   updateFilter(type: FilterType, params: FilterParams): void {
     if (!this.filterActive || !this.filterSrc) return;

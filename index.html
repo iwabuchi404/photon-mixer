@@ -425,15 +425,50 @@
     <!-- フィルター（破壊的適用＋Undo・選択範囲対応） -->
     <section class="panel" id="filter-panel">
       <div class="panel-title">フィルター</div>
-      <div class="ctrl-row" id="filter-start-row">
-        <button id="filter-blur" class="tool-btn" style="flex:1;">ぼかし</button>
-        <button id="filter-glow" class="tool-btn" style="flex:1;">グロー</button>
+      <div class="ctrl-row" id="filter-start-row" style="flex-wrap:wrap;">
+        <button id="filter-blur" class="tool-btn" style="flex:1 1 44%;">ぼかし</button>
+        <button id="filter-glow" class="tool-btn" style="flex:1 1 44%;">グロー</button>
+        <button id="filter-sharpen" class="tool-btn" style="flex:1 1 44%;">シャープ</button>
+        <button id="filter-exposure" class="tool-btn" style="flex:1 1 44%;">露出</button>
+        <button id="filter-levels" class="tool-btn" style="flex:1 1 44%;">レベル補正</button>
+        <button id="filter-curve" class="tool-btn" style="flex:1 1 44%;">トーンカーブ</button>
       </div>
       <div id="filter-params" style="display:none;">
+        <div id="filter-curve-editor" style="display:none; margin-bottom:10px;"></div>
         <div class="ctrl-row" data-fparam="radius">
           <span class="ctrl-label">半径</span>
           <input type="range" id="filter-radius" min="0" max="64" step="1" value="8">
           <span id="filter-radius-val" class="ctrl-val">8</span><span class="ctrl-unit">px</span>
+        </div>
+        <div class="ctrl-row" data-fparam="ev">
+          <span class="ctrl-label">露出</span>
+          <input type="range" id="filter-ev" min="-4" max="4" step="0.1" value="0">
+          <span id="filter-ev-val" class="ctrl-val">0.0</span><span class="ctrl-unit">EV</span>
+        </div>
+        <div class="ctrl-row" data-fparam="inLow">
+          <span class="ctrl-label">入力黒</span>
+          <input type="range" id="filter-inlow" min="0" max="1" step="0.01" value="0">
+          <span id="filter-inlow-val" class="ctrl-val">0.00</span>
+        </div>
+        <div class="ctrl-row" data-fparam="inHigh">
+          <span class="ctrl-label">入力白</span>
+          <input type="range" id="filter-inhigh" min="0" max="1" step="0.01" value="1">
+          <span id="filter-inhigh-val" class="ctrl-val">1.00</span>
+        </div>
+        <div class="ctrl-row" data-fparam="gamma">
+          <span class="ctrl-label">ガンマ</span>
+          <input type="range" id="filter-gamma" min="0.1" max="4" step="0.05" value="1">
+          <span id="filter-gamma-val" class="ctrl-val">1.00</span>
+        </div>
+        <div class="ctrl-row" data-fparam="outLow">
+          <span class="ctrl-label">出力黒</span>
+          <input type="range" id="filter-outlow" min="0" max="1" step="0.01" value="0">
+          <span id="filter-outlow-val" class="ctrl-val">0.00</span>
+        </div>
+        <div class="ctrl-row" data-fparam="outHigh">
+          <span class="ctrl-label">出力白</span>
+          <input type="range" id="filter-outhigh" min="0" max="1" step="0.01" value="1">
+          <span id="filter-outhigh-val" class="ctrl-val">1.00</span>
         </div>
         <div class="ctrl-row" data-fparam="threshold">
           <span class="ctrl-label">しきい値</span>

@@ -25,6 +25,7 @@ import { TOOLS, PARAM_DEFS, getToolDef, type ParamKey } from './ui/tool-config.j
 import { ToolSettingsStore } from './ui/tool-settings.js';
 import { evToExposure, type TonemapId, type DisplayModeId } from './color/display.js';
 import type { FilterType, FilterParams } from './render/filter.js';
+import { CurveEditor } from './ui/curve-editor.js';
 import type { LinearColor } from './color/types.js';
 import type { StrokePoint } from './pen/stroke.js';
 import type { BrushConfig } from './render/brush.js';
@@ -131,6 +132,8 @@ class PhotonMixerApp {
   private toolSettings!: ToolSettingsStore;
   // フィルタープレビュー中の種別（null=非アクティブ）
   private filterType: FilterType | null = null;
+  // トーンカーブエディタ
+  private curveEditor: CurveEditor | null = null;
   private state: AppState = {
     isDrawing: false,
     currentColor: { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
@@ -1279,14 +1282,29 @@ class PhotonMixerApp {
 
   // ─────────────────────────────── フィルター ───────────────────────────────
 
+  /** 各フィルターで表示するパラメータ行 */
+  private static readonly FILTER_PARAMS: Record<FilterType, string[]> = {
+    blur: ['radius'],
+    glow: ['radius', 'threshold', 'intensity'],
+    sharpen: ['radius', 'intensity'],
+    exposure: ['ev'],
+    levels: ['inLow', 'inHigh', 'gamma', 'outLow', 'outHigh'],
+    curve: [],
+  };
+
   /** フィルター開始（プレビュー）。種別に応じてパラメータ行を出し分ける */
   private startFilterUI(type: FilterType): void {
     if (!this.renderPipeline) return;
     if (this.filterType) this.renderPipeline.cancelFilter(); // 既存プレビューを破棄
     this.filterType = type;
-    const showGlow = type === 'glow';
-    (document.querySelector('[data-fparam="threshold"]') as HTMLElement | null)?.style.setProperty('display', showGlow ? '' : 'none');
-    (document.querySelector('[data-fparam="intensity"]') as HTMLElement | null)?.style.setProperty('display', showGlow ? '' : 'none');
+    const visible = new Set(PhotonMixerApp.FILTER_PARAMS[type]);
+    document.querySelectorAll<HTMLElement>('#filter-params [data-fparam]').forEach(row => {
+      row.style.display = visible.has(row.dataset.fparam!) ? '' : 'none';
+    });
+    // トーンカーブエディタは curve のときだけ表示し、現在のLUTを反映
+    const curveEd = document.getElementById('filter-curve-editor');
+    if (curveEd) curveEd.style.display = type === 'curve' ? '' : 'none';
+    if (type === 'curve' && this.curveEditor) this.renderPipeline.setCurveLut(this.curveEditor.getLut());
     const params = document.getElementById('filter-params');
     if (params) params.style.display = '';
     this.renderPipeline.beginFilter().then(ok => {
@@ -1295,10 +1313,17 @@ class PhotonMixerApp {
   }
 
   private currentFilterParams(): FilterParams {
+    const num = (id: string) => parseFloat((document.getElementById(id) as HTMLInputElement).value);
     return {
-      radius: parseFloat((document.getElementById('filter-radius') as HTMLInputElement).value),
-      threshold: parseFloat((document.getElementById('filter-threshold') as HTMLInputElement).value),
-      intensity: parseFloat((document.getElementById('filter-intensity') as HTMLInputElement).value),
+      radius: num('filter-radius'),
+      threshold: num('filter-threshold'),
+      intensity: num('filter-intensity'),
+      ev: num('filter-ev'),
+      inLow: num('filter-inlow'),
+      inHigh: num('filter-inhigh'),
+      gamma: num('filter-gamma'),
+      outLow: num('filter-outlow'),
+      outHigh: num('filter-outhigh'),
     };
   }
 
@@ -1713,11 +1738,29 @@ class PhotonMixerApp {
     // フィルター（ぼかし / グロー）
     document.getElementById('filter-blur')?.addEventListener('click', () => this.startFilterUI('blur'));
     document.getElementById('filter-glow')?.addEventListener('click', () => this.startFilterUI('glow'));
-    for (const id of ['filter-radius', 'filter-threshold', 'filter-intensity']) {
+    document.getElementById('filter-sharpen')?.addEventListener('click', () => this.startFilterUI('sharpen'));
+    document.getElementById('filter-exposure')?.addEventListener('click', () => this.startFilterUI('exposure'));
+    document.getElementById('filter-levels')?.addEventListener('click', () => this.startFilterUI('levels'));
+    document.getElementById('filter-curve')?.addEventListener('click', () => this.startFilterUI('curve'));
+    // トーンカーブエディタ（変更で LUT 更新＋プレビュー）
+    const curveContainer = document.getElementById('filter-curve-editor');
+    if (curveContainer) {
+      this.curveEditor = new CurveEditor(curveContainer, () => {
+        if (!this.curveEditor) return;
+        this.renderPipeline?.setCurveLut(this.curveEditor.getLut());
+        if (this.filterType === 'curve') this.applyFilterPreview();
+      });
+    }
+    // id → 値ラベルの小数桁
+    const filterDecimals: Record<string, number> = {
+      'filter-radius': 0, 'filter-ev': 1, 'filter-threshold': 1, 'filter-intensity': 1,
+      'filter-inlow': 2, 'filter-inhigh': 2, 'filter-gamma': 2, 'filter-outlow': 2, 'filter-outhigh': 2,
+    };
+    for (const [id, dp] of Object.entries(filterDecimals)) {
       const el = document.getElementById(id) as HTMLInputElement | null;
       el?.addEventListener('input', () => {
         const valEl = document.getElementById(`${id}-val`);
-        if (valEl) valEl.textContent = id === 'filter-radius' ? el.value : parseFloat(el.value).toFixed(1);
+        if (valEl) valEl.textContent = parseFloat(el.value).toFixed(dp);
         this.applyFilterPreview();
       });
     }
