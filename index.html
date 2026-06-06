@@ -395,6 +395,33 @@
       <input type="color" id="brush-color" value="#ffffff" style="display:none;">
     </section>
 
+    <!-- 表示（光のコントロール：露出・トーンマップ・表示モード） -->
+    <section class="panel" id="view-panel">
+      <div class="panel-title">表示（光）</div>
+      <div class="ctrl-row">
+        <span class="ctrl-label">露出</span>
+        <input type="range" id="view-exposure" min="-6" max="6" step="0.1" value="0">
+        <span id="view-exposure-val" class="ctrl-val">0.0</span><span class="ctrl-unit">EV</span>
+      </div>
+      <div class="ctrl-row">
+        <span class="ctrl-label">トーン</span>
+        <select id="view-tonemap" class="ctrl-select">
+          <option value="pbrNeutral">PBR Neutral</option>
+          <option value="agx">AgX</option>
+          <option value="reinhard">Reinhard</option>
+          <option value="none">なし(clamp)</option>
+        </select>
+      </div>
+      <div class="ctrl-row">
+        <span class="ctrl-label">モード</span>
+        <select id="view-mode" class="ctrl-select">
+          <option value="transform">表示変換</option>
+          <option value="raw">リニア生</option>
+          <option value="clip">クリップ警告</option>
+        </select>
+      </div>
+    </section>
+
     <!-- ファイル・設定 -->
     <section class="panel" id="doc-panel">
       <div class="panel-title">ファイル</div>

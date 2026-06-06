@@ -14,6 +14,7 @@ import { DownsampleRenderer } from './downsample.js';
 import { BlendRenderer, type BlendMode } from './blend-renderer.js';
 import { TransformRenderer } from './transform.js';
 import { rasterizePolygon, floodFillMask, maskBounds, invertMask } from '../selection/mask.js';
+import { linearToDisplaySrgb, TONEMAP_IDS, DISPLAY_MODE_IDS, type TonemapId, type DisplayModeId } from '../color/display.js';
 
 const BUFFER_FORMAT: GPUTextureFormat = 'rgba16float';
 
@@ -54,6 +55,11 @@ export class RenderPipeline {
   private eraseMode = false;
   // 背景色（リニア・不透明）。null は透明（台紙が透ける）
   private backgroundColor: { r: number; g: number; b: number } | null = null;
+
+  // 表示変換パラメータ（露出 EV / トーンマップ / 表示モード）。PNG 書き出しと共有
+  private displayExposure = 1;
+  private displayTonemap: TonemapId = 'pbrNeutral';
+  private displayMode: DisplayModeId = 'transform';
 
   private canvasWidth = 0;
   private canvasHeight = 0;
@@ -169,6 +175,14 @@ export class RenderPipeline {
 
   setBackgroundColor(color: { r: number; g: number; b: number } | null): void {
     this.backgroundColor = color;
+  }
+
+  /** 表示変換（ビュー露出=2^EV / トーンマップ / 表示モード）を設定 */
+  setDisplayParams(exposure: number, tonemap: TonemapId, mode: DisplayModeId): void {
+    this.displayExposure = exposure;
+    this.displayTonemap = tonemap;
+    this.displayMode = mode;
+    this.compositeRenderer.setDisplayParams(exposure, TONEMAP_IDS.indexOf(tonemap), DISPLAY_MODE_IDS.indexOf(mode));
   }
 
   // --- 描画（アクティブレイヤー対象）---
@@ -830,6 +844,8 @@ export class RenderPipeline {
     const imageData = ctx.createImageData(width, height);
 
     const uint16sPerRow = bytesPerRow / 2;
+    // 画面表示と同じ変換で書き出す（WYSIWYG）。リニア生モードはトーンマップ無し(none)
+    const exportTonemap = this.displayMode === 'raw' ? 'none' : this.displayTonemap;
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
         const idx = y * uint16sPerRow + x * 4;
@@ -843,9 +859,10 @@ export class RenderPipeline {
           imageData.data[pxIdx] = 0; imageData.data[pxIdx + 1] = 0;
           imageData.data[pxIdx + 2] = 0; imageData.data[pxIdx + 3] = 0;
         } else {
-          imageData.data[pxIdx] = Math.round(linearToSrgbByte(r / a));
-          imageData.data[pxIdx + 1] = Math.round(linearToSrgbByte(g / a));
-          imageData.data[pxIdx + 2] = Math.round(linearToSrgbByte(b / a));
+          const disp = linearToDisplaySrgb([r / a, g / a, b / a], this.displayExposure, exportTonemap);
+          imageData.data[pxIdx] = Math.round(disp[0] * 255);
+          imageData.data[pxIdx + 1] = Math.round(disp[1] * 255);
+          imageData.data[pxIdx + 2] = Math.round(disp[2] * 255);
           imageData.data[pxIdx + 3] = Math.round(a * 255);
         }
       }

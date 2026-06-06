@@ -23,6 +23,7 @@ import './ui/components/tool-bar.js'; // customElements.define('pm-tool-bar') �
 import type { ToolBar } from './ui/components/tool-bar.js';
 import { TOOLS, PARAM_DEFS, getToolDef, type ParamKey } from './ui/tool-config.js';
 import { ToolSettingsStore } from './ui/tool-settings.js';
+import { evToExposure, type TonemapId, type DisplayModeId } from './color/display.js';
 import type { LinearColor } from './color/types.js';
 import type { StrokePoint } from './pen/stroke.js';
 import type { BrushConfig } from './render/brush.js';
@@ -1650,6 +1651,21 @@ class PhotonMixerApp {
     curveSel?.addEventListener('change', () => {
       this.engineCtx.setPressureCurve(curveSel.value as any);
     });
+
+    // 表示（光）コントロール：露出 / トーンマップ / 表示モード
+    const viewExp = document.getElementById('view-exposure') as HTMLInputElement;
+    const viewExpVal = document.getElementById('view-exposure-val')!;
+    const viewTone = document.getElementById('view-tonemap') as HTMLSelectElement;
+    const viewMode = document.getElementById('view-mode') as HTMLSelectElement;
+    const applyDisplay = () => {
+      const ev = parseFloat(viewExp.value);
+      viewExpVal.textContent = (ev >= 0 ? '+' : '') + ev.toFixed(1);
+      this.renderPipeline?.setDisplayParams(evToExposure(ev), viewTone.value as TonemapId, viewMode.value as DisplayModeId);
+    };
+    viewExp?.addEventListener('input', applyDisplay);
+    viewTone?.addEventListener('change', applyDisplay);
+    viewMode?.addEventListener('change', applyDisplay);
+    applyDisplay(); // 初期値を反映
 
     // 塗りつぶし許容値
     const tolSlider = document.getElementById('bucket-tolerance') as HTMLInputElement;

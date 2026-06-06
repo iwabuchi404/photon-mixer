@@ -67,9 +67,26 @@ export class CompositeRenderer {
     this.paperPipeline = make(canvasFormat, 'vs_display', 'fs_paper'); 
   }
 
+  // 表示変換パラメータ（露出=2^EV, tonemap enum, display mode enum）
+  private dispExposure = 1;
+  private dispTonemap = 0;
+  private dispMode = 0;
+
   updateViewport(scale: number, offsetX: number, offsetY: number, rotation: number, cw: number, ch: number, sw: number, sh: number, flip = 1): void {
-    const data = new Float32Array([scale, offsetX, offsetY, rotation, cw, ch, sw, sh, flip, 0, 0, 0]);
+    const data = new Float32Array([
+      scale, offsetX, offsetY, rotation, cw, ch, sw, sh, flip,
+      this.dispExposure, this.dispTonemap, this.dispMode,
+    ]);
     this.device.queue.writeBuffer(this.uniformBuffer, 0, data);
+  }
+
+  /** 表示変換パラメータを更新（uniform 末尾3要素のみ書き換え） */
+  setDisplayParams(exposure: number, tonemap: number, mode: number): void {
+    this.dispExposure = exposure;
+    this.dispTonemap = tonemap;
+    this.dispMode = mode;
+    // 先頭から 9 floats(=36 bytes) 目以降に書き込む
+    this.device.queue.writeBuffer(this.uniformBuffer, 9 * 4, new Float32Array([exposure, tonemap, mode]));
   }
 
   draw(pass: GPURenderPassEncoder, texture: GPUTexture, eraseMode = false): void {
