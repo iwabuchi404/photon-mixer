@@ -178,6 +178,104 @@
       background: #0f0;
       color: #000;
     }
+
+    /* 右ドック（縦に複数パネルを並べてスクロール） */
+    #right-dock {
+      position: fixed;
+      right: 10px;
+      top: 10px;
+      bottom: 10px;
+      width: 240px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      overflow-y: auto;
+      z-index: 1000;
+      user-select: none;
+    }
+    .panel {
+      background: rgba(18, 18, 18, 0.92);
+      border: 1px solid #3a3a3a;
+      border-radius: 8px;
+      padding: 12px;
+      color: #eee;
+      font-family: monospace;
+      font-size: 12px;
+      flex: none;
+    }
+    .panel-title {
+      font-size: 11px;
+      color: #7fb2ff;
+      letter-spacing: 0.08em;
+      margin: 0 0 10px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid #333;
+    }
+    /* ツール設定ヘッダー（左ツールバーとの連動を明示） */
+    .tool-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #333;
+    }
+    .tool-header-icon { font-size: 22px; line-height: 1; }
+    .tool-header-name { font-size: 14px; font-weight: bold; color: #fff; flex: 1; }
+    .tool-header-badge {
+      font-size: 9px; color: #8aa; border: 1px solid #3a5a5a;
+      border-radius: 9px; padding: 1px 7px;
+    }
+    .tool-hint {
+      color: #9a9; font-size: 11px; line-height: 1.6;
+      background: rgba(80,140,90,0.08); border-left: 2px solid #4a7;
+      padding: 8px 10px; border-radius: 4px; margin-bottom: 4px;
+    }
+
+    /* 共通の行レイアウト（余白を広げて視認性UP） */
+    .ctrl-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+    .ctrl-row:last-child { margin-bottom: 0; }
+    .ctrl-label { width: 56px; flex: none; color: #aaa; }
+    .ctrl-row input[type="range"] { flex: 1; min-width: 0; }
+    .ctrl-val { width: 30px; text-align: right; color: #fff; }
+    .ctrl-unit { color: #888; font-size: 10px; }
+    .ctrl-num {
+      width: 46px; background: #1a1a1a; color: #fff; border: 1px solid #444;
+      border-radius: 3px; padding: 4px; font-family: monospace; font-size: 11px;
+    }
+    .ctrl-select {
+      flex: 1; background: #1a1a1a; color: #fff; border: 1px solid #444;
+      border-radius: 3px; padding: 4px; font-family: monospace; font-size: 11px; cursor: pointer;
+    }
+    .ctrl-color {
+      width: 30px; height: 24px; flex: none; background: none;
+      border: 1px solid #444; border-radius: 3px; cursor: pointer;
+    }
+    .panel-btn {
+      display: block; width: 100%; margin-top: 8px; padding: 8px 0;
+      background: #2a2a2a; color: #ccc; border: 1px solid #444; border-radius: 4px;
+      cursor: pointer; font-family: monospace; font-size: 11px;
+    }
+    .panel-btn:hover { background: #383838; color: #fff; }
+
+    /* アコーディオン（背景・プリセットなど補助設定） */
+    .accordion { margin-top: 10px; border-top: 1px solid #333; padding-top: 8px; }
+    .accordion > summary {
+      cursor: pointer; color: #bbb; font-size: 11px; list-style: none;
+      user-select: none; padding: 2px 0;
+    }
+    .accordion > summary::-webkit-details-marker { display: none; }
+    .accordion > summary::before { content: '▸ '; color: #666; }
+    .accordion[open] > summary::before { content: '▾ '; }
+    .accordion > .ctrl-row { margin-top: 8px; }
+
+    /* レイヤーパネル */
+    .layer-head {
+      display: flex; align-items: center; gap: 4px;
+      margin-bottom: 8px; padding-bottom: 6px; border-bottom: 1px solid #333;
+    }
+    .icon-btn { width: 26px; height: 24px; flex: none; padding: 0; }
+    #layer-list { max-height: 220px; overflow-y: auto; }
   </style>
 </head>
 <body>
@@ -208,112 +306,136 @@
   <!-- 左の縦ツールバー（TOOLS 定義から Lit が自動生成） -->
   <pm-tool-bar id="tool-bar"></pm-tool-bar>
 
-  <div id="brush-controls">
-    <div class="ctrl-row" id="transform-controls" style="display:none;">
-      <span class="ctrl-label">変形</span>
-      <button id="transform-commit" class="tool-btn" style="flex:1;" title="確定 (Enter)">確定</button>
-      <button id="transform-cancel" class="tool-btn" style="flex:1;" title="キャンセル (Esc)">取消</button>
-    </div>
-    <div class="ctrl-row" id="select-mode-controls" style="display:none;">
-      <button id="select-mode-rect" class="tool-btn active" style="flex:1;" title="矩形選択">矩形</button>
-      <button id="select-mode-lasso" class="tool-btn" style="flex:1;" title="投げ縄選択">投げ縄</button>
-      <button id="select-mode-wand" class="tool-btn" style="flex:1;" title="自動選択（許容値スライダー連動）">自動</button>
-      <button id="select-invert" class="tool-btn" style="flex:1;" title="選択範囲を反転">反転</button>
-    </div>
-    <div class="ctrl-row" id="select-controls" style="display:none;">
-      <span class="ctrl-label">選択</span>
-      <button id="select-all" class="tool-btn" style="flex:1;">全選択</button>
-      <button id="select-clear" class="tool-btn" style="flex:1;">解除</button>
-    </div>
-    <div class="ctrl-row" style="margin-top: 10px;">
-      <span class="ctrl-label">サイズ</span>
-      <input type="range" id="brush-size" min="1" max="100" value="20" style="width: 50px;">
-      <input type="number" id="brush-size-num" min="1" max="100" value="20" style="width: 36px; background: #1a1a1a; color: #fff; border: 1px solid #444; padding: 2px 4px; font-family: monospace; font-size: 11px;">
-      <span style="font-size: 10px;">px</span>
-    </div>
-    <div class="ctrl-row">
-      <span class="ctrl-label">不透明度</span>
-      <input type="range" id="brush-alpha" min="1" max="100" value="100">
-      <span id="brush-alpha-val" class="ctrl-val">100</span>%
-    </div>
-    <div class="ctrl-row">
-      <span class="ctrl-label">にじみ</span>
-      <input type="range" id="brush-wet" min="0" max="100" value="0">
-      <span id="brush-wet-val" class="ctrl-val">0</span>%
-    </div>
-    <div class="ctrl-row">
-      <span class="ctrl-label">補正</span>
-      <input type="range" id="brush-stabilize" min="0" max="100" value="30">
-      <span id="brush-stabilize-val" class="ctrl-val">30</span>%
-    </div>
-    <div class="ctrl-row">
-      <span class="ctrl-label">筆圧</span>
-      <select id="pressure-curve" style="width:80px;font-family:monospace;font-size:11px;background:#1a1a1a;color:#fff;border:1px solid #444;cursor:pointer;">
-        <option value="smooth">標準</option>
-        <option value="linear">リニア</option>
-        <option value="ease-in">入り遅</option>
-        <option value="ease-out">入り早</option>
-      </select>
-    </div>
-    <div class="ctrl-row">
-      <span class="ctrl-label">方式</span>
-      <select id="mix-mode" style="width:80px;font-family:monospace;font-size:11px;background:#1a1a1a;color:#fff;border:1px solid #444;cursor:pointer;">
-        <option value="stamp">スタンプ</option>
-        <option value="progressive">引きずり</option>
-      </select>
-    </div>
-    <div style="margin-top: 6px;">
+  <!-- 右ドック：ツール設定 / カラー / ファイル / レイヤー を縦に分離 -->
+  <div id="right-dock">
+    <!-- ツール設定（左ツールバーのアクティブツールに連動） -->
+    <section class="panel" id="tool-panel">
+      <div class="tool-header">
+        <span class="tool-header-icon" id="tool-header-icon">🖌️</span>
+        <span class="tool-header-name" id="tool-header-name">ブラシ</span>
+        <span class="tool-header-badge" title="設定はツールごとに個別保持されます">個別設定</span>
+      </div>
+      <div id="tool-hint" class="tool-hint" style="display:none;"></div>
+
+      <div class="ctrl-row" id="transform-controls" style="display:none;">
+        <span class="ctrl-label">変形</span>
+        <button id="transform-commit" class="tool-btn" style="flex:1;" title="確定 (Enter)">確定</button>
+        <button id="transform-cancel" class="tool-btn" style="flex:1;" title="キャンセル (Esc)">取消</button>
+      </div>
+      <div class="ctrl-row" id="select-mode-controls" style="display:none;">
+        <button id="select-mode-rect" class="tool-btn active" style="flex:1;" title="矩形選択">矩形</button>
+        <button id="select-mode-lasso" class="tool-btn" style="flex:1;" title="投げ縄選択">投げ縄</button>
+        <button id="select-mode-wand" class="tool-btn" style="flex:1;" title="自動選択（許容値スライダー連動）">自動</button>
+        <button id="select-invert" class="tool-btn" style="flex:1;" title="選択範囲を反転">反転</button>
+      </div>
+      <div class="ctrl-row" id="select-controls" style="display:none;">
+        <span class="ctrl-label">選択</span>
+        <button id="select-all" class="tool-btn" style="flex:1;">全選択</button>
+        <button id="select-clear" class="tool-btn" style="flex:1;">解除</button>
+      </div>
+
+      <div class="ctrl-row" data-param="size">
+        <span class="ctrl-label">サイズ</span>
+        <input type="range" id="brush-size" min="1" max="100" value="20">
+        <input type="number" id="brush-size-num" min="1" max="100" value="20" class="ctrl-num">
+        <span class="ctrl-unit">px</span>
+      </div>
+      <div class="ctrl-row" data-param="opacity">
+        <span class="ctrl-label">不透明度</span>
+        <input type="range" id="brush-alpha" min="1" max="100" value="100">
+        <span id="brush-alpha-val" class="ctrl-val">100</span><span class="ctrl-unit">%</span>
+      </div>
+      <div class="ctrl-row" data-param="wet">
+        <span class="ctrl-label">にじみ</span>
+        <input type="range" id="brush-wet" min="0" max="100" value="0">
+        <span id="brush-wet-val" class="ctrl-val">0</span><span class="ctrl-unit">%</span>
+      </div>
+      <div class="ctrl-row" data-param="stabilize">
+        <span class="ctrl-label">補正</span>
+        <input type="range" id="brush-stabilize" min="0" max="100" value="30">
+        <span id="brush-stabilize-val" class="ctrl-val">30</span><span class="ctrl-unit">%</span>
+      </div>
+      <div class="ctrl-row" data-param="curve">
+        <span class="ctrl-label">筆圧</span>
+        <select id="pressure-curve" class="ctrl-select">
+          <option value="smooth">標準</option>
+          <option value="linear">リニア</option>
+          <option value="ease-in">入り遅</option>
+          <option value="ease-out">入り早</option>
+        </select>
+      </div>
+      <div class="ctrl-row" data-param="mixMode">
+        <span class="ctrl-label">方式</span>
+        <select id="mix-mode" class="ctrl-select">
+          <option value="stamp">スタンプ</option>
+          <option value="progressive">引きずり</option>
+        </select>
+      </div>
+      <div class="ctrl-row" id="texture-controls" style="display:none;">
+        <span class="ctrl-label">テクスチャ</span>
+        <button id="load-texture-btn" class="tool-btn" style="flex:1;">読込</button>
+        <button id="clear-texture-btn" class="tool-btn" style="width:34px;flex:none;">×</button>
+      </div>
+      <div class="ctrl-row" data-param="textureScale">
+        <span class="ctrl-label">スケール</span>
+        <input type="range" id="texture-scale" min="1" max="20" value="1">
+        <span id="texture-scale-val" class="ctrl-val">1</span><span class="ctrl-unit">x</span>
+      </div>
+      <div class="ctrl-row" data-param="tolerance">
+        <span class="ctrl-label">許容値</span>
+        <input type="range" id="bucket-tolerance" min="0" max="100" value="0">
+        <span id="bucket-tolerance-val" class="ctrl-val">0</span><span class="ctrl-unit">%</span>
+      </div>
+    </section>
+
+    <!-- カラー（全ツール共通） -->
+    <section class="panel" id="color-panel">
+      <div class="panel-title">カラー</div>
       <div id="color-picker"></div>
       <input type="color" id="brush-color" value="#ffffff" style="display:none;">
-    </div>
-    <div class="ctrl-row" style="margin-top: 8px; border-top: 1px solid #333; padding-top: 8px;">
-      <span class="ctrl-label">テクスチャ</span>
-      <button id="load-texture-btn" style="flex: 1; padding: 2px 8px; background: #2a2a2a; color: #ccc; border: 1px solid #444; border-radius: 3px; cursor: pointer; font-family: monospace; font-size: 10px;">読込</button>
-      <button id="clear-texture-btn" style="width: 32px; padding: 2px 4px; background: #2a2a2a; color: #888; border: 1px solid #444; border-radius: 3px; cursor: pointer; font-family: monospace; font-size: 10px;">×</button>
-    </div>
-    <div class="ctrl-row">
-      <span class="ctrl-label">スケール</span>
-      <input type="range" id="texture-scale" min="1" max="20" value="1" style="width: 50px;">
-      <span id="texture-scale-val" class="ctrl-val">1</span>x
-    </div>
-    <div class="ctrl-row">
-      <span class="ctrl-label">許容値</span>
-      <input type="range" id="bucket-tolerance" min="0" max="100" value="0" style="width: 50px;">
-      <span id="bucket-tolerance-val" class="ctrl-val">0</span>%
-    </div>
-    <div class="ctrl-row">
-      <span class="ctrl-label">背景</span>
-      <button id="bg-transparent" class="tool-btn active" style="flex:1;">透明</button>
-      <button id="bg-white" class="tool-btn" style="flex:1;">白</button>
-      <input type="color" id="bg-color" value="#ffffff" style="width: 28px; height: 18px; border: none; cursor: pointer;">
-    </div>
-    <div class="ctrl-row" style="margin-top: 8px; border-top: 1px solid #333; padding-top: 8px;">
-      <span class="ctrl-label">プリセット</span>
-      <button id="save-preset-btn" class="tool-btn" style="flex: 1;">保存</button>
-      <button id="load-preset-btn" class="tool-btn" style="flex: 1;">読込</button>
-    </div>
-    <div class="ctrl-row" style="margin-top: 4px;">
-      <button id="save-pmx-btn" class="tool-btn" style="flex: 1;">保存(.pmx)</button>
-      <button id="open-pmx-btn" class="tool-btn" style="flex: 1;">開く</button>
-    </div>
-    <button id="export-png-btn" style="width: 100%; margin: 4px 0; padding: 4px 0; background: #2a2a2a; color: #ccc; border: 1px solid #444; border-radius: 3px; cursor: pointer; font-family: monospace; font-size: 11px;">PNG 書き出し</button>
-    <button id="clear-btn">クリア</button>
+    </section>
+
+    <!-- ファイル・設定 -->
+    <section class="panel" id="doc-panel">
+      <div class="panel-title">ファイル</div>
+      <div class="ctrl-row">
+        <button id="open-pmx-btn" class="tool-btn" style="flex:1;">開く</button>
+        <button id="save-pmx-btn" class="tool-btn" style="flex:1;">保存(.pmx)</button>
+      </div>
+      <button id="export-png-btn" class="panel-btn">PNG 書き出し</button>
+      <button id="clear-btn" class="panel-btn">アクティブレイヤーをクリア</button>
+      <details class="accordion">
+        <summary>背景</summary>
+        <div class="ctrl-row">
+          <button id="bg-transparent" class="tool-btn active" style="flex:1;">透明</button>
+          <button id="bg-white" class="tool-btn" style="flex:1;">白</button>
+          <input type="color" id="bg-color" value="#ffffff" class="ctrl-color">
+        </div>
+      </details>
+      <details class="accordion">
+        <summary>ブラシプリセット</summary>
+        <div class="ctrl-row">
+          <button id="save-preset-btn" class="tool-btn" style="flex:1;">保存</button>
+          <button id="load-preset-btn" class="tool-btn" style="flex:1;">読込</button>
+        </div>
+      </details>
+    </section>
+
+    <!-- レイヤー -->
+    <section class="panel" id="layer-panel">
+      <div class="layer-head">
+        <span style="flex:1;color:#7fb2ff;letter-spacing:.08em;">レイヤー</span>
+        <button id="layer-add" class="tool-btn icon-btn" title="追加">＋</button>
+        <button id="layer-del" class="tool-btn icon-btn" title="削除">－</button>
+        <button id="layer-up" class="tool-btn icon-btn" title="上へ">▲</button>
+        <button id="layer-down" class="tool-btn icon-btn" title="下へ">▼</button>
+      </div>
+      <div id="layer-list"></div>
+    </section>
   </div>
   <input type="file" id="texture-file-input" accept="image/*" style="display: none;">
   <input type="file" id="preset-file-input" accept=".zip" style="display: none;">
   <input type="file" id="pmx-file-input" accept=".pmx" style="display: none;">
-
-  <!-- レイヤーパネル（右下） -->
-  <div id="layer-panel" style="position: fixed; right: 10px; bottom: 10px; width: 220px; background: rgba(0,0,0,0.85); border: 1px solid #444; border-radius: 5px; font-family: monospace; font-size: 11px; color: #ccc; z-index: 1000;">
-    <div style="display: flex; align-items: center; gap: 4px; padding: 6px 8px; border-bottom: 1px solid #444;">
-      <span style="flex: 1;">レイヤー</span>
-      <button id="layer-add" class="tool-btn" style="width: 24px; padding: 2px 0;" title="追加">＋</button>
-      <button id="layer-del" class="tool-btn" style="width: 24px; padding: 2px 0;" title="削除">－</button>
-      <button id="layer-up" class="tool-btn" style="width: 24px; padding: 2px 0;" title="上へ">▲</button>
-      <button id="layer-down" class="tool-btn" style="width: 24px; padding: 2px 0;" title="下へ">▼</button>
-    </div>
-    <div id="layer-list" style="max-height: 240px; overflow-y: auto;"></div>
-  </div>
 
   <canvas id="canvas"></canvas>
   <!-- 選択範囲オーバーレイ（点線枠をスクリーン座標で描画） -->

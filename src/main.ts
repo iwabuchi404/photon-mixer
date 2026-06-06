@@ -21,6 +21,8 @@ import { createEngineCtx, type EngineCtx } from './ui/engine-ctx.js';
 import type { Tool } from './ui/tool-config.js';
 import './ui/components/tool-bar.js'; // customElements.define('pm-tool-bar') を実行（副作用 import・必須）
 import type { ToolBar } from './ui/components/tool-bar.js';
+import { TOOLS, PARAM_DEFS, getToolDef, type ParamKey } from './ui/tool-config.js';
+import { ToolSettingsStore } from './ui/tool-settings.js';
 import type { LinearColor } from './color/types.js';
 import type { StrokePoint } from './pen/stroke.js';
 import type { BrushConfig } from './render/brush.js';
@@ -89,6 +91,25 @@ interface AppState {
   selectMode: 'rect' | 'lasso' | 'wand'; // 選択ツールのモード
 }
 
+/** パラメータ → 対応するDOMコントロールのID（値の保存/復元に使う） */
+const PARAM_CONTROLS: Record<ParamKey, { id: string; num?: string; val?: string }> = {
+  size:         { id: 'brush-size', num: 'brush-size-num' },
+  opacity:      { id: 'brush-alpha', val: 'brush-alpha-val' },
+  wet:          { id: 'brush-wet', val: 'brush-wet-val' },
+  stabilize:    { id: 'brush-stabilize', val: 'brush-stabilize-val' },
+  curve:        { id: 'pressure-curve' },
+  mixMode:      { id: 'mix-mode' },
+  textureScale: { id: 'texture-scale', val: 'texture-scale-val' },
+  tolerance:    { id: 'bucket-tolerance', val: 'bucket-tolerance-val' },
+};
+
+/** パラメータを持たないツール向けの操作ヒント */
+const TOOL_HINTS: Partial<Record<Tool, string>> = {
+  spoit: 'クリックした位置の色を抽出します。',
+  move: 'ドラッグでレイヤー（選択範囲があればその内側）を移動します。',
+  transform: 'ハンドルで拡大縮小・回転。Enter で確定 / Esc で取消。',
+};
+
 class PhotonMixerApp {
   private renderer: Awaited<ReturnType<typeof initRenderer>> | null = null;
   private penInput: PenInputManager | null = null;
@@ -104,6 +125,8 @@ class PhotonMixerApp {
   private engineCtx!: EngineCtx;
   // 左の縦ツールバー（Lit コンポーネント）
   private toolBar: ToolBar | null = null;
+  // ツールごとのパラメータ個別状態（setupControls で生成）
+  private toolSettings!: ToolSettingsStore;
   private state: AppState = {
     isDrawing: false,
     currentColor: { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
@@ -1161,9 +1184,15 @@ class PhotonMixerApp {
       this.cancelTransformUI();
     }
 
+    // 離脱するツールの現在値を保存（個別状態の保持）
+    this.saveToolSettings(prev);
+
     this.state.currentTool = tool;
     this.applyToolCursor();
     this.toolBar?.setActive(tool);
+    // ヘッダー・表示パラメータを更新し、ツールの保存値を復元してエンジンへ反映
+    this.refreshToolOptions(tool);
+    this.restoreToolSettings(tool);
     // 選択ツール時のみ全選択/解除・モード切替コントロールを表示
     const selCtrl = document.getElementById('select-controls');
     if (selCtrl) selCtrl.style.display = tool === 'select' ? '' : 'none';
@@ -1185,6 +1214,60 @@ class PhotonMixerApp {
         this.renderPipeline?.updateTransform(this.buildInvMatrix());
         this.drawTransformOverlay();
       });
+    }
+  }
+
+  /** 現在のツールの各パラメータをコントロールから読み取りストアへ保存 */
+  private saveToolSettings(tool: Tool): void {
+    for (const key of getToolDef(tool).params) {
+      const el = document.getElementById(PARAM_CONTROLS[key].id) as HTMLInputElement | HTMLSelectElement | null;
+      if (el) this.toolSettings.set(tool, key, el.value);
+    }
+  }
+
+  /** ストアの値をコントロールへ復元し、エンジンへ反映（apply）する */
+  private restoreToolSettings(tool: Tool): void {
+    for (const key of getToolDef(tool).params) {
+      const v = this.toolSettings.get(tool, key);
+      if (v === undefined) continue;
+      const ctrl = PARAM_CONTROLS[key];
+      const el = document.getElementById(ctrl.id) as HTMLInputElement | HTMLSelectElement | null;
+      if (el) el.value = String(v);
+      if (ctrl.num) {
+        const n = document.getElementById(ctrl.num) as HTMLInputElement | null;
+        if (n) n.value = String(v);
+      }
+      if (ctrl.val) {
+        const s = document.getElementById(ctrl.val);
+        if (s) s.textContent = String(v);
+      }
+      const def = PARAM_DEFS[key];
+      const applyValue = def.kind === 'range' ? Number(v) : String(v);
+      (def.apply as (val: number | string, e: EngineCtx) => void)(applyValue, this.engineCtx);
+    }
+  }
+
+  /** ツールに応じてヘッダー・表示パラメータ・ヒント・テクスチャ操作を更新 */
+  private refreshToolOptions(tool: Tool): void {
+    const def = getToolDef(tool);
+    const icon = document.getElementById('tool-header-icon');
+    const name = document.getElementById('tool-header-name');
+    if (icon) icon.textContent = def.icon;
+    if (name) name.textContent = def.label;
+    // 関係するパラメータ行のみ表示
+    const params = new Set<string>(def.params);
+    document.querySelectorAll<HTMLElement>('#tool-panel [data-param]').forEach(row => {
+      row.style.display = params.has(row.dataset.param!) ? '' : 'none';
+    });
+    // テクスチャ操作はブラシのみ
+    const tex = document.getElementById('texture-controls');
+    if (tex) tex.style.display = tool === 'brush' ? '' : 'none';
+    // パラメータを持たないツールには操作ヒントを表示
+    const hint = document.getElementById('tool-hint');
+    if (hint) {
+      const text = TOOL_HINTS[tool];
+      hint.textContent = text ?? '';
+      hint.style.display = text ? '' : 'none';
     }
   }
 
@@ -1432,6 +1515,10 @@ class PhotonMixerApp {
       getPipeline: () => this.renderPipeline,
       state: this.state,
     });
+    // ツール個別状態（定義の既定値で初期化）
+    this.toolSettings = new ToolSettingsStore(TOOLS, PARAM_DEFS);
+    // 初期ツールのヘッダー・表示パラメータを反映
+    this.refreshToolOptions(this.state.currentTool);
 
     // 左の縦ツールバー（定義から自動生成）。クリックは onSelect 経由で setTool へ。
     this.toolBar = document.getElementById('tool-bar') as ToolBar | null;
