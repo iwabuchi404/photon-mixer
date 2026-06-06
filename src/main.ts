@@ -19,7 +19,8 @@ import { ColorPicker } from './ui/color-picker.js';
 import { buildMaskContour } from './selection/mask.js';
 import { createEngineCtx, type EngineCtx } from './ui/engine-ctx.js';
 import type { Tool } from './ui/tool-config.js';
-import { ToolBar } from './ui/components/tool-bar.js';
+import './ui/components/tool-bar.js'; // customElements.define('pm-tool-bar') を実行（副作用 import・必須）
+import type { ToolBar } from './ui/components/tool-bar.js';
 import type { LinearColor } from './color/types.js';
 import type { StrokePoint } from './pen/stroke.js';
 import type { BrushConfig } from './render/brush.js';
