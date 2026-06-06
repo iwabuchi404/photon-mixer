@@ -24,6 +24,7 @@ import type { ToolBar } from './ui/components/tool-bar.js';
 import { TOOLS, PARAM_DEFS, getToolDef, type ParamKey } from './ui/tool-config.js';
 import { ToolSettingsStore } from './ui/tool-settings.js';
 import { evToExposure, type TonemapId, type DisplayModeId } from './color/display.js';
+import type { FilterType, FilterParams } from './render/filter.js';
 import type { LinearColor } from './color/types.js';
 import type { StrokePoint } from './pen/stroke.js';
 import type { BrushConfig } from './render/brush.js';
@@ -128,6 +129,8 @@ class PhotonMixerApp {
   private toolBar: ToolBar | null = null;
   // ツールごとのパラメータ個別状態（setupControls で生成）
   private toolSettings!: ToolSettingsStore;
+  // フィルタープレビュー中の種別（null=非アクティブ）
+  private filterType: FilterType | null = null;
   private state: AppState = {
     isDrawing: false,
     currentColor: { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
@@ -1175,6 +1178,8 @@ class PhotonMixerApp {
 
   private setTool(tool: Tool): void {
     const prev = this.state.currentTool;
+    // フィルタープレビュー中にツールを変えたら破棄
+    if (this.filterType) this.cancelFilterUI();
     // move ツールから離脱時: キャンセル
     if (prev === 'move' && tool !== 'move') {
       if (this.isMoveActive) { this.renderPipeline?.cancelMove(); this.isMoveActive = false; this.moveOrigin = null; }
@@ -1272,6 +1277,58 @@ class PhotonMixerApp {
     }
   }
 
+  // ─────────────────────────────── フィルター ───────────────────────────────
+
+  /** フィルター開始（プレビュー）。種別に応じてパラメータ行を出し分ける */
+  private startFilterUI(type: FilterType): void {
+    if (!this.renderPipeline) return;
+    if (this.filterType) this.renderPipeline.cancelFilter(); // 既存プレビューを破棄
+    this.filterType = type;
+    const showGlow = type === 'glow';
+    (document.querySelector('[data-fparam="threshold"]') as HTMLElement | null)?.style.setProperty('display', showGlow ? '' : 'none');
+    (document.querySelector('[data-fparam="intensity"]') as HTMLElement | null)?.style.setProperty('display', showGlow ? '' : 'none');
+    const params = document.getElementById('filter-params');
+    if (params) params.style.display = '';
+    this.renderPipeline.beginFilter().then(ok => {
+      if (ok && this.filterType) this.applyFilterPreview();
+    });
+  }
+
+  private currentFilterParams(): FilterParams {
+    return {
+      radius: parseFloat((document.getElementById('filter-radius') as HTMLInputElement).value),
+      threshold: parseFloat((document.getElementById('filter-threshold') as HTMLInputElement).value),
+      intensity: parseFloat((document.getElementById('filter-intensity') as HTMLInputElement).value),
+    };
+  }
+
+  private applyFilterPreview(): void {
+    if (!this.filterType) return;
+    this.renderPipeline?.updateFilter(this.filterType, this.currentFilterParams());
+  }
+
+  /** 確定: フィルター結果を Undo に積んで状態をクリア */
+  private async commitFilterUI(): Promise<void> {
+    if (!this.filterType || !this.renderPipeline) return;
+    // 適用後の committed を記録（undo/redo 双方で正しく再現できる）
+    const snap = await this.renderPipeline.requestCommittedSnapshot();
+    this.activeHistory().addRecord({ kind: 'fill', snapshot: snap.data, bytesPerRow: snap.bytesPerRow });
+    this.renderPipeline.commitFilter();
+    this.endFilterUI();
+  }
+
+  private cancelFilterUI(): void {
+    if (!this.filterType) return;
+    this.renderPipeline?.cancelFilter();
+    this.endFilterUI();
+  }
+
+  private endFilterUI(): void {
+    this.filterType = null;
+    const params = document.getElementById('filter-params');
+    if (params) params.style.display = 'none';
+  }
+
   private async handleSpoit(x: number, y: number): Promise<void> {
     if (!this.renderPipeline) return;
     const snap = await this.renderPipeline.requestCommittedSnapshot();
@@ -1291,8 +1348,8 @@ class PhotonMixerApp {
 
     const colorPicker = document.getElementById('brush-color') as HTMLInputElement;
     if (colorPicker) colorPicker.value = hex;
-    // HSV ピッカーも同期（スポイト/プリセット適用時）
-    this.colorPicker?.setRgb({ r: srgb.r, g: srgb.g, b: srgb.b });
+    // HSV ピッカーも同期（HDR対応＝色度とEVに分解。スポイト/プリセット適用時）
+    this.colorPicker?.setLinear(color);
     this.renderPipeline?.updateBrushConfig({ color });
   }
 
@@ -1580,12 +1637,13 @@ class PhotonMixerApp {
 
     // HSV カラーピッカー（input type=color は隠し互換用として残す）
     const pickerContainer = document.getElementById('color-picker')!;
-    this.colorPicker = new ColorPicker(pickerContainer, (rgb) => {
-      // rgb は sRGB。リニアに変換して currentColor を更新（α は維持）
-      this.state.currentColor.r = srgbToLinear(rgb.r);
-      this.state.currentColor.g = srgbToLinear(rgb.g);
-      this.state.currentColor.b = srgbToLinear(rgb.b);
-      const hex = '#' + [rgb.r, rgb.g, rgb.b].map(v => Math.max(0, Math.min(255, Math.round(v * 255))).toString(16).padStart(2, '0')).join('');
+    this.colorPicker = new ColorPicker(pickerContainer, (linear) => {
+      // linear は HDR 可（EV込み）。RGB だけ更新し α（不透明度）は維持する
+      this.state.currentColor.r = linear.r;
+      this.state.currentColor.g = linear.g;
+      this.state.currentColor.b = linear.b;
+      const srgb = linearColorToSrgb(linear); // 互換用の隠し input（クランプ済み）
+      const hex = '#' + [srgb.r, srgb.g, srgb.b].map(v => Math.max(0, Math.min(255, Math.round(v * 255))).toString(16).padStart(2, '0')).join('');
       colorPicker.value = hex;
       this.renderPipeline?.updateBrushConfig({ color: { ...this.state.currentColor } });
     });
@@ -1651,6 +1709,20 @@ class PhotonMixerApp {
     curveSel?.addEventListener('change', () => {
       this.engineCtx.setPressureCurve(curveSel.value as any);
     });
+
+    // フィルター（ぼかし / グロー）
+    document.getElementById('filter-blur')?.addEventListener('click', () => this.startFilterUI('blur'));
+    document.getElementById('filter-glow')?.addEventListener('click', () => this.startFilterUI('glow'));
+    for (const id of ['filter-radius', 'filter-threshold', 'filter-intensity']) {
+      const el = document.getElementById(id) as HTMLInputElement | null;
+      el?.addEventListener('input', () => {
+        const valEl = document.getElementById(`${id}-val`);
+        if (valEl) valEl.textContent = id === 'filter-radius' ? el.value : parseFloat(el.value).toFixed(1);
+        this.applyFilterPreview();
+      });
+    }
+    document.getElementById('filter-apply')?.addEventListener('click', () => this.commitFilterUI());
+    document.getElementById('filter-cancel')?.addEventListener('click', () => this.cancelFilterUI());
 
     // 表示（光）コントロール：露出 / トーンマップ / 表示モード
     const viewExp = document.getElementById('view-exposure') as HTMLInputElement;

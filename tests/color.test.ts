@@ -84,6 +84,29 @@ describe('リニア ⇔ Oklab', () => {
   });
 });
 
+describe('HDR (>1.0) の取り扱い', () => {
+  test('HDR値が Oklab 往復で保たれる', () => {
+    const hdrs = [
+      { r: 4, g: 2, b: 1, a: 1 },
+      { r: 16, g: 8, b: 0.5, a: 1 },
+      { r: 1.0, g: 3.5, b: 2.2, a: 0.7 },
+    ];
+    for (const c of hdrs) {
+      const back = oklabToLinear(linearToOklab(c));
+      assert.ok(approx(back.r, c.r, 1e-3) && approx(back.g, c.g, 1e-3) && approx(back.b, c.b, 1e-3),
+        `${JSON.stringify(c)} -> ${JSON.stringify(back)}`);
+    }
+  });
+
+  test('HDR色どうしの Oklab 混色が有限・非負', () => {
+    const a = linearToOklab({ r: 4, g: 1, b: 0.2, a: 1 });
+    const b = linearToOklab({ r: 0.5, g: 2, b: 6, a: 1 });
+    const mid = oklabToLinear(mixOklab(a, b, 0.5));
+    assert.ok([mid.r, mid.g, mid.b].every(v => Number.isFinite(v) && v >= -1e-6),
+      `mid=${JSON.stringify(mid)}`);
+  });
+});
+
 describe('mixOklab（Oklab線形補間）', () => {
   const A = { L: 0.2, a: 0.1, b: -0.1, alpha: 0.4 };
   const B = { L: 0.8, a: -0.2, b: 0.3, alpha: 1.0 };

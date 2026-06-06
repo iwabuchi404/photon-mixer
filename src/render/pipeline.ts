@@ -13,6 +13,7 @@ import { CompositeRenderer } from './composite.js';
 import { DownsampleRenderer } from './downsample.js';
 import { BlendRenderer, type BlendMode } from './blend-renderer.js';
 import { TransformRenderer } from './transform.js';
+import { FilterRenderer, type FilterType, type FilterParams } from './filter.js';
 import { rasterizePolygon, floodFillMask, maskBounds, invertMask } from '../selection/mask.js';
 import { linearToDisplaySrgb, TONEMAP_IDS, DISPLAY_MODE_IDS, type TonemapId, type DisplayModeId } from '../color/display.js';
 
@@ -40,6 +41,7 @@ export class RenderPipeline {
   private downsampleRenderer: DownsampleRenderer;
   private blendRenderer: BlendRenderer;
   private transformRenderer: TransformRenderer;
+  private filterRenderer: FilterRenderer;
 
   private brushTexture4x!: GPUTexture;
   private isolatedTexture!: GPUTexture;
@@ -71,6 +73,7 @@ export class RenderPipeline {
     this.downsampleRenderer = new DownsampleRenderer(renderer.device);
     this.blendRenderer = new BlendRenderer(renderer.device);
     this.transformRenderer = new TransformRenderer(renderer.device);
+    this.filterRenderer = new FilterRenderer(renderer.device);
   }
 
   // アクティブレイヤーの committed テクスチャ（既存の描画系メソッドが参照する）
@@ -85,6 +88,7 @@ export class RenderPipeline {
     await this.downsampleRenderer.init();
     await this.blendRenderer.init(BUFFER_FORMAT);
     await this.transformRenderer.init(BUFFER_FORMAT);
+    await this.filterRenderer.init(canvas.width, canvas.height);
     this.createTextures(canvas.width, canvas.height);
     this.updateViewport(1.0, 0, 0, 0);
   }
@@ -496,6 +500,55 @@ export class RenderPipeline {
     this.txBounds = null;
   }
 
+  // --- フィルター（破壊的適用＋Undo・選択範囲対応）---
+  private filterActive = false;
+  private filterSnapshot: Uint16Array | null = null; // Undo 用（aligned）
+  private filterSrc: GPUTexture | null = null;        // 原本コピー（入力）
+
+  isFilterActive(): boolean { return this.filterActive; }
+
+  /** フィルター開始: committed のスナップショット(Undo)と原本コピーを用意 */
+  async beginFilter(): Promise<boolean> {
+    if (this.filterActive) return false;
+    const snap = await this.requestCommittedSnapshot();
+    this.filterSnapshot = snap.data.slice(0);
+    this.filterSrc?.destroy();
+    this.filterSrc = this.renderer.device.createTexture({
+      size: [this.canvasWidth, this.canvasHeight], format: BUFFER_FORMAT,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    const enc = this.renderer.device.createCommandEncoder();
+    enc.copyTextureToTexture({ texture: this.committedTexture }, { texture: this.filterSrc }, [this.canvasWidth, this.canvasHeight]);
+    this.renderer.device.queue.submit([enc.finish()]);
+    this.filterActive = true;
+    return true;
+  }
+
+  /** プレビュー更新: 原本にフィルターを適用し committed に書く（選択範囲があればその内側のみ） */
+  updateFilter(type: FilterType, params: FilterParams): void {
+    if (!this.filterActive || !this.filterSrc) return;
+    this.filterRenderer.apply(type, params, this.filterSrc, this.selectionMask, this.committedTexture);
+  }
+
+  /** 確定: プレビュー結果を committed に残したまま状態をクリア（Undo 記録は呼び出し側） */
+  commitFilter(): void {
+    this._clearFilterState();
+  }
+
+  /** キャンセル: committed を元へ戻す */
+  cancelFilter(): void {
+    if (!this.filterActive || !this.filterSnapshot) return;
+    this.updateCommittedTexture(this.filterSnapshot);
+    this._clearFilterState();
+  }
+
+  private _clearFilterState(): void {
+    this.filterActive = false;
+    this.filterSnapshot = null;
+    this.filterSrc?.destroy();
+    this.filterSrc = null;
+  }
+
   // --- 移動ツール ---
   private moveActive = false;
   // 移動前スナップショット（Undo 用）aligned Uint16Array
@@ -800,14 +853,16 @@ export class RenderPipeline {
   }
 
   resizeCanvasSize(w: number, h: number) {
-    // リサイズ前に変形・移動操作があればキャンセル
+    // リサイズ前に変形・移動・フィルター操作があればキャンセル
     if (this.txActive) this.cancelTransform();
     if (this.moveActive) this.cancelMove();
+    if (this.filterActive) this.cancelFilter();
     this.brushRenderer.resize(w * 4, h * 4);
     this.brushTexture4x.destroy();
     this.isolatedTexture.destroy();
     this.displayA.destroy(); this.displayB.destroy(); this.activeComposite.destroy();
     this.createTextures(w, h);
+    this.filterRenderer.resize(w, h);
   }
 
   resizeScreenSize(w: number, h: number) {
@@ -882,7 +937,9 @@ export class RenderPipeline {
   dispose() {
     this.brushRenderer.dispose();
     this.transformRenderer.dispose();
+    this.filterRenderer.dispose();
     this._clearTransformState();
+    this._clearFilterState();
     this.brushTexture4x?.destroy();
     this.isolatedTexture?.destroy();
     this.displayA?.destroy(); this.displayB?.destroy(); this.activeComposite?.destroy();

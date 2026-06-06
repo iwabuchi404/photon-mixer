@@ -422,6 +422,36 @@
       </div>
     </section>
 
+    <!-- フィルター（破壊的適用＋Undo・選択範囲対応） -->
+    <section class="panel" id="filter-panel">
+      <div class="panel-title">フィルター</div>
+      <div class="ctrl-row" id="filter-start-row">
+        <button id="filter-blur" class="tool-btn" style="flex:1;">ぼかし</button>
+        <button id="filter-glow" class="tool-btn" style="flex:1;">グロー</button>
+      </div>
+      <div id="filter-params" style="display:none;">
+        <div class="ctrl-row" data-fparam="radius">
+          <span class="ctrl-label">半径</span>
+          <input type="range" id="filter-radius" min="0" max="64" step="1" value="8">
+          <span id="filter-radius-val" class="ctrl-val">8</span><span class="ctrl-unit">px</span>
+        </div>
+        <div class="ctrl-row" data-fparam="threshold">
+          <span class="ctrl-label">しきい値</span>
+          <input type="range" id="filter-threshold" min="0" max="4" step="0.05" value="1">
+          <span id="filter-threshold-val" class="ctrl-val">1.0</span>
+        </div>
+        <div class="ctrl-row" data-fparam="intensity">
+          <span class="ctrl-label">強度</span>
+          <input type="range" id="filter-intensity" min="0" max="4" step="0.05" value="1">
+          <span id="filter-intensity-val" class="ctrl-val">1.0</span>
+        </div>
+        <div class="ctrl-row">
+          <button id="filter-apply" class="tool-btn" style="flex:1;">適用</button>
+          <button id="filter-cancel" class="tool-btn" style="flex:1;">取消</button>
+        </div>
+      </div>
+    </section>
+
     <!-- ファイル・設定 -->
     <section class="panel" id="doc-panel">
       <div class="panel-title">ファイル</div>

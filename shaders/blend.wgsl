@@ -44,7 +44,7 @@ fn blend_fn(mode: u32, cb: vec3f, cs: vec3f) -> vec3f {
     case 3u: {                                         // overlay = hardlight(cs,cb)
       return select(1.0 - 2.0 * (1.0 - cs) * (1.0 - cb), 2.0 * cs * cb, cb <= vec3f(0.5));
     }
-    case 4u: { return min(cs + cb, vec3f(1.0)); }      // add (linear dodge)
+    case 4u: { return cs + cb; }                       // add (linear dodge) — HDRに蓄積（表示時にトーンマップ）
     default: { return cs; }                            // normal
   }
 }
