@@ -611,60 +611,96 @@ describe('ペン入力統合テスト', () => {
   describe('StrokeHistory', async () => {
     const { StrokeHistory } = await import('../src/pen/stroke.js');
 
-    test('ストロークを追加・取得できる', () => {
+    const strokeRecord = (x: number) => ({
+      kind: 'stroke' as const,
+      points: [{ x, y: x, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 0, size: 10 }],
+      erase: false,
+    });
+
+    test('操作レコードを追加・取得できる', () => {
       const history = new StrokeHistory();
+      const rec = strokeRecord(100);
 
-      const stroke = [
-        { x: 100, y: 100, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 0, size: 10 },
-        { x: 110, y: 110, pressure: 0.7, tiltX: 0, tiltY: 0, timestamp: 100, size: 12 }
-      ];
+      history.addRecord(rec);
 
-      history.addStroke(stroke);
-
-      const all = history.getAllStrokes();
+      const all = history.getAllRecords();
       assert.strictEqual(all.length, 1);
-      assert.deepStrictEqual(all[0], stroke);
+      assert.deepStrictEqual(all[0], rec);
     });
 
-    test('複数のストロークを管理できる', () => {
+    test('複数の操作レコードを管理できる', () => {
       const history = new StrokeHistory();
 
-      history.addStroke([{ x: 0, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 0, size: 10 }]);
-      history.addStroke([{ x: 10, y: 10, pressure: 0.6, tiltX: 0, tiltY: 0, timestamp: 100, size: 12 }]);
-      history.addStroke([{ x: 20, y: 20, pressure: 0.7, tiltX: 0, tiltY: 0, timestamp: 200, size: 14 }]);
+      history.addRecord(strokeRecord(0));
+      history.addRecord(strokeRecord(10));
+      history.addRecord(strokeRecord(20));
 
-      assert.strictEqual(history.getStrokeCount(), 3);
+      assert.strictEqual(history.getRecordCount(), 3);
     });
 
-    test('Undoで直前のストロークを削除できる', () => {
+    test('Undoで直前の操作を削除して返す', () => {
       const history = new StrokeHistory();
+      const rec1 = strokeRecord(0);
+      const rec2 = strokeRecord(10);
 
-      const stroke1 = [{ x: 0, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 0, size: 10 }];
-      const stroke2 = [{ x: 10, y: 10, pressure: 0.6, tiltX: 0, tiltY: 0, timestamp: 100, size: 12 }];
-
-      history.addStroke(stroke1);
-      history.addStroke(stroke2);
+      history.addRecord(rec1);
+      history.addRecord(rec2);
 
       const undone = history.undo();
-      assert.deepStrictEqual(undone, stroke2);
-      assert.strictEqual(history.getStrokeCount(), 1);
+      assert.deepStrictEqual(undone, rec2);
+      assert.strictEqual(history.getRecordCount(), 1);
     });
 
     test('Undoがないときはnullを返す', () => {
       const history = new StrokeHistory();
-
-      const undone = history.undo();
-      assert.strictEqual(undone, null);
+      assert.strictEqual(history.undo(), null);
     });
 
-    test('クリアですべてのストロークを削除できる', () => {
+    test('RedoでUndoした操作をやり直せる', () => {
       const history = new StrokeHistory();
+      const rec = strokeRecord(5);
 
-      history.addStroke([{ x: 0, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 0, size: 10 }]);
-      history.addStroke([{ x: 10, y: 10, pressure: 0.6, tiltX: 0, tiltY: 0, timestamp: 100, size: 12 }]);
+      history.addRecord(rec);
+      history.undo();
+      assert.strictEqual(history.getRecordCount(), 0);
+
+      const redone = history.redo();
+      assert.deepStrictEqual(redone, rec);
+      assert.strictEqual(history.getRecordCount(), 1);
+    });
+
+    test('新しい操作でRedoスタックがクリアされる', () => {
+      const history = new StrokeHistory();
+      history.addRecord(strokeRecord(0));
+      history.undo();
+      // Undo 後に新規操作 → Redo は無効化される
+      history.addRecord(strokeRecord(1));
+      assert.strictEqual(history.redo(), null);
+    });
+
+    test('fill レコード（スナップショット）も保持できる', () => {
+      const history = new StrokeHistory();
+      const snapshot = new Uint16Array([1, 2, 3, 4]);
+      history.addRecord({ kind: 'fill', snapshot, bytesPerRow: 256 });
+
+      const all = history.getAllRecords();
+      assert.strictEqual(all.length, 1);
+      assert.strictEqual(all[0].kind, 'fill');
+    });
+
+    test('maxUndo(50)を超えると古いレコードが捨てられる', () => {
+      const history = new StrokeHistory();
+      for (let i = 0; i < 60; i++) history.addRecord(strokeRecord(i));
+      assert.strictEqual(history.getRecordCount(), 50, '最大50件に制限される');
+    });
+
+    test('クリアですべての操作を削除できる', () => {
+      const history = new StrokeHistory();
+      history.addRecord(strokeRecord(0));
+      history.addRecord(strokeRecord(10));
 
       history.clear();
-      assert.strictEqual(history.getStrokeCount(), 0);
+      assert.strictEqual(history.getRecordCount(), 0);
     });
   });
 

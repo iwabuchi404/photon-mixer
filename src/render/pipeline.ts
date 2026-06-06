@@ -13,6 +13,7 @@ import { CompositeRenderer } from './composite.js';
 import { DownsampleRenderer } from './downsample.js';
 import { BlendRenderer, type BlendMode } from './blend-renderer.js';
 import { TransformRenderer } from './transform.js';
+import { rasterizePolygon, floodFillMask, maskBounds, invertMask } from '../selection/mask.js';
 
 const BUFFER_FORMAT: GPUTextureFormat = 'rgba16float';
 
@@ -286,20 +287,8 @@ export class RenderPipeline {
    */
   private applySelectionMask(data: Uint8Array): void {
     const w = this.canvasWidth, h = this.canvasHeight;
-    let lx = w, ty = h, rx = 0, by = 0, any = false;
-    for (let y = 0; y < h; y++) {
-      const row = y * w;
-      for (let x = 0; x < w; x++) {
-        if (data[row + x] !== 0) {
-          any = true;
-          if (x < lx) lx = x;
-          if (x + 1 > rx) rx = x + 1;
-          if (y < ty) ty = y;
-          if (y + 1 > by) by = y + 1;
-        }
-      }
-    }
-    if (!any) { this.clearSelection(); return; }
+    const bounds = maskBounds(data, w, h);
+    if (!bounds) { this.clearSelection(); return; }
 
     if (!this.selectionMask) {
       this.selectionMask = this.renderer.device.createTexture({
@@ -317,7 +306,7 @@ export class RenderPipeline {
     );
     this.brushRenderer.setSelectionTexture(this.selectionMask);
     this.selectionMaskData = data;
-    this.selectionBounds = { lx, ty, rx, by };
+    this.selectionBounds = bounds;
   }
 
   /** 矩形選択（キャンバス座標） */
@@ -335,31 +324,7 @@ export class RenderPipeline {
 
   /** 投げ縄選択（キャンバス座標の多角形）。even-odd 走査線でラスタライズ */
   setLassoSelection(points: { x: number; y: number }[]): void {
-    const w = this.canvasWidth, h = this.canvasHeight;
-    if (points.length < 3) { this.clearSelection(); return; }
-    const data = new Uint8Array(w * h);
-    let minY = h, maxY = 0;
-    for (const p of points) { if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y; }
-    const y0 = Math.max(0, Math.floor(minY)), y1 = Math.min(h - 1, Math.ceil(maxY));
-    const n = points.length;
-    const xs: number[] = [];
-    for (let y = y0; y <= y1; y++) {
-      const yc = y + 0.5;
-      xs.length = 0;
-      for (let i = 0, j = n - 1; i < n; j = i++) {
-        const pi = points[i], pj = points[j];
-        if ((pi.y <= yc && pj.y > yc) || (pj.y <= yc && pi.y > yc)) {
-          xs.push(pi.x + (yc - pi.y) / (pj.y - pi.y) * (pj.x - pi.x));
-        }
-      }
-      xs.sort((a, b) => a - b);
-      for (let k = 0; k + 1 < xs.length; k += 2) {
-        const xa = Math.max(0, Math.round(xs[k]));
-        const xb = Math.min(w, Math.round(xs[k + 1]));
-        if (xb > xa) data.fill(255, y * w + xa, y * w + xb);
-      }
-    }
-    this.applySelectionMask(data);
+    this.applySelectionMask(rasterizePolygon(points, this.canvasWidth, this.canvasHeight));
   }
 
   /** 自動選択（committed の連結同色領域）。tolerance: 0..1（straight color 差） */
@@ -369,7 +334,8 @@ export class RenderPipeline {
     if (ix < 0 || ix >= w || iy < 0 || iy >= h) return;
     const snap = await this.requestCommittedSnapshot();
     const u16pr = snap.bytesPerRow / 2;
-    const straight = (px: number, py: number) => {
+    // committed はプリマルチプライド float16。straight 色に戻してサンプリングする
+    const sample = (px: number, py: number) => {
       const idx = py * u16pr + px * 4;
       const a = float16ToFloat32(snap.data[idx + 3]);
       const inv = a > 0.0001 ? 1 / a : 0;
@@ -380,37 +346,12 @@ export class RenderPipeline {
         a,
       };
     };
-    const ref = straight(ix, iy);
-    const same = (px: number, py: number) => {
-      const c = straight(px, py);
-      return Math.abs(c.r - ref.r) <= tolerance && Math.abs(c.g - ref.g) <= tolerance
-        && Math.abs(c.b - ref.b) <= tolerance && Math.abs(c.a - ref.a) <= tolerance;
-    };
-    const data = new Uint8Array(w * h);
-    const stack: [number, number][] = [[ix, iy]];
-    while (stack.length > 0) {
-      const [cx, cy] = stack.pop()!;
-      if (data[cy * w + cx] !== 0) continue;
-      let lx = cx;
-      while (lx > 0 && data[cy * w + (lx - 1)] === 0 && same(lx - 1, cy)) lx--;
-      let rx = cx;
-      while (rx < w - 1 && data[cy * w + (rx + 1)] === 0 && same(rx + 1, cy)) rx++;
-      for (let i = lx; i <= rx; i++) {
-        data[cy * w + i] = 255;
-        if (cy > 0 && data[(cy - 1) * w + i] === 0 && same(i, cy - 1)) stack.push([i, cy - 1]);
-        if (cy < h - 1 && data[(cy + 1) * w + i] === 0 && same(i, cy + 1)) stack.push([i, cy + 1]);
-      }
-    }
-    this.applySelectionMask(data);
+    this.applySelectionMask(floodFillMask(w, h, ix, iy, sample, tolerance));
   }
 
   /** 選択範囲を反転（未選択なら全選択になる） */
   invertSelection(): void {
-    const w = this.canvasWidth, h = this.canvasHeight;
-    const cur = this.selectionMaskData;
-    const data = new Uint8Array(w * h);
-    for (let i = 0; i < data.length; i++) data[i] = (cur && cur[i]) ? 0 : 255;
-    this.applySelectionMask(data);
+    this.applySelectionMask(invertMask(this.selectionMaskData, this.canvasWidth, this.canvasHeight));
   }
 
   clearSelection(): void {

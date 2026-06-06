@@ -12,7 +12,9 @@
       "PowerShell(& \"node_modules/electron/dist/electron.exe\" --version 2>&1 | Select-Object -First 5; \"EXIT: $LASTEXITCODE\")",
       "PowerShell(npx tsc --noEmit 2>&1 | Select-Object -First 30; \"EXIT: $LASTEXITCODE\")",
       "PowerShell(npm run build 2>&1 | Select-Object -Last 6; \"EXIT: $LASTEXITCODE\")",
-      "PowerShell(npm test 2>&1 | Select-Object -Last 20; \"EXIT: $LASTEXITCODE\")"
+      "PowerShell(npm test 2>&1 | Select-Object -Last 20; \"EXIT: $LASTEXITCODE\")",
+      "PowerShell(npm test 2>&1 | Select-Object -Last 35; \"EXIT: $LASTEXITCODE\")",
+      "PowerShell(npm test 2>&1 | Select-String -Pattern \"^# \\(tests|pass|fail|suites|todo|skipped\\)|duration_ms|failing tests\" | Select-Object -First 20; \"EXIT: $LASTEXITCODE\")"
     ]
   }
 }

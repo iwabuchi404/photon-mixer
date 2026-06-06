@@ -16,6 +16,7 @@ import { BrushPresetManager } from './brush-preset.js';
 import { savePmx, loadPmx } from './pmx.js';
 import { saveAutosave, loadAutosave } from './autosave.js';
 import { ColorPicker } from './ui/color-picker.js';
+import { buildMaskContour } from './selection/mask.js';
 import type { LinearColor } from './color/types.js';
 import type { StrokePoint } from './pen/stroke.js';
 import type { BrushConfig } from './render/brush.js';
@@ -70,26 +71,6 @@ function sampleSnapshot(
   };
 }
 
-/**
- * coverage マスク（tight w*h, 0/非0）の境界線分を抽出する。
- * 選択ピクセルと未選択ピクセルの境界（穴の縁を含む）を、ピクセル角の単位線分
- * [x0,y0,x1,y1, ...]（キャンバス座標）で返す。投げ縄/自動選択の任意形状に対応。
- */
-function buildMaskContour(data: Uint8Array, w: number, h: number): number[] {
-  const seg: number[] = [];
-  const sel = (x: number, y: number): boolean =>
-    x >= 0 && x < w && y >= 0 && y < h && data[y * w + x] !== 0;
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      if (!sel(x, y)) continue;
-      if (!sel(x - 1, y)) seg.push(x, y, x, y + 1);             // 左辺
-      if (!sel(x + 1, y)) seg.push(x + 1, y, x + 1, y + 1);     // 右辺
-      if (!sel(x, y - 1)) seg.push(x, y, x + 1, y);             // 上辺
-      if (!sel(x, y + 1)) seg.push(x, y + 1, x + 1, y + 1);     // 下辺
-    }
-  }
-  return seg;
-}
 
 type Tool = 'brush' | 'eraser' | 'spoit' | 'bucket' | 'blur' | 'line' | 'select' | 'move' | 'transform';
 

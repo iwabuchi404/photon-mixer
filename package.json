@@ -8,8 +8,8 @@
     "build": "tsc && powershell -Command \"Copy-Item -Path shaders -Destination dist -Recurse -Force; Copy-Item -Path electron/preload.cjs -Destination dist/electron -Force\"",
     "dev": "tsc && powershell -Command \"Copy-Item -Path shaders -Destination dist -Recurse -Force; Copy-Item -Path electron/preload.cjs -Destination dist/electron -Force\" && electron .",
     "watch": "tsc --watch",
-    "test": "npx tsx tests/pen.test.ts",
-    "test:watch": "npx tsx --watch tests/pen.test.ts"
+    "test": "node --import tsx --test tests/*.test.ts",
+    "test:watch": "node --import tsx --test --watch tests/*.test.ts"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
