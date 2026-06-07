@@ -14,7 +14,14 @@ import { DownsampleRenderer } from './downsample.js';
 import { BlendRenderer, type BlendMode } from './blend-renderer.js';
 import { TransformRenderer } from './transform.js';
 import { FilterRenderer, type FilterType, type FilterParams } from './filter.js';
+import { buildCurveLut, type CurvePoint } from '../color/curve.js';
 import { rasterizePolygon, floodFillMask, maskBounds, invertMask } from '../selection/mask.js';
+
+/** 効果レイヤーの既定パラメータ */
+const DEFAULT_FILTER_PARAMS: FilterParams = {
+  radius: 8, threshold: 1, intensity: 1, ev: 0,
+  inLow: 0, inHigh: 1, gamma: 1, outLow: 0, outHigh: 1,
+};
 import { linearToDisplaySrgb, TONEMAP_IDS, DISPLAY_MODE_IDS, type TonemapId, type DisplayModeId } from '../color/display.js';
 
 const BUFFER_FORMAT: GPUTextureFormat = 'rgba16float';
@@ -26,10 +33,14 @@ export interface LayerInfo {
   opacity: number;
   blendMode: BlendMode;
   alphaLock: boolean;
+  kind: 'paint' | 'effect';        // effect=非破壊エフェクト（下の合成結果に適用）
+  filterType?: FilterType;         // kind==='effect' のみ
 }
 
 interface LayerTex extends LayerInfo {
-  committed: GPUTexture;
+  committed: GPUTexture;           // paint の描画先（effect でも確保しておく＝不変条件維持）
+  params?: FilterParams;           // effect のパラメータ
+  curvePoints?: CurvePoint[];      // effect(curve) の制御点
 }
 
 let layerIdCounter = 0;
@@ -154,6 +165,7 @@ export class RenderPipeline {
       opacity: 1.0,
       blendMode: 'normal',
       alphaLock: false,
+      kind: 'paint',
       committed: this.makeLayerTexture(),
     };
   }
@@ -252,8 +264,16 @@ export class RenderPipeline {
     for (let i = 0; i < this.layers.length; i++) {
       const layer = this.layers[i];
       if (!layer.visible || layer.opacity <= 0) continue;
-      const src = (i === this.activeIndex && activeSrc) ? activeSrc : layer.committed;
-      this.blendRenderer.blend(acc, src, other, layer.blendMode, layer.opacity);
+      if (layer.kind === 'effect' && layer.filterType && layer.params) {
+        // 非破壊エフェクト: 下の合成結果(acc)に適用して other へ（効果不透明度=opacity）
+        if (layer.filterType === 'curve' && layer.curvePoints) {
+          this.filterRenderer.setCurveLut(buildCurveLut(layer.curvePoints));
+        }
+        this.filterRenderer.apply(layer.filterType, layer.params, acc, null, other, layer.opacity);
+      } else {
+        const src = (i === this.activeIndex && activeSrc) ? activeSrc : layer.committed;
+        this.blendRenderer.blend(acc, src, other, layer.blendMode, layer.opacity);
+      }
       const tmp = acc; acc = other; other = tmp;
     }
     return acc;
@@ -276,12 +296,65 @@ export class RenderPipeline {
   // --- レイヤー操作 ---
 
   getLayers(): LayerInfo[] {
-    return this.layers.map(({ id, name, visible, opacity, blendMode, alphaLock }) => ({ id, name, visible, opacity, blendMode, alphaLock }));
+    return this.layers.map(({ id, name, visible, opacity, blendMode, alphaLock, kind, filterType }) =>
+      ({ id, name, visible, opacity, blendMode, alphaLock, kind, filterType }));
   }
 
   setLayerAlphaLock(id: string, locked: boolean): void {
     const l = this.layers.find(l => l.id === id);
     if (l) l.alphaLock = locked;
+  }
+
+  // --- 効果（非破壊エフェクト）レイヤー ---
+
+  private static readonly EFFECT_LABELS: Record<FilterType, string> = {
+    blur: 'ぼかし', glow: 'グロー', sharpen: 'シャープ', exposure: '露出', levels: 'レベル', curve: 'トーンカーブ',
+  };
+
+  /** 効果レイヤーを追加（アクティブの上に挿入して選択） */
+  addEffectLayer(type: FilterType): string {
+    const layer: LayerTex = {
+      id: `layer-${++layerIdCounter}`,
+      name: `効果: ${RenderPipeline.EFFECT_LABELS[type]}`,
+      visible: true,
+      opacity: 1.0,
+      blendMode: 'normal',
+      alphaLock: false,
+      kind: 'effect',
+      filterType: type,
+      params: { ...DEFAULT_FILTER_PARAMS },
+      curvePoints: type === 'curve' ? [{ x: 0, y: 0 }, { x: 1, y: 1 }] : undefined,
+      committed: this.makeLayerTexture(), // 不変条件維持のため確保（未使用）
+    };
+    this.layers.splice(this.activeIndex + 1, 0, layer);
+    this.activeIndex += 1;
+    return layer.id;
+  }
+
+  /** 効果レイヤーのパラメータを更新 */
+  setEffectParams(id: string, params: Partial<FilterParams>): void {
+    const l = this.layers.find(l => l.id === id);
+    if (l && l.kind === 'effect' && l.params) l.params = { ...l.params, ...params };
+  }
+
+  /** 効果(curve)レイヤーの制御点を更新 */
+  setEffectCurve(id: string, points: CurvePoint[]): void {
+    const l = this.layers.find(l => l.id === id);
+    if (l && l.kind === 'effect') l.curvePoints = points.map(p => ({ ...p }));
+  }
+
+  /** 効果レイヤーの情報取得（UIのパラメータ編集用） */
+  getEffect(id: string): { filterType: FilterType; params: FilterParams; curvePoints?: CurvePoint[] } | null {
+    const l = this.layers.find(l => l.id === id);
+    if (l && l.kind === 'effect' && l.filterType && l.params) {
+      return { filterType: l.filterType, params: l.params, curvePoints: l.curvePoints };
+    }
+    return null;
+  }
+
+  /** アクティブレイヤーが効果かどうか */
+  isActiveEffect(): boolean {
+    return this.layers[this.activeIndex]?.kind === 'effect';
   }
 
   // --- 選択範囲（任意形状マスク）---
@@ -739,6 +812,7 @@ export class RenderPipeline {
 
     const out: { info: LayerInfo; data: Uint16Array }[] = [];
     for (const layer of this.layers) {
+      if (layer.kind === 'effect') continue; // 効果レイヤーは現状 .pmx 非対応（次段で対応予定）
       const staging = device.createBuffer({ size: bytesPerRow * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
       const enc = device.createCommandEncoder();
       enc.copyTextureToBuffer({ texture: layer.committed }, { buffer: staging, bytesPerRow }, [w, h]);
@@ -752,7 +826,7 @@ export class RenderPipeline {
       }
       staging.unmap(); staging.destroy();
       out.push({
-        info: { id: layer.id, name: layer.name, visible: layer.visible, opacity: layer.opacity, blendMode: layer.blendMode, alphaLock: layer.alphaLock },
+        info: { id: layer.id, name: layer.name, visible: layer.visible, opacity: layer.opacity, blendMode: layer.blendMode, alphaLock: layer.alphaLock, kind: 'paint' },
         data: tight,
       });
     }
@@ -770,8 +844,8 @@ export class RenderPipeline {
     this.layers = layers.map(({ info, data }) => {
       const tex = this.makeLayerTexture();
       this.writeLayerTight(tex, data);
-      // 旧 .pmx には alphaLock が無いので既定 false
-      return { ...info, alphaLock: info.alphaLock ?? false, committed: tex };
+      // 旧 .pmx には alphaLock/kind が無いので既定で補完
+      return { ...info, alphaLock: info.alphaLock ?? false, kind: 'paint' as const, committed: tex };
     });
     if (this.layers.length === 0) this.layers = [this.createLayer('レイヤー 1')];
     const idx = this.layers.findIndex(l => l.id === activeId);

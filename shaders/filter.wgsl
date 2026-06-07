@@ -22,7 +22,7 @@ struct FilterU {
   gamma: f32,       // レベル: ガンマ
   out_low: f32,     // レベル: 出力黒
   out_high: f32,    // レベル: 出力白
-  _p0: f32,
+  strength: f32,    // 効果の不透明度（0..1, マスク合成時に乗算）
   _p1: f32,
 }
 
@@ -153,9 +153,9 @@ fn fs_curve(in: VOut) -> @location(0) vec4f {
 fn fs_mask_composite(in: VOut) -> @location(0) vec4f {
   let filtered = textureSampleLevel(tex0, samp, in.uv, 0.0);
   let original = textureSampleLevel(tex1, samp, in.uv, 0.0);
-  var m = 1.0;
+  var m = u.strength;
   if (u.use_mask > 0.5) {
-    m = textureSampleLevel(tex2, samp, in.uv, 0.0).r;
+    m = m * textureSampleLevel(tex2, samp, in.uv, 0.0).r;
   }
   return mix(original, filtered, m);
 }

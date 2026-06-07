@@ -130,8 +130,8 @@ class PhotonMixerApp {
   private toolBar: ToolBar | null = null;
   // ツールごとのパラメータ個別状態（setupControls で生成）
   private toolSettings!: ToolSettingsStore;
-  // フィルタープレビュー中の種別（null=非アクティブ）
-  private filterType: FilterType | null = null;
+  // 編集中の効果レイヤーID（null=効果を編集していない）
+  private editingEffectId: string | null = null;
   // トーンカーブエディタ
   private curveEditor: CurveEditor | null = null;
   private state: AppState = {
@@ -306,7 +306,9 @@ class PhotonMixerApp {
       row.addEventListener('click', () => {
         this.renderPipeline?.setActiveLayer(layer.id);
         this.rebuildLayerPanel();
+        this.refreshEffectEdit(); // 効果レイヤーなら編集パネル表示
       });
+      const isEffect = layer.kind === 'effect';
 
       // 1行目: 表示トグル + 名前
       const top = document.createElement('div');
@@ -334,7 +336,7 @@ class PhotonMixerApp {
       });
       top.appendChild(eye);
       top.appendChild(nameEl);
-      top.appendChild(lock);
+      if (!isEffect) top.appendChild(lock); // 効果レイヤーにアルファロックは無い
 
       // 2行目: 合成モード + 不透明度
       const ctl = document.createElement('div');
@@ -359,7 +361,7 @@ class PhotonMixerApp {
       op.addEventListener('input', () => {
         this.renderPipeline?.setLayerOpacity(layer.id, parseInt(op.value) / 100);
       });
-      ctl.appendChild(sel);
+      if (!isEffect) ctl.appendChild(sel); // 効果レイヤーは合成モード非対応（不透明度=効果の強さ）
       ctl.appendChild(op);
 
       row.appendChild(top);
@@ -492,6 +494,8 @@ class PhotonMixerApp {
 
   private handlePenInput(event: import('./pen/input.js').PenInputEvent): void {
     if (this.state.isPanning) return;
+    // 効果（非破壊）レイヤーが選択中はキャンバス操作を受け付けない（描画対象はペイントレイヤーのみ）
+    if (this.renderPipeline?.isActiveEffect()) return;
 
     const { type, point } = event;
 
@@ -1181,8 +1185,6 @@ class PhotonMixerApp {
 
   private setTool(tool: Tool): void {
     const prev = this.state.currentTool;
-    // フィルタープレビュー中にツールを変えたら破棄
-    if (this.filterType) this.cancelFilterUI();
     // move ツールから離脱時: キャンセル
     if (prev === 'move' && tool !== 'move') {
       if (this.isMoveActive) { this.renderPipeline?.cancelMove(); this.isMoveActive = false; this.moveOrigin = null; }
@@ -1292,24 +1294,13 @@ class PhotonMixerApp {
     curve: [],
   };
 
-  /** フィルター開始（プレビュー）。種別に応じてパラメータ行を出し分ける */
-  private startFilterUI(type: FilterType): void {
+  /** 効果（非破壊エフェクト）レイヤーを追加して編集対象にする */
+  private addEffect(type: FilterType): void {
     if (!this.renderPipeline) return;
-    if (this.filterType) this.renderPipeline.cancelFilter(); // 既存プレビューを破棄
-    this.filterType = type;
-    const visible = new Set(PhotonMixerApp.FILTER_PARAMS[type]);
-    document.querySelectorAll<HTMLElement>('#filter-params [data-fparam]').forEach(row => {
-      row.style.display = visible.has(row.dataset.fparam!) ? '' : 'none';
-    });
-    // トーンカーブエディタは curve のときだけ表示し、現在のLUTを反映
-    const curveEd = document.getElementById('filter-curve-editor');
-    if (curveEd) curveEd.style.display = type === 'curve' ? '' : 'none';
-    if (type === 'curve' && this.curveEditor) this.renderPipeline.setCurveLut(this.curveEditor.getLut());
-    const params = document.getElementById('filter-params');
-    if (params) params.style.display = '';
-    this.renderPipeline.beginFilter().then(ok => {
-      if (ok && this.filterType) this.applyFilterPreview();
-    });
+    const id = this.renderPipeline.addEffectLayer(type);
+    this.renderPipeline.setActiveLayer(id);
+    this.rebuildLayerPanel();
+    this.refreshEffectEdit();
   }
 
   private currentFilterParams(): FilterParams {
@@ -1327,31 +1318,50 @@ class PhotonMixerApp {
     };
   }
 
-  private applyFilterPreview(): void {
-    if (!this.filterType) return;
-    this.renderPipeline?.updateFilter(this.filterType, this.currentFilterParams());
+  /** スライダー/ラベルを効果のパラメータで埋める */
+  private setFilterControls(p: FilterParams): void {
+    const set = (id: string, v: number, dp: number) => {
+      const el = document.getElementById(id) as HTMLInputElement | null;
+      if (el) el.value = String(v);
+      const vl = document.getElementById(`${id}-val`);
+      if (vl) vl.textContent = v.toFixed(dp);
+    };
+    set('filter-radius', p.radius, 0);
+    set('filter-threshold', p.threshold, 1);
+    set('filter-intensity', p.intensity, 1);
+    set('filter-ev', p.ev, 1);
+    set('filter-inlow', p.inLow, 2);
+    set('filter-inhigh', p.inHigh, 2);
+    set('filter-gamma', p.gamma, 2);
+    set('filter-outlow', p.outLow, 2);
+    set('filter-outhigh', p.outHigh, 2);
   }
 
-  /** 確定: フィルター結果を Undo に積んで状態をクリア */
-  private async commitFilterUI(): Promise<void> {
-    if (!this.filterType || !this.renderPipeline) return;
-    // 適用後の committed を記録（undo/redo 双方で正しく再現できる）
-    const snap = await this.renderPipeline.requestCommittedSnapshot();
-    this.activeHistory().addRecord({ kind: 'fill', snapshot: snap.data, bytesPerRow: snap.bytesPerRow });
-    this.renderPipeline.commitFilter();
-    this.endFilterUI();
-  }
-
-  private cancelFilterUI(): void {
-    if (!this.filterType) return;
-    this.renderPipeline?.cancelFilter();
-    this.endFilterUI();
-  }
-
-  private endFilterUI(): void {
-    this.filterType = null;
+  /** アクティブレイヤーが効果なら編集パネルを表示、そうでなければ隠す */
+  private refreshEffectEdit(): void {
+    const id = this.renderPipeline?.getActiveLayerId();
+    const eff = id ? this.renderPipeline?.getEffect(id) : null;
     const params = document.getElementById('filter-params');
-    if (params) params.style.display = 'none';
+    if (!id || !eff) {
+      this.editingEffectId = null;
+      if (params) params.style.display = 'none';
+      return;
+    }
+    this.editingEffectId = id;
+    const visible = new Set(PhotonMixerApp.FILTER_PARAMS[eff.filterType]);
+    document.querySelectorAll<HTMLElement>('#filter-params [data-fparam]').forEach(row => {
+      row.style.display = visible.has(row.dataset.fparam!) ? '' : 'none';
+    });
+    this.setFilterControls(eff.params);
+    const curveEd = document.getElementById('filter-curve-editor');
+    if (curveEd) curveEd.style.display = eff.filterType === 'curve' ? '' : 'none';
+    if (eff.filterType === 'curve' && this.curveEditor) this.curveEditor.setPoints(eff.curvePoints ?? [{ x: 0, y: 0 }, { x: 1, y: 1 }]);
+    if (params) params.style.display = '';
+  }
+
+  /** 効果パラメータのスライダー変更を反映 */
+  private onEffectParamInput(): void {
+    if (this.editingEffectId) this.renderPipeline?.setEffectParams(this.editingEffectId, this.currentFilterParams());
   }
 
   private async handleSpoit(x: number, y: number): Promise<void> {
@@ -1703,12 +1713,14 @@ class PhotonMixerApp {
     document.getElementById('layer-add')?.addEventListener('click', () => {
       this.renderPipeline?.addLayer();
       this.rebuildLayerPanel();
+      this.refreshEffectEdit();
     });
     document.getElementById('layer-del')?.addEventListener('click', () => {
       const id = this.renderPipeline?.getActiveLayerId();
       this.renderPipeline?.removeActiveLayer();
       if (id) this.layerHistories.delete(id);
       this.rebuildLayerPanel();
+      this.refreshEffectEdit();
     });
     document.getElementById('layer-up')?.addEventListener('click', () => {
       this.renderPipeline?.moveActiveLayer('up');
@@ -1735,20 +1747,20 @@ class PhotonMixerApp {
       this.engineCtx.setPressureCurve(curveSel.value as any);
     });
 
-    // フィルター（ぼかし / グロー）
-    document.getElementById('filter-blur')?.addEventListener('click', () => this.startFilterUI('blur'));
-    document.getElementById('filter-glow')?.addEventListener('click', () => this.startFilterUI('glow'));
-    document.getElementById('filter-sharpen')?.addEventListener('click', () => this.startFilterUI('sharpen'));
-    document.getElementById('filter-exposure')?.addEventListener('click', () => this.startFilterUI('exposure'));
-    document.getElementById('filter-levels')?.addEventListener('click', () => this.startFilterUI('levels'));
-    document.getElementById('filter-curve')?.addEventListener('click', () => this.startFilterUI('curve'));
-    // トーンカーブエディタ（変更で LUT 更新＋プレビュー）
+    // 効果（非破壊エフェクト）を追加するボタン
+    document.getElementById('filter-blur')?.addEventListener('click', () => this.addEffect('blur'));
+    document.getElementById('filter-glow')?.addEventListener('click', () => this.addEffect('glow'));
+    document.getElementById('filter-sharpen')?.addEventListener('click', () => this.addEffect('sharpen'));
+    document.getElementById('filter-exposure')?.addEventListener('click', () => this.addEffect('exposure'));
+    document.getElementById('filter-levels')?.addEventListener('click', () => this.addEffect('levels'));
+    document.getElementById('filter-curve')?.addEventListener('click', () => this.addEffect('curve'));
+    // トーンカーブエディタ（変更で編集中の効果へ反映）
     const curveContainer = document.getElementById('filter-curve-editor');
     if (curveContainer) {
       this.curveEditor = new CurveEditor(curveContainer, () => {
-        if (!this.curveEditor) return;
-        this.renderPipeline?.setCurveLut(this.curveEditor.getLut());
-        if (this.filterType === 'curve') this.applyFilterPreview();
+        if (this.editingEffectId && this.curveEditor) {
+          this.renderPipeline?.setEffectCurve(this.editingEffectId, this.curveEditor.getPoints());
+        }
       });
     }
     // id → 値ラベルの小数桁
@@ -1761,11 +1773,9 @@ class PhotonMixerApp {
       el?.addEventListener('input', () => {
         const valEl = document.getElementById(`${id}-val`);
         if (valEl) valEl.textContent = parseFloat(el.value).toFixed(dp);
-        this.applyFilterPreview();
+        this.onEffectParamInput();
       });
     }
-    document.getElementById('filter-apply')?.addEventListener('click', () => this.commitFilterUI());
-    document.getElementById('filter-cancel')?.addEventListener('click', () => this.cancelFilterUI());
 
     // 表示（光）コントロール：露出 / トーンマップ / 表示モード
     const viewExp = document.getElementById('view-exposure') as HTMLInputElement;

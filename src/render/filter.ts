@@ -125,7 +125,7 @@ export class FilterRenderer {
   /** uniform を構築（WGSL FilterU と同順） */
   private uni(o: {
     dirX?: number; dirY?: number; radius?: number; threshold?: number; intensity?: number;
-    useMask?: number; ev?: number; levels?: FilterParams;
+    useMask?: number; ev?: number; levels?: FilterParams; strength?: number;
   }): number[] {
     const l = o.levels;
     return [
@@ -134,7 +134,7 @@ export class FilterRenderer {
       o.radius ?? 0, o.threshold ?? 0, o.intensity ?? 0, o.useMask ?? 0,
       o.ev ?? 0,
       l?.inLow ?? 0, l?.inHigh ?? 1, l?.gamma ?? 1, l?.outLow ?? 0, l?.outHigh ?? 1,
-      0, 0,
+      o.strength ?? 1, 0,
     ];
   }
 
@@ -142,7 +142,7 @@ export class FilterRenderer {
    * フィルターを適用。src（原本）から計算し、選択マスクで合成して dst に書く。
    * src と dst は別テクスチャであること。
    */
-  apply(type: FilterType, params: FilterParams, src: GPUTexture, mask: GPUTexture | null, dst: GPUTexture): void {
+  apply(type: FilterType, params: FilterParams, src: GPUTexture, mask: GPUTexture | null, dst: GPUTexture, strength = 1): void {
     const r = params.radius;
     const useMask = mask ? 1 : 0;
 
@@ -173,8 +173,8 @@ export class FilterRenderer {
       this.pass('curve', this.tmpA, src, this.curveLut ?? this.dummy, null, this.uni({}));
       filtered = this.tmpA;
     }
-    // 選択マスクで original と合成して dst へ
-    this.pass('maskComposite', dst, filtered, src, mask, this.uni({ useMask }));
+    // 選択マスクと効果不透明度で original と合成して dst へ
+    this.pass('maskComposite', dst, filtered, src, mask, this.uni({ useMask, strength }));
   }
 
   dispose(): void {

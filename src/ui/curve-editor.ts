@@ -34,6 +34,12 @@ export class CurveEditor {
   }
 
   getLut(): Uint8Array { return buildCurveLut(this.points); }
+  getPoints(): CurvePoint[] { return this.points.map(p => ({ ...p })); }
+  /** 外部から制御点を設定（onChange は発火しない） */
+  setPoints(pts: CurvePoint[]): void {
+    this.points = pts.length >= 2 ? pts.map(p => ({ ...p })) : [{ x: 0, y: 0 }, { x: 1, y: 1 }];
+    this.draw();
+  }
 
   // 座標変換
   private toCanvas(p: CurvePoint) { return { px: p.x * this.W, py: (1 - p.y) * this.H }; }
