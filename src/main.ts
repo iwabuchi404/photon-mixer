@@ -23,7 +23,7 @@ import './ui/components/tool-bar.js'; // customElements.define('pm-tool-bar') �
 import type { ToolBar } from './ui/components/tool-bar.js';
 import { TOOLS, PARAM_DEFS, getToolDef, type ParamKey } from './ui/tool-config.js';
 import { ToolSettingsStore } from './ui/tool-settings.js';
-import { evToExposure, type TonemapId, type DisplayModeId } from './color/display.js';
+import { evToExposure, linearToDisplaySrgb, type TonemapId, type DisplayModeId } from './color/display.js';
 import type { FilterType, FilterParams } from './render/filter.js';
 import { CurveEditor } from './ui/curve-editor.js';
 import type { LinearColor } from './color/types.js';
@@ -1368,6 +1368,7 @@ class PhotonMixerApp {
       row.style.display = visible.has(row.dataset.fparam!) ? '' : 'none';
     });
     this.setFilterControls(eff.params);
+    this.populateSourceSelect(id, eff.source);
     const curveEd = document.getElementById('filter-curve-editor');
     if (curveEd) curveEd.style.display = eff.filterType === 'curve' ? '' : 'none';
     if (eff.filterType === 'curve' && this.curveEditor) this.curveEditor.setPoints(eff.curvePoints ?? [{ x: 0, y: 0 }, { x: 1, y: 1 }]);
@@ -1377,6 +1378,34 @@ class PhotonMixerApp {
   /** 効果パラメータのスライダー変更を反映 */
   private onEffectParamInput(): void {
     if (this.editingEffectId) this.renderPipeline?.setEffectParams(this.editingEffectId, this.currentFilterParams());
+  }
+
+  /** 効果の入力ソース選択肢を構築（下の全結果 ＋ 各ペイントレイヤー） */
+  private populateSourceSelect(effectId: string, current: string): void {
+    const sel = document.getElementById('filter-source') as HTMLSelectElement | null;
+    if (!sel || !this.renderPipeline) return;
+    sel.innerHTML = '';
+    const add = (value: string, label: string) => {
+      const o = document.createElement('option');
+      o.value = value; o.textContent = label;
+      if (value === current) o.selected = true;
+      sel.appendChild(o);
+    };
+    add('below', '下の全結果');
+    for (const l of this.renderPipeline.getLayers()) {
+      if (l.kind === 'paint' && l.id !== effectId) add(l.id, `レイヤー: ${l.name}`);
+    }
+  }
+
+  /** Freeze（焼き込み）: 効果をピクセルに確定する */
+  private freezeEffect(mode: 'withBelow' | 'toBelow'): void {
+    if (!this.editingEffectId || !this.renderPipeline) return;
+    if (mode === 'withBelow') this.renderPipeline.freezeEffectWithBelow(this.editingEffectId);
+    else this.renderPipeline.freezeEffectToBelow(this.editingEffectId);
+    // レイヤー構造が変わるため履歴はクリア（焼き込みは Undo 非対応）
+    this.layerHistories.clear();
+    this.rebuildLayerPanel();
+    this.refreshEffectEdit();
   }
 
   /** 現在の表示（View）設定を UI から取得（.pmx 保存用） */
@@ -1408,8 +1437,39 @@ class PhotonMixerApp {
     const { width, height } = this.viewport.getCanvasSize();
     const c = sampleSnapshot(snap.data, x, y, width, height, snap.bytesPerRow);
     // committed はプリマルチプライドαなので straight color に戻す（α=0 は透明＝拾わない）
-    if (c.a < 0.001) return;
-    this.updateCurrentColor({ r: c.r / c.a, g: c.g / c.a, b: c.b / c.a, a: 1 });
+    if (c.a < 0.001) { this.updateSpoitGap(null); return; }
+    const straight: LinearColor = { r: c.r / c.a, g: c.g / c.a, b: c.b / c.a, a: 1 };
+    this.updateCurrentColor(straight);
+    this.updateSpoitGap(straight);
+  }
+
+  /**
+   * スポイト知覚ギャップ表示: 内部リニア値と表示上の見え方の乖離が大きいときのみ
+   * 「内部値 / 表示」の色チップを並べて表示する（仕様）。
+   */
+  private updateSpoitGap(c: LinearColor | null): void {
+    const el = document.getElementById('spoit-gap');
+    if (!el) return;
+    if (!c) { el.style.display = 'none'; return; }
+    const view = this.currentViewSettings();
+    const hdr = Math.max(c.r, c.g, c.b) > 1.0;
+    const gap = hdr || view.viewEV !== 0 || view.tonemap !== 'none';
+    if (!gap) { el.style.display = 'none'; return; }
+
+    const toHex = (rgb: { r: number; g: number; b: number }) =>
+      '#' + [rgb.r, rgb.g, rgb.b].map(v => Math.max(0, Math.min(255, Math.round(v * 255))).toString(16).padStart(2, '0')).join('');
+    const rawHex = toHex(linearColorToSrgb(c)); // 内部値（クランプ表示）
+    const disp = linearToDisplaySrgb([c.r, c.g, c.b], evToExposure(view.viewEV), view.tonemap);
+    const dispHex = toHex({ r: disp[0], g: disp[1], b: disp[2] });
+    const f = (v: number) => v.toFixed(v >= 10 ? 1 : 3);
+    el.innerHTML =
+      `<div style="font-size:9px; color:#7fb2ff; margin-bottom:3px;">スポイト（内部値 / 表示）${hdr ? ' <span style="color:#000;background:#ffb24a;border-radius:6px;padding:0 4px;">HDR</span>' : ''}</div>` +
+      `<div style="display:flex; gap:8px; align-items:center; font-size:9px; color:#9a9;">` +
+      `<div style="text-align:center;"><div style="width:28px;height:20px;background:${rawHex};border:1px solid #555;"></div>内部値</div>` +
+      `<div style="text-align:center;"><div style="width:28px;height:20px;background:${dispHex};border:1px solid #555;"></div>表示</div>` +
+      `<div>R:${f(c.r)}<br>G:${f(c.g)}<br>B:${f(c.b)}</div>` +
+      `</div>`;
+    el.style.display = '';
   }
 
   private updateCurrentColor(color: LinearColor): void {
@@ -1792,6 +1852,12 @@ class PhotonMixerApp {
     document.getElementById('filter-exposure')?.addEventListener('click', () => this.addEffect('exposure'));
     document.getElementById('filter-levels')?.addEventListener('click', () => this.addEffect('levels'));
     document.getElementById('filter-curve')?.addEventListener('click', () => this.addEffect('curve'));
+    // Freeze（焼き込み）
+    document.getElementById('freeze-with-below')?.addEventListener('click', () => this.freezeEffect('withBelow'));
+    document.getElementById('freeze-to-below')?.addEventListener('click', () => this.freezeEffect('toBelow'));
+    document.getElementById('filter-source')?.addEventListener('change', (e) => {
+      if (this.editingEffectId) this.renderPipeline?.setEffectSource(this.editingEffectId, (e.target as HTMLSelectElement).value);
+    });
     // トーンカーブエディタ（変更で編集中の効果へ反映）
     const curveContainer = document.getElementById('filter-curve-editor');
     if (curveContainer) {

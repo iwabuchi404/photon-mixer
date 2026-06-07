@@ -80,6 +80,7 @@ export class ColorPicker {
     evRow.innerHTML = `<span class="ctrl-label" style="width:auto;">EV</span>`;
     this.evSlider = document.createElement('input');
     this.evSlider.type = 'range';
+    this.evSlider.id = 'cp-ev-slider'; // SDR/HDR 分離スタイルを CSS で適用
     this.evSlider.min = '-6'; this.evSlider.max = '6'; this.evSlider.step = '0.1'; this.evSlider.value = '0';
     this.evSlider.style.flex = '1';
     const evVal = document.createElement('span');
@@ -87,8 +88,25 @@ export class ColorPicker {
     evRow.appendChild(this.evSlider);
     evRow.appendChild(evVal);
     container.appendChild(evRow);
+
+    // SDR / HDR の意味づけキャプション（普通の色 ┆ 光る色）
+    const caption = document.createElement('div');
+    caption.style.cssText = 'display:flex; justify-content:space-between; font-size:9px; color:#777; margin-top:-2px;';
+    caption.innerHTML = `<span>普通の色</span><span style="color:#ffb24a;">光る色 (HDR) →</span>`;
+    container.appendChild(caption);
+
+    // 初回のみの補助ヒント（一度でも EV を動かしたら消える）
+    if (!localStorage.getItem('pm-ev-hint-seen')) {
+      const hint = document.createElement('div');
+      hint.id = 'cp-ev-hint';
+      hint.style.cssText = 'font-size:10px; color:#9a9; background:rgba(255,178,74,0.12); border-left:2px solid #ffb24a; padding:4px 6px; border-radius:3px; margin-top:2px;';
+      hint.textContent = 'EV を 0 より右に上げると「光る色（HDR）」になります。';
+      container.appendChild(hint);
+    }
+
     this.evSlider.addEventListener('input', () => {
       this.ev = parseFloat(this.evSlider.value);
+      this.dismissEvHint();
       this.updateReadout();
       this.emit(false);
     });
@@ -125,6 +143,11 @@ export class ColorPicker {
     this.swatches = (sw ?? []).map(c => ({ ...c }));
     this.saveSwatches();
     this.renderPalette();
+  }
+
+  private dismissEvHint(): void {
+    const hint = this.container.querySelector('#cp-ev-hint') as HTMLElement | null;
+    if (hint) { hint.remove(); localStorage.setItem('pm-ev-hint-seen', '1'); }
   }
 
   /** 外部から色をセット（sRGB・LDR） */

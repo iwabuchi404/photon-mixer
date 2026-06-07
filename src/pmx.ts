@@ -32,6 +32,7 @@ export interface PmxEffectLayer {
   filterType: FilterType;
   params: FilterParams;
   curvePoints?: CurvePoint[];
+  source?: string; // 入力ソース: 'below' or ペイントレイヤーID
 }
 
 export interface PmxDocumentSettings {

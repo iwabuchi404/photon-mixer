@@ -36,6 +36,7 @@ export interface LayerInfo {
   alphaLock: boolean;
   kind: 'paint' | 'effect';        // effect=非破壊エフェクト（下の合成結果に適用）
   filterType?: FilterType;         // kind==='effect' のみ
+  source?: string;                 // effect の入力ソース: 'below'（下の全結果）or ペイントレイヤーID
 }
 
 interface LayerTex extends LayerInfo {
@@ -61,6 +62,7 @@ export class RenderPipeline {
   private displayA!: GPUTexture;
   private displayB!: GPUTexture;
   private activeComposite!: GPUTexture; // アクティブレイヤー committed + 現在ストローク
+  private filterScratch!: GPUTexture;   // 効果（レイヤー入力）の処理結果一時バッファ
 
   private layers: LayerTex[] = [];
   private activeIndex = 0;
@@ -151,6 +153,11 @@ export class RenderPipeline {
       size: [width, height], format: BUFFER_FORMAT,
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
+    // 効果の入力ソースがレイヤー指定のとき、処理結果を一時保持する
+    this.filterScratch = this.renderer.device.createTexture({
+      size: [width, height], format: BUFFER_FORMAT,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
 
     // レイヤーを初期化（1枚）
     for (const l of this.layers) l.committed.destroy();
@@ -238,7 +245,7 @@ export class RenderPipeline {
    * 全レイヤーを下から合成して結果テクスチャを返す
    * @param includeLiveStroke true ならアクティブレイヤーに現在ストロークを重ねる
    */
-  private compositeLayers(includeLiveStroke: boolean): GPUTexture {
+  private compositeLayers(includeLiveStroke: boolean, endIndex = this.layers.length - 1, transparentBg = false): GPUTexture {
     const { device } = this.renderer;
 
     // アクティブレイヤー用のソース（現在ストロークを焼き込んだ一時テクスチャ）
@@ -258,19 +265,30 @@ export class RenderPipeline {
     }
 
     // ping-pong 合成。acc を背景色（or 透明）にクリアして下から重ねる
-    this.clearToBackground(this.displayA);
+    // 焼き込み等で背景を含めたくない場合は透明クリア
+    if (transparentBg) this.clearTextureContent(this.displayA);
+    else this.clearToBackground(this.displayA);
     let acc = this.displayA;
     let other = this.displayB;
 
-    for (let i = 0; i < this.layers.length; i++) {
+    for (let i = 0; i <= endIndex; i++) {
       const layer = this.layers[i];
       if (!layer.visible || layer.opacity <= 0) continue;
       if (layer.kind === 'effect' && layer.filterType && layer.params) {
-        // 非破壊エフェクト: 下の合成結果(acc)に適用して other へ（効果不透明度=opacity）
         if (layer.filterType === 'curve' && layer.curvePoints) {
           this.filterRenderer.setCurveLut(buildCurveLut(layer.curvePoints));
         }
-        this.filterRenderer.apply(layer.filterType, layer.params, acc, null, other, layer.opacity);
+        // 入力ソースが特定ペイントレイヤーなら、そのレイヤーを入力に処理し acc へ重ねる
+        const srcLayer = (layer.source && layer.source !== 'below')
+          ? this.layers.find(l => l.id === layer.source && l.kind === 'paint')
+          : undefined;
+        if (srcLayer) {
+          this.filterRenderer.apply(layer.filterType, layer.params, srcLayer.committed, null, this.filterScratch, 1.0);
+          this.blendRenderer.blend(acc, this.filterScratch, other, 'normal', layer.opacity);
+        } else {
+          // 下の合成結果(acc)に適用して other へ（効果不透明度=opacity）
+          this.filterRenderer.apply(layer.filterType, layer.params, acc, null, other, layer.opacity);
+        }
       } else {
         const src = (i === this.activeIndex && activeSrc) ? activeSrc : layer.committed;
         this.blendRenderer.blend(acc, src, other, layer.blendMode, layer.opacity);
@@ -323,6 +341,7 @@ export class RenderPipeline {
       alphaLock: false,
       kind: 'effect',
       filterType: type,
+      source: 'below',
       params: { ...DEFAULT_FILTER_PARAMS },
       curvePoints: type === 'curve' ? [{ x: 0, y: 0 }, { x: 1, y: 1 }] : undefined,
       committed: this.makeLayerTexture(), // 不変条件維持のため確保（未使用）
@@ -344,11 +363,17 @@ export class RenderPipeline {
     if (l && l.kind === 'effect') l.curvePoints = points.map(p => ({ ...p }));
   }
 
+  /** 効果レイヤーの入力ソースを更新（'below' or ペイントレイヤーID） */
+  setEffectSource(id: string, source: string): void {
+    const l = this.layers.find(l => l.id === id);
+    if (l && l.kind === 'effect') l.source = source;
+  }
+
   /** 効果レイヤーの情報取得（UIのパラメータ編集用） */
-  getEffect(id: string): { filterType: FilterType; params: FilterParams; curvePoints?: CurvePoint[] } | null {
+  getEffect(id: string): { filterType: FilterType; params: FilterParams; curvePoints?: CurvePoint[]; source: string } | null {
     const l = this.layers.find(l => l.id === id);
     if (l && l.kind === 'effect' && l.filterType && l.params) {
-      return { filterType: l.filterType, params: l.params, curvePoints: l.curvePoints };
+      return { filterType: l.filterType, params: l.params, curvePoints: l.curvePoints, source: l.source ?? 'below' };
     }
     return null;
   }
@@ -356,6 +381,51 @@ export class RenderPipeline {
   /** アクティブレイヤーが効果かどうか */
   isActiveEffect(): boolean {
     return this.layers[this.activeIndex]?.kind === 'effect';
+  }
+
+  /**
+   * Freeze: 効果と下の全レイヤーを1枚のペイントレイヤーに統合する。
+   * [0..effect] を合成（透明下地）→ 焼き込み、その範囲を1枚に置換。上のレイヤーは保持。
+   */
+  freezeEffectWithBelow(effectId: string): void {
+    const idx = this.layers.findIndex(l => l.id === effectId);
+    if (idx < 0 || this.layers[idx].kind !== 'effect') return;
+    const result = this.compositeLayers(false, idx, true); // 透明下地で [0..idx] を合成
+    const baked = this.makeLayerTexture();
+    const enc = this.renderer.device.createCommandEncoder();
+    enc.copyTextureToTexture({ texture: result }, { texture: baked }, [this.canvasWidth, this.canvasHeight]);
+    this.renderer.device.queue.submit([enc.finish()]);
+    for (let i = 0; i <= idx; i++) this.layers[i].committed.destroy();
+    const layer: LayerTex = {
+      id: `layer-${++layerIdCounter}`, name: '統合レイヤー',
+      visible: true, opacity: 1.0, blendMode: 'normal', alphaLock: false,
+      kind: 'paint', committed: baked,
+    };
+    this.layers.splice(0, idx + 1, layer);
+    this.activeIndex = 0;
+  }
+
+  /**
+   * Freeze: 効果を直下のペイントレイヤーに焼き込み、効果レイヤーを除去する。
+   * 直下がペイントでなければ「下を統合」にフォールバック。
+   */
+  freezeEffectToBelow(effectId: string): void {
+    const idx = this.layers.findIndex(l => l.id === effectId);
+    if (idx < 0 || this.layers[idx].kind !== 'effect') return;
+    const below = this.layers[idx - 1];
+    if (!below || below.kind !== 'paint') { this.freezeEffectWithBelow(effectId); return; }
+    const eff = this.layers[idx];
+    // 直下レイヤーの内容をコピーして入力にし、効果を適用して書き戻す
+    const srcCopy = this.makeLayerTexture();
+    const enc = this.renderer.device.createCommandEncoder();
+    enc.copyTextureToTexture({ texture: below.committed }, { texture: srcCopy }, [this.canvasWidth, this.canvasHeight]);
+    this.renderer.device.queue.submit([enc.finish()]);
+    if (eff.filterType === 'curve' && eff.curvePoints) this.filterRenderer.setCurveLut(buildCurveLut(eff.curvePoints));
+    this.filterRenderer.apply(eff.filterType!, eff.params!, srcCopy, null, below.committed, eff.opacity);
+    srcCopy.destroy();
+    this.layers[idx].committed.destroy();
+    this.layers.splice(idx, 1);
+    this.activeIndex = this.layers.findIndex(l => l.id === below.id);
   }
 
   /** 全レイヤーの積み順（id） — .pmx 保存用 */
@@ -368,7 +438,7 @@ export class RenderPipeline {
     return this.layers.filter(l => l.kind === 'effect').map(l => ({
       id: l.id, name: l.name, visible: l.visible, opacity: l.opacity,
       blendMode: 'normal' as const, kind: 'effect' as const,
-      filterType: l.filterType!, params: l.params!, curvePoints: l.curvePoints,
+      filterType: l.filterType!, params: l.params!, curvePoints: l.curvePoints, source: l.source ?? 'below',
     }));
   }
 
@@ -884,7 +954,7 @@ export class RenderPipeline {
       byId.set(e.id, {
         id: e.id, name: e.name, visible: e.visible, opacity: e.opacity,
         blendMode: 'normal', alphaLock: false, kind: 'effect',
-        filterType: e.filterType, params: { ...e.params },
+        filterType: e.filterType, source: e.source ?? 'below', params: { ...e.params },
         curvePoints: e.curvePoints?.map(p => ({ ...p })),
         committed: this.makeLayerTexture(),
       });
@@ -994,6 +1064,7 @@ export class RenderPipeline {
     this.brushTexture4x.destroy();
     this.isolatedTexture.destroy();
     this.displayA.destroy(); this.displayB.destroy(); this.activeComposite.destroy();
+    this.filterScratch.destroy();
     this.createTextures(w, h);
     this.filterRenderer.resize(w, h);
   }
@@ -1076,6 +1147,7 @@ export class RenderPipeline {
     this.brushTexture4x?.destroy();
     this.isolatedTexture?.destroy();
     this.displayA?.destroy(); this.displayB?.destroy(); this.activeComposite?.destroy();
+    this.filterScratch?.destroy();
     for (const l of this.layers) l.committed.destroy();
   }
 }

@@ -276,6 +276,28 @@
     }
     .icon-btn { width: 26px; height: 24px; flex: none; padding: 0; }
     #layer-list { max-height: 220px; overflow-y: auto; }
+
+    /* Color EV スライダー: 左半分=SDR(通常), 右半分=HDR(発光) を視覚分離 */
+    #cp-ev-slider {
+      -webkit-appearance: none;
+      appearance: none;
+      height: 14px;
+      border-radius: 7px;
+      /* 中央(=EV 0)で区切り。左=ニュートラル、右=発光グラデーション */
+      background: linear-gradient(90deg,
+        #4a4a4a 0%, #4a4a4a 49.5%,
+        #ffd24a 50%,                /* 境界ノッチ */
+        #6a4513 50.5%, #ff7a1a 100%);
+      outline: none;
+    }
+    #cp-ev-slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 10px; height: 18px;
+      border-radius: 3px;
+      background: #fff;
+      border: 1px solid #000;
+      cursor: pointer;
+    }
   </style>
 </head>
 <body>
@@ -393,6 +415,8 @@
       <div class="panel-title">カラー</div>
       <div id="color-picker"></div>
       <input type="color" id="brush-color" value="#ffffff" style="display:none;">
+      <!-- スポイト知覚ギャップ表示（内部値 vs 表示）。条件成立時のみ表示 -->
+      <div id="spoit-gap" style="display:none; margin-top:8px;"></div>
     </section>
 
     <!-- 表示（光のコントロール：露出・トーンマップ・表示モード） -->
@@ -435,6 +459,10 @@
         <button id="filter-curve" class="tool-btn" style="flex:1 1 44%;">トーンカーブ</button>
       </div>
       <div id="filter-params" style="display:none;">
+        <div class="ctrl-row" id="filter-source-row">
+          <span class="ctrl-label">入力</span>
+          <select id="filter-source" class="ctrl-select"></select>
+        </div>
         <div id="filter-curve-editor" style="display:none; margin-bottom:10px;"></div>
         <div class="ctrl-row" data-fparam="radius">
           <span class="ctrl-label">半径</span>
@@ -480,6 +508,11 @@
           <span class="ctrl-label">強度</span>
           <input type="range" id="filter-intensity" min="0" max="4" step="0.05" value="1">
           <span id="filter-intensity-val" class="ctrl-val">1.0</span>
+        </div>
+        <div class="ctrl-row" style="margin-top:8px; border-top:1px solid #333; padding-top:8px;">
+          <span class="ctrl-label">確定</span>
+          <button id="freeze-with-below" class="tool-btn" style="flex:1;" title="この効果と下のレイヤーを1枚に統合（焼き込み）">効果+下を統合</button>
+          <button id="freeze-to-below" class="tool-btn" style="flex:1;" title="効果を直下のレイヤーに焼き込む">直下に焼込</button>
         </div>
       </div>
     </section>
