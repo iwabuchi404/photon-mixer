@@ -275,7 +275,11 @@
       margin-bottom: 8px; padding-bottom: 6px; border-bottom: 1px solid #333;
     }
     .icon-btn { width: 26px; height: 24px; flex: none; padding: 0; }
-    #layer-list { max-height: 220px; overflow-y: auto; }
+    #layer-list { max-height: 200px; overflow-y: auto; border: 1px solid #2a2a2a; border-radius: 4px; }
+    .effects-label {
+      font-size: 10px; color: #9ab; letter-spacing: .04em;
+      margin: 10px 0 6px; border-top: 1px solid #333; padding-top: 8px;
+    }
 
     /* Color EV スライダー: 左半分=SDR(通常), 右半分=HDR(発光) を視覚分離 */
     #cp-ev-slider {
@@ -446,10 +450,17 @@
       </div>
     </section>
 
-    <!-- フィルター（破壊的適用＋Undo・選択範囲対応） -->
-    <section class="panel" id="filter-panel">
-      <div class="panel-title">効果（非破壊フィルター）</div>
-      <div class="tool-hint" style="margin-bottom:8px;">ボタンで効果レイヤーを追加。レイヤーを選ぶと下のスライダーで後から再編集できます。</div>
+    <!-- レイヤー / 効果（統合パネル：スタックと効果設定を一体化） -->
+    <section class="panel" id="layer-panel">
+      <div class="layer-head">
+        <span style="flex:1;color:#7fb2ff;letter-spacing:.08em;">レイヤー / 効果</span>
+        <button id="layer-add" class="tool-btn icon-btn" title="ペイントレイヤー追加">＋</button>
+        <button id="layer-del" class="tool-btn icon-btn" title="削除">－</button>
+        <button id="layer-up" class="tool-btn icon-btn" title="上へ">▲</button>
+        <button id="layer-down" class="tool-btn icon-btn" title="下へ">▼</button>
+      </div>
+      <div id="layer-list"></div>
+      <div class="effects-label">＋ 効果レイヤーを追加</div>
       <div class="ctrl-row" id="filter-start-row" style="flex-wrap:wrap;">
         <button id="filter-blur" class="tool-btn" style="flex:1 1 44%;">ぼかし</button>
         <button id="filter-glow" class="tool-btn" style="flex:1 1 44%;">グロー</button>
@@ -459,6 +470,7 @@
         <button id="filter-curve" class="tool-btn" style="flex:1 1 44%;">トーンカーブ</button>
       </div>
       <div id="filter-params" style="display:none;">
+        <div id="effect-editor-title" class="effects-label" style="color:#9f9; border-top-color:#2a4a2a;">⚙ 効果の設定</div>
         <div class="ctrl-row" id="filter-source-row">
           <span class="ctrl-label">入力</span>
           <select id="filter-source" class="ctrl-select"></select>
@@ -543,17 +555,6 @@
       </details>
     </section>
 
-    <!-- レイヤー -->
-    <section class="panel" id="layer-panel">
-      <div class="layer-head">
-        <span style="flex:1;color:#7fb2ff;letter-spacing:.08em;">レイヤー</span>
-        <button id="layer-add" class="tool-btn icon-btn" title="追加">＋</button>
-        <button id="layer-del" class="tool-btn icon-btn" title="削除">－</button>
-        <button id="layer-up" class="tool-btn icon-btn" title="上へ">▲</button>
-        <button id="layer-down" class="tool-btn icon-btn" title="下へ">▼</button>
-      </div>
-      <div id="layer-list"></div>
-    </section>
   </div>
   <input type="file" id="texture-file-input" accept="image/*" style="display: none;">
   <input type="file" id="preset-file-input" accept=".zip" style="display: none;">

@@ -1363,6 +1363,9 @@ class PhotonMixerApp {
       return;
     }
     this.editingEffectId = id;
+    const title = document.getElementById('effect-editor-title');
+    const layer = this.renderPipeline?.getLayers().find(l => l.id === id);
+    if (title) title.textContent = `⚙ ${layer?.name ?? '効果'} の設定`;
     const visible = new Set(PhotonMixerApp.FILTER_PARAMS[eff.filterType]);
     document.querySelectorAll<HTMLElement>('#filter-params [data-fparam]').forEach(row => {
       row.style.display = visible.has(row.dataset.fparam!) ? '' : 'none';
