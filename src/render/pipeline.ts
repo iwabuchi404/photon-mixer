@@ -16,6 +16,7 @@ import { TransformRenderer } from './transform.js';
 import { FilterRenderer, type FilterType, type FilterParams } from './filter.js';
 import { buildCurveLut, type CurvePoint } from '../color/curve.js';
 import { rasterizePolygon, floodFillMask, maskBounds, invertMask } from '../selection/mask.js';
+import type { PmxLayer, PmxEffectLayer } from '../pmx.js';
 
 /** 効果レイヤーの既定パラメータ */
 const DEFAULT_FILTER_PARAMS: FilterParams = {
@@ -355,6 +356,20 @@ export class RenderPipeline {
   /** アクティブレイヤーが効果かどうか */
   isActiveEffect(): boolean {
     return this.layers[this.activeIndex]?.kind === 'effect';
+  }
+
+  /** 全レイヤーの積み順（id） — .pmx 保存用 */
+  getStackOrder(): string[] {
+    return this.layers.map(l => l.id);
+  }
+
+  /** 効果レイヤーの仕様一覧 — .pmx 保存用 */
+  getEffectSpecs(): PmxEffectLayer[] {
+    return this.layers.filter(l => l.kind === 'effect').map(l => ({
+      id: l.id, name: l.name, visible: l.visible, opacity: l.opacity,
+      blendMode: 'normal' as const, kind: 'effect' as const,
+      filterType: l.filterType!, params: l.params!, curvePoints: l.curvePoints,
+    }));
   }
 
   // --- 選択範囲（任意形状マスク）---
@@ -852,6 +867,36 @@ export class RenderPipeline {
     this.activeIndex = idx >= 0 ? idx : 0;
   }
 
+  /**
+   * .pmx 読込（効果レイヤー対応）：ペイント＋効果を stackOrder の積み順で復元する。
+   */
+  loadDocument(width: number, height: number, paint: PmxLayer[], effects: PmxEffectLayer[], stackOrder: string[], activeId: string): void {
+    this.resizeCanvasSize(width, height);
+    for (const l of this.layers) l.committed.destroy();
+
+    const byId = new Map<string, LayerTex>();
+    for (const { info, data } of paint) {
+      const tex = this.makeLayerTexture();
+      this.writeLayerTight(tex, data);
+      byId.set(info.id, { ...info, alphaLock: info.alphaLock ?? false, kind: 'paint', committed: tex });
+    }
+    for (const e of effects) {
+      byId.set(e.id, {
+        id: e.id, name: e.name, visible: e.visible, opacity: e.opacity,
+        blendMode: 'normal', alphaLock: false, kind: 'effect',
+        filterType: e.filterType, params: { ...e.params },
+        curvePoints: e.curvePoints?.map(p => ({ ...p })),
+        committed: this.makeLayerTexture(),
+      });
+    }
+
+    const order = stackOrder.length ? stackOrder : [...byId.keys()];
+    this.layers = order.map(id => byId.get(id)).filter((l): l is LayerTex => !!l);
+    if (this.layers.length === 0) this.layers = [this.createLayer('レイヤー 1')];
+    const idx = this.layers.findIndex(l => l.id === activeId);
+    this.activeIndex = idx >= 0 ? idx : 0;
+  }
+
   /** tight packed float16 データをテクスチャに書き込む */
   private writeLayerTight(tex: GPUTexture, data: Uint16Array): void {
     const { device } = this.renderer;
@@ -879,13 +924,22 @@ export class RenderPipeline {
   updateBrushConfig(config: Partial<BrushConfig>): void { this.brushRenderer.updateConfig(config); }
 
   async requestCommittedSnapshot() {
+    return this.readbackTexture(this.committedTexture);
+  }
+
+  /** 全レイヤー合成結果（リニア・プリマルチ）の CPU 読み出し（スポイト用） */
+  async requestCompositeSnapshot() {
+    return this.readbackTexture(this.compositeLayers(false));
+  }
+
+  private async readbackTexture(tex: GPUTexture) {
     const { device } = this.renderer;
     const width = this.canvasWidth;
     const height = this.canvasHeight;
     const bytesPerRow = Math.ceil(width * 8 / 256) * 256;
     const staging = device.createBuffer({ size: bytesPerRow * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const enc = device.createCommandEncoder();
-    enc.copyTextureToBuffer({ texture: this.committedTexture }, { buffer: staging, bytesPerRow }, [width, height]);
+    enc.copyTextureToBuffer({ texture: tex }, { buffer: staging, bytesPerRow }, [width, height]);
     device.queue.submit([enc.finish()]);
     await staging.mapAsync(GPUMapMode.READ);
     const data = new Uint16Array(staging.getMappedRange().slice(0));

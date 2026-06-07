@@ -118,6 +118,15 @@ export class ColorPicker {
     this.renderAll();
   }
 
+  /** スウォッチ取得（.pmx 保存用・LinearColor 配列） */
+  getSwatches(): LinearColor[] { return this.swatches.map(c => ({ ...c })); }
+  /** スウォッチ設定（.pmx 読込時） */
+  setSwatches(sw: LinearColor[]): void {
+    this.swatches = (sw ?? []).map(c => ({ ...c }));
+    this.saveSwatches();
+    this.renderPalette();
+  }
+
   /** 外部から色をセット（sRGB・LDR） */
   setRgb(rgb: RGB): void {
     this.setLinear({ r: srgbToLinear(rgb.r), g: srgbToLinear(rgb.g), b: srgbToLinear(rgb.b), a: 1 });

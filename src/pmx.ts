@@ -1,22 +1,48 @@
 /**
  * .pmx ネイティブ形式の保存/読み込み
  *
- * MVP: ZIP コンテナ + 生 float16 RGBA データ（プリマルチプライド・リニア）
- *   manifest.json          バージョン・キャンバスサイズ・レイヤー構成
- *   layers/<id>.f16         各レイヤーの tight packed float16 RGBA（width*height*4 u16）
+ * ZIP コンテナ:
+ *   manifest.json   バージョン・キャンバスサイズ・レイヤー構成・View設定・スウォッチ・効果レイヤー
+ *   layers/<id>.f16 各ペイントレイヤーの tight packed float16 RGBA（プリマルチプライド・リニア）
  *
- * 注: 仕様では EXR を予定しているが、ライブラリ依存を避けつつ完全精度を保つため
- *     当面は生 float16 を採用。EXR 互換書き出しは将来対応。
+ * 効果（非破壊）レイヤーはピクセルを持たず manifest にパラメータのみ保存する。
+ * stackOrder で paint/effect の積み順を保持する。
  */
 
 import * as fflate from 'fflate';
 import type { LayerInfo } from './render/pipeline.js';
+import type { TonemapId, DisplayModeId } from './color/display.js';
+import type { FilterType, FilterParams } from './render/filter.js';
+import type { CurvePoint } from './color/curve.js';
 
-const PMX_VERSION = '1.0';
+const PMX_VERSION = '1.1';
 
 export interface PmxLayer {
   info: LayerInfo;
   data: Uint16Array; // tight packed float16 RGBA
+}
+
+export interface PmxEffectLayer {
+  id: string;
+  name: string;
+  visible: boolean;
+  opacity: number;
+  blendMode: 'normal';
+  kind: 'effect';
+  filterType: FilterType;
+  params: FilterParams;
+  curvePoints?: CurvePoint[];
+}
+
+export interface PmxDocumentSettings {
+  view: { viewEV: number; tonemap: TonemapId; viewMode: DisplayModeId };
+  swatches: { r: number; g: number; b: number; a: number }[];
+}
+
+export interface PmxSaveExtras {
+  documentSettings?: PmxDocumentSettings;
+  effectLayers?: PmxEffectLayer[];
+  stackOrder?: string[]; // 全レイヤー（paint+effect）の id を積み順で
 }
 
 export interface PmxManifest {
@@ -26,24 +52,37 @@ export interface PmxManifest {
   height: number;
   activeId: string;
   layers: (LayerInfo & { file: string })[];
+  effectLayers?: PmxEffectLayer[];
+  stackOrder?: string[];
+  documentSettings?: PmxDocumentSettings;
 }
 
-/**
- * .pmx を生成
- */
-export function savePmx(width: number, height: number, layers: PmxLayer[], activeId: string): Blob {
+export interface PmxLoadResult {
+  width: number;
+  height: number;
+  activeId: string;
+  layers: PmxLayer[];
+  effectLayers: PmxEffectLayer[];
+  stackOrder: string[];
+  documentSettings?: PmxDocumentSettings;
+}
+
+/** .pmx を生成 */
+export function savePmx(width: number, height: number, layers: PmxLayer[], activeId: string, extras: PmxSaveExtras = {}): Blob {
   const manifest: PmxManifest = {
     version: PMX_VERSION,
     app: 'PhotonMixer',
     width, height, activeId,
     layers: layers.map(l => ({ ...l.info, file: `layers/${l.info.id}.f16` })),
+    effectLayers: extras.effectLayers,
+    stackOrder: extras.stackOrder,
+    documentSettings: extras.documentSettings,
   };
 
   const files: Record<string, Uint8Array> = {
     'manifest.json': new TextEncoder().encode(JSON.stringify(manifest, null, 2)),
   };
   for (const l of layers) {
-    // Uint16Array を Uint8Array ビューに（リトルエンディアンのまま格納）
     files[`layers/${l.info.id}.f16`] = new Uint8Array(l.data.buffer, l.data.byteOffset, l.data.byteLength);
   }
 
@@ -51,10 +90,8 @@ export function savePmx(width: number, height: number, layers: PmxLayer[], activ
   return new Blob([zipped], { type: 'application/octet-stream' });
 }
 
-/**
- * .pmx を読み込み
- */
-export async function loadPmx(blob: Blob): Promise<{ width: number; height: number; activeId: string; layers: PmxLayer[] }> {
+/** .pmx を読み込み */
+export async function loadPmx(blob: Blob): Promise<PmxLoadResult> {
   const buf = new Uint8Array(await blob.arrayBuffer());
   const unzipped = fflate.unzipSync(buf);
 
@@ -66,12 +103,17 @@ export async function loadPmx(blob: Blob): Promise<{ width: number; height: numb
   for (const entry of manifest.layers) {
     const bytes = unzipped[entry.file];
     if (!bytes) throw new Error(`Invalid .pmx: ${entry.file} not found`);
-    // byteOffset がアライン外の可能性があるためコピーして Uint16Array 化
     const copy = bytes.slice();
     const data = new Uint16Array(copy.buffer, copy.byteOffset, copy.byteLength / 2);
     const { file, ...info } = entry;
     layers.push({ info, data });
   }
 
-  return { width: manifest.width, height: manifest.height, activeId: manifest.activeId, layers };
+  const effectLayers = manifest.effectLayers ?? [];
+  const stackOrder = manifest.stackOrder ?? [...layers.map(l => l.info.id), ...effectLayers.map(e => e.id)];
+
+  return {
+    width: manifest.width, height: manifest.height, activeId: manifest.activeId,
+    layers, effectLayers, stackOrder, documentSettings: manifest.documentSettings,
+  };
 }

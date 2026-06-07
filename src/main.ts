@@ -249,7 +249,11 @@ class PhotonMixerApp {
       try {
         const { width, height } = this.renderPipeline.getCanvasSize();
         const layers = await this.renderPipeline.readAllLayers();
-        const blob = savePmx(width, height, layers, this.renderPipeline.getActiveLayerId());
+        const blob = savePmx(width, height, layers, this.renderPipeline.getActiveLayerId(), {
+          documentSettings: { view: this.currentViewSettings(), swatches: this.colorPicker?.getSwatches() ?? [] },
+          effectLayers: this.renderPipeline.getEffectSpecs(),
+          stackOrder: this.renderPipeline.getStackOrder(),
+        });
         await saveAutosave(blob);
       } catch (e) {
         console.warn('autosave failed:', e);
@@ -293,7 +297,7 @@ class PhotonMixerApp {
       { v: 'multiply', label: '乗算' },
       { v: 'screen', label: 'スクリーン' },
       { v: 'overlay', label: 'オーバーレイ' },
-      { v: 'add', label: '加算' },
+      { v: 'add', label: '加算（光）' },
     ];
 
     list.innerHTML = '';
@@ -346,6 +350,7 @@ class PhotonMixerApp {
       for (const m of blendModes) {
         const opt = document.createElement('option');
         opt.value = m.v; opt.textContent = m.label;
+        if (m.v === 'add') opt.title = 'Linear Dodge: リニア空間で光量を足します';
         if (m.v === layer.blendMode) opt.selected = true;
         sel.appendChild(opt);
       }
@@ -379,7 +384,11 @@ class PhotonMixerApp {
       const { width, height } = this.renderPipeline.getCanvasSize();
       const layers = await this.renderPipeline.readAllLayers();
       const activeId = this.renderPipeline.getActiveLayerId();
-      const blob = savePmx(width, height, layers, activeId);
+      const blob = savePmx(width, height, layers, activeId, {
+        documentSettings: { view: this.currentViewSettings(), swatches: this.colorPicker?.getSwatches() ?? [] },
+        effectLayers: this.renderPipeline.getEffectSpecs(),
+        stackOrder: this.renderPipeline.getStackOrder(),
+      });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -398,8 +407,13 @@ class PhotonMixerApp {
   private async openPmxFile(file: File): Promise<void> {
     if (!this.renderPipeline) return;
     try {
-      const { width, height, activeId, layers } = await loadPmx(file);
-      this.renderPipeline.loadLayers(width, height, layers, activeId);
+      const { width, height, activeId, layers, effectLayers, stackOrder, documentSettings } = await loadPmx(file);
+      this.renderPipeline.loadDocument(width, height, layers, effectLayers, stackOrder, activeId);
+      // View 設定・スウォッチを復元
+      if (documentSettings) {
+        this.applyViewSettings(documentSettings.view);
+        this.colorPicker?.setSwatches(documentSettings.swatches as any);
+      }
       // ビューポートを作り直したキャンバスに合わせて再配置
       this.viewport.reset(width, height, window.innerWidth, window.innerHeight);
       const t = this.viewport.getTransform();
@@ -407,6 +421,7 @@ class PhotonMixerApp {
       // 履歴はピクセルから復元できないためクリア（読込後の Undo は不可）
       this.layerHistories.clear();
       this.rebuildLayerPanel();
+      this.refreshEffectEdit();
       this.updateZoomDisplay();
     } catch (e) {
       console.error('Failed to open .pmx:', e);
@@ -1364,9 +1379,32 @@ class PhotonMixerApp {
     if (this.editingEffectId) this.renderPipeline?.setEffectParams(this.editingEffectId, this.currentFilterParams());
   }
 
+  /** 現在の表示（View）設定を UI から取得（.pmx 保存用） */
+  private currentViewSettings(): { viewEV: number; tonemap: TonemapId; viewMode: DisplayModeId } {
+    return {
+      viewEV: parseFloat((document.getElementById('view-exposure') as HTMLInputElement).value),
+      tonemap: (document.getElementById('view-tonemap') as HTMLSelectElement).value as TonemapId,
+      viewMode: (document.getElementById('view-mode') as HTMLSelectElement).value as DisplayModeId,
+    };
+  }
+
+  /** View 設定を UI とエンジンへ適用（.pmx 読込時） */
+  private applyViewSettings(v: { viewEV: number; tonemap: TonemapId; viewMode: DisplayModeId }): void {
+    const exp = document.getElementById('view-exposure') as HTMLInputElement | null;
+    const expVal = document.getElementById('view-exposure-val');
+    const tone = document.getElementById('view-tonemap') as HTMLSelectElement | null;
+    const mode = document.getElementById('view-mode') as HTMLSelectElement | null;
+    if (exp) exp.value = String(v.viewEV);
+    if (expVal) expVal.textContent = (v.viewEV >= 0 ? '+' : '') + v.viewEV.toFixed(1);
+    if (tone) tone.value = v.tonemap;
+    if (mode) mode.value = v.viewMode;
+    this.renderPipeline?.setDisplayParams(evToExposure(v.viewEV), v.tonemap, v.viewMode);
+  }
+
   private async handleSpoit(x: number, y: number): Promise<void> {
     if (!this.renderPipeline) return;
-    const snap = await this.renderPipeline.requestCommittedSnapshot();
+    // 仕様: 全レイヤー合成結果の内部リニア値を拾う（表示変換後の色ではない）
+    const snap = await this.renderPipeline.requestCompositeSnapshot();
     const { width, height } = this.viewport.getCanvasSize();
     const c = sampleSnapshot(snap.data, x, y, width, height, snap.bytesPerRow);
     // committed はプリマルチプライドαなので straight color に戻す（α=0 は透明＝拾わない）
