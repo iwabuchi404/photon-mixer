@@ -6,3 +6,9 @@ dist/
 
 # 検証用スクリーンショット（自動生成）
 screenshots/
+
+# electron-builder リリース出力
+release/
+
+# エディタ・AI 設定
+.codex/
