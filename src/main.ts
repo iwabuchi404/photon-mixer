@@ -162,7 +162,7 @@ class PhotonMixerApp {
     // spacing=1: 4x バッファでダウンサンプルするため 1px でも GPU 負荷は低く品質が高い
     // 半透明ブラシで点線にならないためスタンプを密に配置する
     this.interpolator = new Interpolator({ spacing: 1, speedThreshold: 2000 });
-    this.strokeManager = new StrokeManager({ baseSize: 2, maxSize: 20, curve: 'smooth' });
+    this.strokeManager = new StrokeManager({ baseSize: 2, maxSize: 20, curve: 'linear' });
     this.viewport = new Viewport();
     this.perfMonitor = new PerfMonitor();
   }
@@ -1501,6 +1501,15 @@ class PhotonMixerApp {
     const iy = Math.round(y);
     if (ix < 0 || ix >= width || iy < 0 || iy >= height) return;
 
+    // 選択範囲マスク（null=選択なし=全域対象）
+    const sel = this.renderPipeline.getSelectionMaskData();
+    const mask = sel?.data ?? null;
+    // 開始点が選択範囲外なら何もしない
+    if (mask && mask[iy * width + ix] === 0) return;
+
+    const inSelection = (px: number, py: number): boolean =>
+      !mask || mask[py * width + px] !== 0;
+
     const targetColor = this.state.currentColor;
 
     // committed はプリマルチプライドαなので RGB を α 倍して書き込む
@@ -1523,11 +1532,11 @@ class PhotonMixerApp {
     while (stack.length > 0) {
       const [cx, cy] = stack.pop()!;
       let lx = cx;
-      while (lx > 0 && this.isSameColor(data, lx - 1, cy, startStraight, tol, uint16sPerRow)) {
+      while (lx > 0 && inSelection(lx - 1, cy) && this.isSameColor(data, lx - 1, cy, startStraight, tol, uint16sPerRow)) {
         lx--;
       }
       let rx = cx;
-      while (rx < width - 1 && this.isSameColor(data, rx + 1, cy, startStraight, tol, uint16sPerRow)) {
+      while (rx < width - 1 && inSelection(rx + 1, cy) && this.isSameColor(data, rx + 1, cy, startStraight, tol, uint16sPerRow)) {
         rx++;
       }
 
@@ -1539,10 +1548,10 @@ class PhotonMixerApp {
         data[idx + 3] = target16[3];
         processed[cy * width + i] = 1;
 
-        if (cy > 0 && !processed[(cy - 1) * width + i] && this.isSameColor(data, i, cy - 1, startStraight, tol, uint16sPerRow)) {
+        if (cy > 0 && !processed[(cy - 1) * width + i] && inSelection(i, cy - 1) && this.isSameColor(data, i, cy - 1, startStraight, tol, uint16sPerRow)) {
           stack.push([i, cy - 1]);
         }
-        if (cy < height - 1 && !processed[(cy + 1) * width + i] && this.isSameColor(data, i, cy + 1, startStraight, tol, uint16sPerRow)) {
+        if (cy < height - 1 && !processed[(cy + 1) * width + i] && inSelection(i, cy + 1) && this.isSameColor(data, i, cy + 1, startStraight, tol, uint16sPerRow)) {
           stack.push([i, cy + 1]);
         }
       }
@@ -1611,7 +1620,7 @@ class PhotonMixerApp {
     const blur = this.state.currentTool === 'blur';
     const wet = blur ? 1.0 : this.state.wetRatio;
     const snap = this.committedSnapshot;
-    const canvas = this.renderer!.canvas;
+    const { width: canvasW, height: canvasH } = this.viewport.getCanvasSize();
 
     // smudge が既存色/ブラシ色へドリフトする e-fold 距離（px）。小さいほど速く拾う
     const SMUDGE_LEN = 25;
@@ -1632,7 +1641,7 @@ class PhotonMixerApp {
       let targetOklab = blur ? linearToOklab(smudge) : origOklab;
       let driftT = rate;
       if (snap) {
-        const cc = sampleSnapshot(snap.data, p.x, p.y, canvas.width, canvas.height, snap.bytesPerRow);
+        const cc = sampleSnapshot(snap.data, p.x, p.y, canvasW, canvasH, snap.bytesPerRow);
         if (cc.a > 0.001) {
           // 既存色を拾う（薄い既存色は弱く拾う）
           targetOklab = linearToOklab({ r: cc.r / cc.a, g: cc.g / cc.a, b: cc.b / cc.a, a: 1 });

@@ -6,21 +6,45 @@
   "main": "dist/electron/main.js",
   "scripts": {
     "build": "tsc && powershell -Command \"Copy-Item -Path shaders -Destination dist -Recurse -Force; Copy-Item -Path electron/preload.cjs -Destination dist/electron -Force\"",
-    "dev": "tsc && powershell -Command \"Copy-Item -Path shaders -Destination dist -Recurse -Force; Copy-Item -Path electron/preload.cjs -Destination dist/electron -Force\" && electron .",
+    "dev": "tsc && powershell -Command \"Copy-Item -Path shaders -Destination dist -Recurse -Force; Copy-Item -Path electron/preload.cjs -Destination dist/electron -Force\" && cross-env PM_DEV=1 electron .",
     "watch": "tsc --watch",
     "test": "node --import tsx --test tests/*.test.ts",
-    "test:watch": "node --import tsx --test --watch tests/*.test.ts"
+    "test:watch": "node --import tsx --test --watch tests/*.test.ts",
+    "dist:win": "npm run build && electron-builder --win portable"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
     "@webgpu/types": "^0.1.70",
+    "cross-env": "^7.0.3",
     "electron": "^30.0.0",
+    "electron-builder": "^24.13.3",
     "tsx": "^4.22.4",
     "typescript": "^5.4.0"
   },
   "dependencies": {
     "fflate": "^0.8.3",
-    "lit": "^3.3.3",
-    "playwright-core": "^1.60.0"
+    "lit": "^3.3.3"
+  },
+  "build": {
+    "appId": "com.photonmixer.app",
+    "productName": "PhotonMixer",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "index.html",
+      "dist/**/*",
+      "node_modules/fflate/**/*",
+      "node_modules/lit/**/*",
+      "node_modules/lit-html/**/*",
+      "node_modules/lit-element/**/*",
+      "node_modules/@lit/**/*"
+    ],
+    "win": {
+      "target": [
+        "portable"
+      ],
+      "artifactName": "${productName}-${version}-portable.exe"
+    }
   }
 }

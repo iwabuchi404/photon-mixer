@@ -384,8 +384,8 @@
       <div class="ctrl-row" data-param="curve">
         <span class="ctrl-label">筆圧</span>
         <select id="pressure-curve" class="ctrl-select">
-          <option value="smooth">標準</option>
           <option value="linear">リニア</option>
+          <option value="smooth">標準</option>
           <option value="ease-in">入り遅</option>
           <option value="ease-out">入り早</option>
         </select>
@@ -393,8 +393,8 @@
       <div class="ctrl-row" data-param="mixMode">
         <span class="ctrl-label">方式</span>
         <select id="mix-mode" class="ctrl-select">
-          <option value="stamp">スタンプ</option>
           <option value="progressive">引きずり</option>
+          <option value="stamp">スタンプ</option>
         </select>
       </div>
       <div class="ctrl-row" id="texture-controls" style="display:none;">
@@ -564,6 +564,30 @@
   <!-- 選択範囲オーバーレイ（点線枠をスクリーン座標で描画） -->
   <canvas id="selection-overlay" style="position: fixed; left: 0; top: 0; pointer-events: none; z-index: 1400;"></canvas>
   <div id="brush-cursor" style="position: fixed; border: 1px solid rgba(255,255,255,0.7); border-radius: 50%; pointer-events: none; transform: translate(-50%, -50%); z-index: 1500; display: none; mix-blend-mode: difference;"></div>
-  <script type="module" src="dist/src/main.js"></script>
+  <script>
+    window.__pmModuleLoaded = false;
+    window.addEventListener('error', (e) => {
+      const div = document.createElement('div');
+      div.style.cssText = 'position:fixed;bottom:10px;left:10px;right:10px;background:#400;color:#f88;padding:12px;font:12px monospace;z-index:9999;white-space:pre-wrap;border:1px solid #f00;border-radius:4px;max-height:40vh;overflow:auto';
+      div.textContent = '[ERROR] ' + (e.message || e.error?.message || JSON.stringify(e));
+      if (e.filename) div.textContent += '\n  at ' + e.filename + ':' + e.lineno + ':' + e.colno;
+      document.body.appendChild(div);
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+      const div = document.createElement('div');
+      div.style.cssText = 'position:fixed;bottom:10px;left:10px;right:10px;background:#440;color:#ff8;padding:12px;font:12px monospace;z-index:9999;white-space:pre-wrap;border:1px solid #fa0;border-radius:4px;max-height:40vh;overflow:auto';
+      div.textContent = '[PROMISE] ' + (e.reason?.message || e.reason?.stack || String(e.reason));
+      document.body.appendChild(div);
+    });
+    setTimeout(() => {
+      if (!window.__pmModuleLoaded) {
+        const div = document.createElement('div');
+        div.style.cssText = 'position:fixed;bottom:10px;left:10px;right:10px;background:#440;color:#ff8;padding:12px;font:12px monospace;z-index:9999;white-space:pre-wrap;border:1px solid #fa0;border-radius:4px';
+        div.textContent = '[WARN] dist/src/main.js が3秒以内にロード完了しませんでした。DevTools (F12) でConsoleを確認してください。';
+        document.body.appendChild(div);
+      }
+    }, 3000);
+  </script>
+  <script type="module" src="dist/src/main.js" onerror="window.__pmModuleLoadError=true" onload="window.__pmModuleLoaded=true"></script>
 </body>
 </html>

@@ -26,8 +26,8 @@ function createWindow(): void {
     show: false, // ロード完了まで非表示
   });
 
-  // 開発者ツールを開く（デバッグ用）
-  mainWindow.webContents.openDevTools();
+  // 開発者ツールを開く（デバッグ時のみ）
+  if (process.env.PM_DEV) mainWindow.webContents.openDevTools();
 
   // index.html をロード
   mainWindow.loadFile('index.html');

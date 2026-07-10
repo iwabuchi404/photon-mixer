@@ -41,7 +41,7 @@ export class FilterRenderer {
   }
 
   async init(width: number, height: number): Promise<void> {
-    const res = await fetch('shaders/filter.wgsl');
+    const res = await fetch('dist/shaders/filter.wgsl');
     if (!res.ok) throw new Error('Failed to load filter.wgsl');
     const module = this.device.createShaderModule({ code: await res.text() });
 

@@ -10,7 +10,7 @@ export class TransformRenderer {
   private sampler: GPUSampler;
   private readonly shaderPath: string;
 
-  constructor(device: GPUDevice, shaderPath = './shaders/transform.wgsl') {
+  constructor(device: GPUDevice, shaderPath = 'dist/shaders/transform.wgsl') {
     this.device = device;
     // uniform: array<vec4f,3>(48) + 4 floats(16) = 64 bytes
     this.uniformBuffer = device.createBuffer({

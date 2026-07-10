@@ -25,7 +25,7 @@ export class BlendRenderer {
   }
 
   async init(format: GPUTextureFormat): Promise<void> {
-    const res = await fetch('shaders/blend.wgsl');
+    const res = await fetch('dist/shaders/blend.wgsl');
     if (!res.ok) throw new Error('Failed to load blend.wgsl');
     const module = this.device.createShaderModule({ code: await res.text() });
 

@@ -57,12 +57,12 @@ export const PARAM_DEFS: Record<ParamKey, ParamDef> = {
   textureScale: { key: 'textureScale', kind: 'range', label: 'スケール', min: 1, max: 20, unit: 'x', default: 1,   apply: (v, e) => e.setTextureScale(v) },
   tolerance:    { key: 'tolerance',    kind: 'range', label: '許容値', min: 0, max: 100, unit: '%',  default: 0,   apply: (v, e) => e.setTolerance(v / 100) },
   mixMode:      {
-    key: 'mixMode', kind: 'select', label: '方式', default: 'stamp',
+    key: 'mixMode', kind: 'select', label: '方式', default: 'progressive',
     options: [['stamp', 'スタンプ'], ['progressive', '引きずり']],
     apply: (v, e) => e.setMixMode(v as BrushMixMode),
   },
   curve:        {
-    key: 'curve', kind: 'select', label: '筆圧', default: 'smooth',
+    key: 'curve', kind: 'select', label: '筆圧', default: 'linear',
     options: [['smooth', '標準'], ['linear', 'リニア'], ['ease-in', '入り遅'], ['ease-out', '入り早']],
     apply: (v, e) => e.setPressureCurve(v as PressureCurve),
   },

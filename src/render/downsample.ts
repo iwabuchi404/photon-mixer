@@ -12,7 +12,7 @@ export class DownsampleRenderer {
   }
 
   async init(): Promise<void> {
-    const response = await fetch('shaders/downsample.wgsl');
+    const response = await fetch('dist/shaders/downsample.wgsl');
     if (!response.ok) throw new Error('Failed to load downsample.wgsl');
     const module = this.device.createShaderModule({ code: await response.text() });
 

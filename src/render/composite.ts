@@ -33,7 +33,7 @@ export class CompositeRenderer {
   }
 
   async init(canvasFormat: GPUTextureFormat): Promise<void> {
-    const response = await fetch('shaders/composite.wgsl');
+    const response = await fetch('dist/shaders/composite.wgsl');
     if (!response.ok) throw new Error('Failed to load composite.wgsl');
     const module = this.device.createShaderModule({ code: await response.text() });
 

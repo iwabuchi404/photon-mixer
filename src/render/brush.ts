@@ -19,7 +19,7 @@ export interface BrushConfig {
 const DEFAULT_BRUSH_CONFIG: BrushConfig = {
   color: { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
   wetRatio: 0.0,
-  mixMode: 'stamp',
+  mixMode: 'progressive',
   usePointColor: false,
   useTexture: false,
   textureScale: 1.0,
@@ -49,7 +49,7 @@ export class BrushRenderer {
 
   private readonly maxPoints = 500000;
 
-  constructor(device: GPUDevice, config: Partial<BrushConfig> = {}, shaderPath = 'shaders/brush.wgsl') {
+  constructor(device: GPUDevice, config: Partial<BrushConfig> = {}, shaderPath = 'dist/shaders/brush.wgsl') {
     this.device = device;
     this.config = { ...DEFAULT_BRUSH_CONFIG, ...config };
     this.shaderPath = shaderPath;
