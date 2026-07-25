@@ -14,11 +14,9 @@ fn linear_to_oklab(c: vec3f) -> vec3f {
   let m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;
   let s = 0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b;
   
-  // pow(x, 1/3) は負の数でエラーになる可能性があるが、光量なので正を想定
-  // 安全のため max(0, x) を取る
-  let l_ = pow(max(0.0, l), 1.0/3.0);
-  let m_ = pow(max(0.0, m), 1.0/3.0);
-  let s_ = pow(max(0.0, s), 1.0/3.0);
+  let l_ = sign(l) * pow(abs(l), 1.0/3.0);
+  let m_ = sign(m) * pow(abs(m), 1.0/3.0);
+  let s_ = sign(s) * pow(abs(s), 1.0/3.0);
   
   return vec3f(
     0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
