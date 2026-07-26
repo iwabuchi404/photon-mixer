@@ -14,10 +14,19 @@ PhotonMixer（Electron + WebGPU 製のイラストソフト、v0.1.0リリース
   - `npm run build`: **成功**。`tsc` はエラー・警告ともに出力なし（クリーンコンパイル）。`shaders/` と `electron/preload.cjs` のコピーも正常完了。`dist/electron/main.js`、`dist/shaders/*.wgsl` の生成を確認。
   - コード修正は行っていない。ベースラインは健全であり、後続のアプリ起動確認・レビュータスクに進める状態。
 
-- [ ] ビルド済みアプリを起動してベースライン動作を確認する:
+- [x] ビルド済みアプリを起動してベースライン動作を確認する:
   - `scripts/verify-pen.mjs` など既存の `scripts/verify-*.mjs`（playwright-core の `_electron` で Electron を起動しスクリーンショットを撮るパターン）を参考に、アプリが正常に起動しメインウィンドウが表示されることを確認する
   - 起動時にコンソールエラーが出ていないか確認する
   - 起動直後のスクリーンショットを `screenshots/baseline-review.png` として保存する
+
+  **実行結果 (2026-07-26):**
+  - 既存の `verify-*.mjs` パターンを踏襲した `scripts/verify-baseline.mjs` を新規作成し、Electron 起動 → メインウィンドウ確認 → スクリーンショット保存を行った。
+  - **環境上の問題**: `playwright-core` が `package.json` の devDependencies に含まれておらず（`package-lock.json` にも存在せず、グローバルインストールも無し）、既存の `verify-*.mjs` 群も含めて起動不能な状態だった。`npm install --save-dev playwright-core` で追加インストールして解消。この依存関係欠落は開発ツール体制のギャップとして `docs/review/test-tooling.md`（後続タスク）に記録する。
+  - 起動結果: ウィンドウタイトル `PhotonMixer Phase 1`、URL `file:///D:/work/photon-mixer/index.html`、ウィンドウ数 1。`#canvas` 要素の存在を確認。
+  - WebGPU 状態: `{"hasGPU":true,"adapterOk":true,"errorMsg":null}` — アダプタ取得成功。
+  - コンソールエラー: **なし**（`console` の error イベント、`pageerror` イベントともに 0 件）。
+  - 起動直後は「新規キャンバス」作成ダイアログ（幅/高さ入力、既定 2000x2000px）が表示される仕様であることを確認。ブラシ設定パネル・カラーパイプラインUI（EV、露出、トーン、モード等）も正常に描画されている。
+  - スクリーンショットを `screenshots/baseline-review.png` に保存済み。
 
 - [ ] ペンエンジン・レンダリングコアをレビューする:
   - `src/pen/*.ts`（input, stabilization, interpolation, stroke）、`src/render/*.ts`、`src/core/*.ts`、`shaders/*.wgsl` を読み、`docs/spec.md` のペンエンジン仕様（補間・手ブレ補正・4xサブピクセルバッファ・スタンプ間隔等）と実装の整合性を確認する

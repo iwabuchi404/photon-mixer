@@ -20,6 +20,7 @@
     "cross-env": "^7.0.3",
     "electron": "^30.0.0",
     "electron-builder": "^24.13.3",
+    "playwright-core": "^1.62.0",
     "tsx": "^4.22.4",
     "typescript": "^5.4.0"
   },
