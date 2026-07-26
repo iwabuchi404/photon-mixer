@@ -28,10 +28,16 @@ PhotonMixer（Electron + WebGPU 製のイラストソフト、v0.1.0リリース
   - 起動直後は「新規キャンバス」作成ダイアログ（幅/高さ入力、既定 2000x2000px）が表示される仕様であることを確認。ブラシ設定パネル・カラーパイプラインUI（EV、露出、トーン、モード等）も正常に描画されている。
   - スクリーンショットを `screenshots/baseline-review.png` に保存済み。
 
-- [ ] ペンエンジン・レンダリングコアをレビューする:
+- [x] ペンエンジン・レンダリングコアをレビューする:
   - `src/pen/*.ts`（input, stabilization, interpolation, stroke）、`src/render/*.ts`、`src/core/*.ts`、`shaders/*.wgsl` を読み、`docs/spec.md` のペンエンジン仕様（補間・手ブレ補正・4xサブピクセルバッファ・スタンプ間隔等）と実装の整合性を確認する
   - 正確性の問題、エラーハンドリングの不足、デッドコード、仕様との乖離を洗い出す
   - `docs/review/pen-render-engine.md` に YAML front matter（`type: review-finding`, `title`, `created`, `tags: [review, pen-engine, rendering]`）付きで記録し、各問題に重要度（critical / minor / code-smell）を付ける
+
+  **実行結果 (2026-07-26):**
+  - `docs/review/pen-render-engine.md` を作成し、critical 3件・minor 1件・code-smell 2件を記録。
+  - 主な発見: (1) `src/render/pipeline.ts` の4xブラシバッファがキャンバス全体サイズで確保されており仕様の「ブラシ範囲のみ4x処理」に反しVRAM/性能面で問題（既定2000x2000キャンバスで約488MiB）。(2) `src/pen/interpolation.ts` の高速時先端予測が、区間の始点・終点が同一点に潰れるバグにより実質機能していない（仕様の「加速度考慮予測」が効いていない）。(3) `shaders/blend.wgsl` の Normal/Overlay ブレンドが仕様の「Oklab経由」「Oklab L軸判定」を満たしておらず単純RGB演算になっている。minor は手ブレ補正のα計算式が仕様の `clamp` 式と異なる点。code-smell は入力層のサンプリングレート吸収が未実装（検出のみでデッドコード）な点と、筆圧判定の冗長な条件式。
+  - 良好点（Catmull-Rom基本式、隔離ストロークバッファ、ダウンサンプルAA、筆圧非線形マッピング、Undo再レンダリング）も文書内に記録済み。
+  - コード修正は行っていない（レビューのみ、このタスクの範囲外）。
 
 - [ ] カラーパイプライン・選択範囲まわりをレビューする:
   - `src/color/*.ts`、`src/selection/*.ts`、`src/pmx.ts`、`src/autosave.ts` を読み、`docs/spec.md` のカラーパイプライン仕様（Oklab混色、float32リニア、Color EV、HDR、.pmx保存/読込のラウンドトリップ）との整合性を確認する
