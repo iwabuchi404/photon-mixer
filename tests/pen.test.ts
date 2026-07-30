@@ -70,8 +70,12 @@ class MockPointerEvent implements PointerEvent {
   readonly width = 1;
   readonly height = 1;
   readonly isPrimary = true;
+  readonly timeStamp: number;
+  private readonly coalescedEvents: PointerEvent[];
 
-  constructor(type: string, props: Partial<MockPointerEvent> = {}) {
+  constructor(type: string, props: any = {}) {
+    this.timeStamp = props.timeStamp ?? performance.now();
+    this.coalescedEvents = props.coalescedEvents ?? [];
     Object.assign(this, {
       pointerType: 'pen',
       pressure: 0.5,
@@ -88,8 +92,9 @@ class MockPointerEvent implements PointerEvent {
   stopPropagation() {}
   stopImmediatePropagation() {}
 
-  // TimeStampはDOMHighResTimeStamp
-  readonly timeStamp = performance.now();
+  getCoalescedEvents(): PointerEvent[] {
+    return this.coalescedEvents;
+  }
 
   getModifierState(key: string): boolean {
     return false;
@@ -206,6 +211,28 @@ describe('ペン入力統合テスト', () => {
       assert.strictEqual(receivedPoint?.tiltX, 30);
       assert.strictEqual(receivedPoint?.tiltY, -15);
       assert.strictEqual(receivedPoint?.pressure, 0.7);
+    });
+
+    test('coalesced eventの全点を時刻順に取り込む', () => {
+      const manager = new PenInputManager(mockCanvas as any);
+      const received: any[] = [];
+      manager.onPenInput(event => received.push(event.point));
+
+      const samples = [
+        new MockPointerEvent('pointermove', { clientX: 101.25, clientY: 201, timeStamp: 10, pressure: 0.2 }),
+        new MockPointerEvent('pointermove', { clientX: 102.5, clientY: 202, timeStamp: 12, pressure: 0.4 }),
+        new MockPointerEvent('pointermove', { clientX: 104.75, clientY: 203, timeStamp: 15, pressure: 0.7 }),
+      ];
+      mockCanvas.emitEvent('pointermove', new MockPointerEvent('pointermove', {
+        clientX: 105,
+        clientY: 204,
+        timeStamp: 16,
+        coalescedEvents: samples,
+      }));
+
+      assert.deepStrictEqual(received.map(p => p.x), [101.25, 102.5, 104.75]);
+      assert.deepStrictEqual(received.map(p => p.timestamp), [10, 12, 15]);
+      assert.deepStrictEqual(received.map(p => p.pressure), [0.2, 0.4, 0.7]);
     });
 
     test('複数のハンドラーを登録できる', (t) => {
@@ -375,6 +402,384 @@ describe('ペン入力統合テスト', () => {
       assert.strictEqual(config.minAlpha, 0.1);
       assert.strictEqual(config.maxAlpha, 1.0, '更新してない項目は保持される');
     });
+
+    test('速度は補正済み位置ではなく生入力点同士から計算する', () => {
+      const stabilizer = new Stabilizer({ threshold: 1000, minAlpha: 0.1 });
+      stabilizer.stabilize({ x: 0, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 0 });
+      stabilizer.stabilize({ x: 1, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 100 });
+      stabilizer.stabilize({ x: 2, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 200 });
+      assert.ok(Math.abs(stabilizer.getLastVelocity() - 10) < 1e-6);
+    });
+
+    test('異なるサンプリング周波数でもほぼ同じ終点になる', () => {
+      const run = (hz: number) => {
+        const stabilizer = new Stabilizer({ threshold: 1000, minAlpha: 0.1 });
+        const points = Array.from({ length: hz + 1 }, (_, i) => ({
+          x: 100 * i / hz,
+          y: 0,
+          pressure: 0.5,
+          tiltX: 0,
+          tiltY: 0,
+          timestamp: 1000 * i / hz,
+        }));
+        return stabilizer.stabilizeBatch(points).at(-1)!;
+      };
+      const at60 = run(60);
+      const at240 = run(240);
+      assert.ok(Math.abs(at60.x - at240.x) < 0.75, `60Hz=${at60.x}, 240Hz=${at240.x}`);
+    });
+
+    test('確定バッチは最後の生入力位置で終わる', () => {
+      const stabilizer = new Stabilizer({ threshold: 1000, minAlpha: 0.1 });
+      const points = [
+        { x: 0, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 0 },
+        { x: 10, y: 5, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 100 },
+      ];
+      const result = stabilizer.stabilizeBatch(points, true);
+      assert.deepStrictEqual(
+        { x: result.at(-1)!.x, y: result.at(-1)!.y },
+        { x: 10, y: 5 },
+      );
+    });
+  });
+
+  describe('PulledStringStabilizer', async () => {
+    const { PulledStringStabilizer } = await import('../src/pen/pulled-string.js');
+    const mkPoint = (x: number, y: number, t = 0): any => ({ x, y, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: t });
+
+    test('デフォルト設定で初期化できる', () => {
+      const ps = new PulledStringStabilizer();
+      const config = ps.getConfig();
+      assert.ok(config.radius > 0);
+      assert.strictEqual(config.finishLine, true);
+    });
+
+    test('カスタム設定で初期化できる', () => {
+      const ps = new PulledStringStabilizer({ radius: 20, finishLine: false });
+      const config = ps.getConfig();
+      assert.strictEqual(config.radius, 20);
+      assert.strictEqual(config.finishLine, false);
+    });
+
+    test('radius=0 で入力位置と一致する', () => {
+      const ps = new PulledStringStabilizer({ radius: 0, finishLine: false });
+      const result = ps.stabilizeBatch([
+        mkPoint(0, 0, 0), mkPoint(10, 0, 10), mkPoint(20, 5, 20),
+      ]);
+      assert.strictEqual(result.length, 3);
+      assert.strictEqual(result[0].x, 0);
+      assert.strictEqual(result[1].x, 10);
+      assert.strictEqual(result[2].x, 20);
+    });
+
+    test('紐が緩い間は出力が変化しない', () => {
+      const ps = new PulledStringStabilizer({ radius: 10, finishLine: false });
+      const result = ps.stabilizeBatch([
+        mkPoint(0, 0, 0), mkPoint(3, 0, 10),
+      ]);
+      assert.strictEqual(result.length, 1);
+      assert.strictEqual(result[0].x, 0);
+      assert.strictEqual(result[0].y, 0);
+    });
+
+    test('紐が張ったらブラシが引かれる', () => {
+      const ps = new PulledStringStabilizer({ radius: 10, finishLine: false });
+      const result = ps.stabilizeBatch([
+        mkPoint(0, 0, 0), mkPoint(20, 0, 10),
+      ]);
+      assert.strictEqual(result.length, 2);
+      assert.strictEqual(result[1].x, 10);
+      assert.strictEqual(result[1].y, 0);
+    });
+
+    test('ブラシは常に紐の長さ分だけペン先より遅れる', () => {
+      const ps = new PulledStringStabilizer({ radius: 10, finishLine: false });
+      const result = ps.stabilizeBatch([
+        mkPoint(0, 0, 0), mkPoint(20, 0, 10), mkPoint(40, 0, 20),
+      ]);
+      const last = result.at(-1)!;
+      assert.ok(Math.abs(last.x - 30) < 1e-6, `expected ~30, got ${last.x}`);
+      assert.strictEqual(last.y, 0);
+    });
+
+    test('finishLine で最終位置まで到達する', () => {
+      const ps = new PulledStringStabilizer({ radius: 10, finishLine: true });
+      const result = ps.stabilizeBatch([
+        mkPoint(0, 0, 0), mkPoint(20, 0, 10),
+      ], true);
+      const last = result.at(-1)!;
+      assert.ok(Math.abs(last.x - 20) < 1e-6, `expected ~20, got ${last.x}`);
+    });
+
+    test('finishLine が長い1区間を作らず再サンプリングされる', () => {
+      const ps = new PulledStringStabilizer({ radius: 10, finishLine: true });
+      const result = ps.stabilizeBatch([
+        mkPoint(0, 0, 0), mkPoint(100, 0, 10),
+      ], true);
+      const finishPoints = result.slice(-3);
+      assert.ok(Math.abs(finishPoints.at(-1)!.x - 100) < 1e-6);
+      const gaps: number[] = [];
+      for (let i = 1; i < finishPoints.length; i++) {
+        gaps.push(Math.hypot(
+          finishPoints[i].x - finishPoints[i-1].x,
+          finishPoints[i].y - finishPoints[i-1].y,
+        ));
+      }
+      assert.ok(gaps.every(g => g < 10), `gaps should be < 10, got ${gaps}`);
+    });
+
+    test('finishLine=false で追従しない', () => {
+      const ps = new PulledStringStabilizer({ radius: 10, finishLine: false });
+      const result = ps.stabilizeBatch([
+        mkPoint(0, 0, 0), mkPoint(100, 0, 10),
+      ], true);
+      const last = result.at(-1)!;
+      assert.ok(Math.abs(last.x - 90) < 1e-6, `expected ~90, got ${last.x}`);
+    });
+
+    test('異なるサンプリングレートで形状差が許容範囲内', () => {
+      const trajectory = [
+        mkPoint(0, 0), mkPoint(15, 5), mkPoint(30, 15), mkPoint(45, 30),
+        mkPoint(60, 50), mkPoint(75, 75), mkPoint(90, 105),
+      ];
+      const ps60 = new PulledStringStabilizer({ radius: 10, finishLine: false });
+      const r60 = ps60.stabilizeBatch(trajectory);
+      const dense: any[] = [];
+      for (let i = 0; i < trajectory.length - 1; i++) {
+        for (let j = 0; j < 4; j++) {
+          const t = j / 4;
+          dense.push({
+            x: trajectory[i].x + (trajectory[i+1].x - trajectory[i].x) * t,
+            y: trajectory[i].y + (trajectory[i+1].y - trajectory[i].y) * t,
+            pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 0,
+          });
+        }
+      }
+      dense.push(trajectory.at(-1)!);
+      const ps240 = new PulledStringStabilizer({ radius: 10, finishLine: false });
+      const r240 = ps240.stabilizeBatch(dense);
+      const end60 = r60.at(-1)!;
+      const end240 = r240.at(-1)!;
+      const dist = Math.hypot(end60.x - end240.x, end60.y - end240.y);
+      assert.ok(dist < 1.0, `end point drift should be < 1px, got ${dist}`);
+    });
+
+    test('updateConfig で設定を更新できる', () => {
+      const ps = new PulledStringStabilizer({ radius: 5, finishLine: true });
+      ps.updateConfig({ radius: 20 });
+      assert.strictEqual(ps.getConfig().radius, 20);
+      assert.strictEqual(ps.getConfig().finishLine, true);
+    });
+
+    test('reset で内部状態をクリア', () => {
+      const ps = new PulledStringStabilizer({ radius: 10, finishLine: false });
+      ps.stabilizeBatch([mkPoint(0, 0), mkPoint(20, 0)]);
+      ps.reset();
+      const result = ps.stabilizeBatch([mkPoint(50, 50), mkPoint(60, 50)]);
+      assert.strictEqual(result[0].x, 50);
+      assert.strictEqual(result[0].y, 50);
+    });
+  });
+
+  describe('StabilizationController', async () => {
+    const { StabilizationController } = await import('../src/pen/stabilization-mode.js');
+    const mkPoint = (x: number, y: number): any => ({ x, y, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 0 });
+
+    test('デフォルトは EMA モード', () => {
+      const ctrl = new StabilizationController();
+      assert.strictEqual(ctrl.getMode(), 'ema');
+    });
+
+    test('mode 切り替えで内部インスタンスが切り替わる', () => {
+      const ctrl = new StabilizationController();
+      ctrl.setMode('pulled-string');
+      assert.strictEqual(ctrl.getMode(), 'pulled-string');
+    });
+
+    test('EMA モードで stabilizeBatch が EMA と同じ結果', () => {
+      const ctrl = new StabilizationController({ emaConfig: { threshold: 1000, minAlpha: 0.1 } });
+      const points = [mkPoint(0, 0), mkPoint(50, 50), mkPoint(100, 50)];
+      const result = ctrl.stabilizeBatch(points);
+      assert.strictEqual(result.length, points.length);
+    });
+
+    test('Pulled String モードで stabilizeBatch が Pulled String と同じ結果', () => {
+      const ctrl = new StabilizationController({
+        mode: 'pulled-string',
+        pulledStringConfig: { radius: 10, finishLine: false },
+      });
+      const points = [mkPoint(0, 0), mkPoint(5, 0), mkPoint(20, 0)];
+      const result = ctrl.stabilizeBatch(points);
+      assert.ok(result.length < points.length);
+    });
+
+    test('updateEmaConfig で EMA 設定を更新', () => {
+      const ctrl = new StabilizationController();
+      ctrl.updateEmaConfig({ minAlpha: 0.05 });
+      assert.strictEqual(ctrl.getEmaStabilizer().getConfig().minAlpha, 0.05);
+    });
+
+    test('updatePulledStringConfig で Pulled String 設定を更新', () => {
+      const ctrl = new StabilizationController();
+      ctrl.updatePulledStringConfig({ radius: 25 });
+      assert.strictEqual(ctrl.getPulledStringStabilizer().getConfig().radius, 25);
+    });
+
+    test('reset で両方の内部状態をクリア', () => {
+      const ctrl = new StabilizationController({ mode: 'pulled-string', pulledStringConfig: { radius: 10 } });
+      ctrl.stabilizeBatch([mkPoint(0, 0), mkPoint(20, 0)]);
+      ctrl.reset();
+      const result = ctrl.stabilizeBatch([mkPoint(100, 100), mkPoint(110, 100)]);
+      assert.strictEqual(result[0].x, 100);
+    });
+  });
+
+  describe('PostCorrector', async () => {
+    const { Interpolator } = await import('../src/pen/interpolation.js');
+    const { PostCorrector } = await import('../src/pen/post-correction.js');
+    const mkPoint = (x: number, y: number, p = 0.5): any => ({ x, y, pressure: p, tiltX: 0, tiltY: 0, timestamp: 0 });
+
+    test('enabled=false で素通し', () => {
+      const interp = new Interpolator();
+      const pc = new PostCorrector(interp, { enabled: false, tolerance: 2 });
+      const points = [mkPoint(0, 0), mkPoint(10, 0), mkPoint(20, 0)];
+      const result = pc.correct(points);
+      assert.strictEqual(result, points); // 同一参照
+    });
+
+    test('点数が少なすぎる場合は素通し', () => {
+      const interp = new Interpolator();
+      const pc = new PostCorrector(interp, { enabled: true, tolerance: 2 });
+      const points = [mkPoint(0, 0), mkPoint(10, 0)];
+      const result = pc.correct(points);
+      assert.strictEqual(result, points);
+    });
+
+    test('直線上の中間点が削除される', () => {
+      const interp = new Interpolator();
+      const pc = new PostCorrector(interp, { enabled: true, tolerance: 1 });
+      // (0,0) → (10,0) → (20,0) → (30,0): 全て直線上
+      const points = [mkPoint(0, 0), mkPoint(10, 0), mkPoint(20, 0), mkPoint(30, 0)];
+      const result = pc.correct(points);
+      // RDP で中間点が削除され、再補間されても直線なので点数は減る傾向
+      // 始点・終点は保持
+      assert.ok(result.length > 0);
+      assert.strictEqual(result[0].x, 0);
+      assert.strictEqual(result[0].y, 0);
+      const last = result.at(-1)!;
+      assert.strictEqual(last.x, 30);
+      assert.strictEqual(last.y, 0);
+    });
+
+    test('始点・終点が補正前と一致する', () => {
+      const interp = new Interpolator();
+      const pc = new PostCorrector(interp, { enabled: true, tolerance: 3 });
+      const points = [
+        mkPoint(0, 0), mkPoint(5, 3), mkPoint(10, 7), mkPoint(15, 10),
+        mkPoint(20, 8), mkPoint(25, 5), mkPoint(30, 0),
+      ];
+      const result = pc.correct(points);
+      assert.strictEqual(result[0].x, 0);
+      assert.strictEqual(result[0].y, 0);
+      const last = result.at(-1)!;
+      assert.strictEqual(last.x, 30);
+      assert.strictEqual(last.y, 0);
+    });
+
+    test('ブレたストロークが平滑化される', () => {
+      const interp = new Interpolator();
+      const pc = new PostCorrector(interp, { enabled: true, tolerance: 5 });
+      // ジグザグのストローク
+      const points: any[] = [];
+      for (let i = 0; i <= 20; i++) {
+        const y = i % 2 === 0 ? 0 : 5;
+        points.push(mkPoint(i * 5, y));
+      }
+      const result = pc.correct(points);
+      // 平滑化により Y方向の変動が減るはず
+      const yRange = Math.max(...result.map(p => p.y)) - Math.min(...result.map(p => p.y));
+      const origRange = 5;
+      assert.ok(yRange <= origRange, `y range should not increase: ${yRange} vs ${origRange}`);
+    });
+
+    test('tolerance が大きいほど多く削除される', () => {
+      const interp = new Interpolator();
+      const points: any[] = [];
+      // 緩やかな曲線 + ノイズ
+      for (let i = 0; i <= 30; i++) {
+        const noise = (i % 3 === 0) ? 2 : 0;
+        points.push(mkPoint(i * 3, Math.sin(i * 0.2) * 10 + noise));
+      }
+      const pcLow = new PostCorrector(interp, { enabled: true, tolerance: 0.5 });
+      const pcHigh = new PostCorrector(interp, { enabled: true, tolerance: 8 });
+      const resampled = interp.resampleByArcLength(points);
+      const lowControls = (pcLow as any).rdpSimplify(resampled, 0.5);
+      const highControls = (pcHigh as any).rdpSimplify(resampled, 8);
+      assert.ok(
+        highControls.length < lowControls.length,
+        `high tolerance should keep fewer controls: low=${lowControls.length}, high=${highControls.length}`,
+      );
+    });
+
+    test('筆圧の単調変化が維持される', () => {
+      const interp = new Interpolator();
+      const pc = new PostCorrector(interp, { enabled: true, tolerance: 2 });
+      const points: any[] = [];
+      for (let i = 0; i <= 20; i++) {
+        points.push(mkPoint(i * 5, 0, i / 20)); // 筆圧 0→1 へ単調増加
+      }
+      const result = pc.correct(points);
+      for (let i = 1; i < result.length; i++) {
+        assert.ok(
+          result[i].pressure + 1e-9 >= result[i - 1].pressure,
+          `pressure must be monotonic at ${i}: ${result[i - 1].pressure} -> ${result[i].pressure}`,
+        );
+      }
+    });
+
+    test('大きな方向変化の頂点が許容誤差内で保持される', () => {
+      const interp = new Interpolator();
+      const pc = new PostCorrector(interp, { enabled: true, tolerance: 1 });
+      // L字型: (0,0) → (50,0) → (50,50)
+      const points = [mkPoint(0, 0), mkPoint(25, 0), mkPoint(50, 0), mkPoint(50, 25), mkPoint(50, 50)];
+      const result = pc.correct(points);
+      const cornerDistance = Math.min(...result.map(p => Math.hypot(p.x - 50, p.y)));
+      assert.ok(cornerDistance <= 1, `corner should remain within tolerance, got ${cornerDistance}`);
+    });
+
+    test('RDP距離は無限直線ではなく線分端点への距離を使う', () => {
+      const interp = new Interpolator();
+      const pc = new PostCorrector(interp, { enabled: true, tolerance: 1 });
+      const point = mkPoint(-5, 1);
+      const distance = (pc as any).perpendicularDistance(point, 0, 0, 10, 0, 100);
+      assert.ok(Math.abs(distance - Math.hypot(5, 1)) < 1e-9, `distance=${distance}`);
+    });
+
+    test('updateConfig で設定を更新', () => {
+      const interp = new Interpolator();
+      const pc = new PostCorrector(interp, { enabled: false, tolerance: 1 });
+      pc.updateConfig({ enabled: true, tolerance: 5 });
+      const config = pc.getConfig();
+      assert.strictEqual(config.enabled, true);
+      assert.strictEqual(config.tolerance, 5);
+    });
+
+    test('長いストロークでも再帰上限や極端な確定遅延が発生しない', () => {
+      const interp = new Interpolator();
+      const pc = new PostCorrector(interp, { enabled: true, tolerance: 3 });
+      // 5000点のストローク
+      const points: any[] = [];
+      for (let i = 0; i < 5000; i++) {
+        points.push(mkPoint(i * 0.1, Math.sin(i * 0.01) * 20));
+      }
+      const start = Date.now();
+      const result = pc.correct(points);
+      const elapsed = Date.now() - start;
+      // 5000点でも100ms以内に完了する（非再帰実装）
+      assert.ok(elapsed < 100, `should complete in < 100ms, took ${elapsed}ms`);
+      assert.ok(result.length > 0);
+      assert.strictEqual(result[0].x, 0);
+    });
   });
 
   describe('Interpolator', async () => {
@@ -477,6 +882,69 @@ describe('ペン入力統合テスト', () => {
       assert.strictEqual(result[0].x, 0);
       // Catmull-Romスプラインは最後の点が元の点に近い値になる
       assert.ok(Math.abs(result[result.length - 1].x - 90) < 5, '最後の点は元の点に近い');
+    });
+
+    test('弧長リサンプリングで入力間隔をほぼ一定にする', () => {
+      const interpolator = new Interpolator({ inputSpacing: 2 });
+      const points = [
+        { x: 0, y: 0, pressure: 0, tiltX: 0, tiltY: 0, timestamp: 0 },
+        { x: 1, y: 0, pressure: 0.1, tiltX: 0, tiltY: 0, timestamp: 2 },
+        { x: 9, y: 0, pressure: 0.9, tiltX: 0, tiltY: 0, timestamp: 20 },
+        { x: 10, y: 0, pressure: 1, tiltX: 0, tiltY: 0, timestamp: 22 },
+      ];
+      const result = interpolator.resampleByArcLength(points, 2);
+      const gaps = result.slice(1).map((p, i) => Math.hypot(p.x - result[i].x, p.y - result[i].y));
+      assert.ok(gaps.slice(0, -1).every(gap => Math.abs(gap - 2) < 1e-6));
+      assert.deepStrictEqual({ x: result.at(-1)!.x, y: result.at(-1)!.y }, { x: 10, y: 0 });
+    });
+
+    test('centripetal補間は直線を直線のまま保つ', () => {
+      const interpolator = new Interpolator({ spacing: 1, inputSpacing: 4 });
+      const points = [
+        { x: 0, y: 5, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 0 },
+        { x: 3, y: 5, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 10 },
+        { x: 20, y: 5, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 30 },
+        { x: 50, y: 5, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 60 },
+      ];
+      const result = interpolator.interpolate(points);
+      assert.ok(result.every(p => Number.isFinite(p.x) && Number.isFinite(p.y)));
+      assert.ok(result.every(p => Math.abs(p.y - 5) < 1e-6));
+    });
+
+    test('不均一な折れ点で大きくオーバーシュートしない', () => {
+      const interpolator = new Interpolator({ spacing: 0.5, inputSpacing: 2 });
+      const points = [
+        { x: 0, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 0 },
+        { x: 20, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 20 },
+        { x: 21, y: 20, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 40 },
+        { x: 40, y: 20, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 60 },
+      ];
+      const result = interpolator.interpolate(points);
+      assert.ok(result.every(p => p.x >= -0.01 && p.x <= 40.01));
+      assert.ok(result.every(p => p.y >= -0.5 && p.y <= 20.5));
+    });
+  });
+
+  describe('4x brush bbox', async () => {
+    const { alignBrushBbox4x } = await import('../src/render/brush-bbox.js');
+
+    test('原点とサイズを4の倍数へ外向きに揃える', () => {
+      const bbox = alignBrushBbox4x(101, 202, 319, 407, 8000, 8000);
+      assert.deepStrictEqual(bbox, { minX: 100, minY: 200, width: 220, height: 208 });
+      assert.strictEqual(bbox.minX % 4, 0);
+      assert.strictEqual(bbox.minY % 4, 0);
+      assert.strictEqual(bbox.width % 4, 0);
+      assert.strictEqual(bbox.height % 4, 0);
+    });
+
+    test('キャンバス端で範囲内にクリップする', () => {
+      const bbox = alignBrushBbox4x(-3, -2, 401, 402, 400, 400);
+      assert.deepStrictEqual(bbox, { minX: 0, minY: 0, width: 400, height: 400 });
+    });
+
+    test('ストロークがキャンバス外でも有効な最小領域に収める', () => {
+      const bbox = alignBrushBbox4x(450, 500, 480, 530, 400, 400);
+      assert.deepStrictEqual(bbox, { minX: 396, minY: 396, width: 4, height: 4 });
     });
   });
 

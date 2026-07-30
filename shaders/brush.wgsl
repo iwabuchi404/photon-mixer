@@ -17,6 +17,10 @@ struct Uniforms {
   _pad1: u32,
   _pad2: u32,
   _pad3: u32,
+  // ブラシ bbox（4x キャンバス座標系）。NDC マッピングのみに使用。
+  // canvas_uv は引き続き canvas_width/height（=キャンバス全体×4）で算出する。
+  bbox_origin: vec2f,    // bbox 原点（4x 座標）
+  bbox_size: vec2f,      // bbox サイズ（4x 座標）
 }
 
 // 点ごとのデータ: data=(x, y, size, pressure), color=(r, g, b, a)
@@ -106,8 +110,12 @@ fn vertex_main(@builtin(instance_index) instance_id: u32, @builtin(vertex_index)
   let offset = offsets[vertex_id] * size;
   let pos = center + offset;
 
-  let screen_x = (pos.x / uniforms.canvas_width) * 2.0 - 1.0;
-  let screen_y = 1.0 - (pos.y / uniforms.canvas_height) * 2.0;
+  // レンダーターゲットはブラシ bbox の 4x テクスチャ。
+  // bbox 内ローカル座標を NDC [-1,1] へ映射。bbox 外の頂点は自動的にクリップされる。
+  let local_x = (pos.x - uniforms.bbox_origin.x) / max(uniforms.bbox_size.x, 1.0);
+  let local_y = (pos.y - uniforms.bbox_origin.y) / max(uniforms.bbox_size.y, 1.0);
+  let screen_x = local_x * 2.0 - 1.0;
+  let screen_y = 1.0 - local_y * 2.0;
 
   var output: VertexOutput;
   output.position = vec4<f32>(screen_x, screen_y, 0.0, 1.0);

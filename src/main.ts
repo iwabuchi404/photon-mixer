@@ -4,8 +4,9 @@
 
 import { initRenderer } from './core/renderer.js';
 import { PenInputManager } from './pen/input.js';
-import { Stabilizer } from './pen/stabilization.js';
+import { StabilizationController } from './pen/stabilization-mode.js';
 import { Interpolator } from './pen/interpolation.js';
+import { PostCorrector } from './pen/post-correction.js';
 import { StrokeManager, StrokeHistory } from './pen/stroke.js';
 import { RenderPipeline } from './render/pipeline.js';
 import { PerfMonitor } from './ui/perf-monitor.js';
@@ -116,8 +117,9 @@ const TOOL_HINTS: Partial<Record<Tool, string>> = {
 class PhotonMixerApp {
   private renderer: Awaited<ReturnType<typeof initRenderer>> | null = null;
   private penInput: PenInputManager | null = null;
-  private stabilizer: Stabilizer;
+  private stabilizer: StabilizationController;
   private interpolator: Interpolator;
+  private postCorrector: PostCorrector;
   private strokeManager: StrokeManager;
   // レイヤーごとの Undo 履歴（Undo はアクティブレイヤーに作用）
   private layerHistories = new Map<string, StrokeHistory>();
@@ -158,10 +160,15 @@ class PhotonMixerApp {
   private committedSnapshot: { data: Uint16Array; bytesPerRow: number } | null = null;
 
   constructor() {
-    this.stabilizer = new Stabilizer({ threshold: 1000, minAlpha: 0.3 });
+    this.stabilizer = new StabilizationController({
+      mode: 'ema',
+      emaConfig: { threshold: 1000, minAlpha: 0.3 },
+      pulledStringConfig: { radius: 8, finishLine: true },
+    });
     // spacing=1: 4x バッファでダウンサンプルするため 1px でも GPU 負荷は低く品質が高い
     // 半透明ブラシで点線にならないためスタンプを密に配置する
     this.interpolator = new Interpolator({ spacing: 1, speedThreshold: 2000 });
+    this.postCorrector = new PostCorrector(this.interpolator);
     this.strokeManager = new StrokeManager({ baseSize: 2, maxSize: 20, curve: 'linear' });
     this.viewport = new Viewport();
     this.perfMonitor = new PerfMonitor();
@@ -738,10 +745,20 @@ class PhotonMixerApp {
           return;
         }
 
+        // pointerup位置も確定ストロークへ含める。moveの最終サンプルと離れている場合、
+        // ここを落とすと強い補正ほど線がペン位置の手前で終わってしまう。
+        const lastRaw = this.rawPoints[this.rawPoints.length - 1];
+        if (!lastRaw || Math.hypot(
+          transformedPoint.x - lastRaw.x,
+          transformedPoint.y - lastRaw.y,
+        ) > 0.01) {
+          this.rawPoints.push(transformedPoint);
+        }
+
         const erase = this.state.currentTool === 'eraser';
         if (this.usesSmudge()) {
           // 色付きの全点を over blend で committed へ確定（別ストロークと正しく合成）
-          const colored = this.buildColoredStroke();
+          const colored = this.buildColoredStroke(true);
           if (colored.length > 0) {
             this.renderPipeline?.commitStroke(colored);
             this.activeHistory().addRecord({ kind: 'stroke', points: colored, erase, alphaLock: this.renderPipeline?.getActiveLayerAlphaLock() ?? false });
@@ -749,8 +766,12 @@ class PhotonMixerApp {
           // 点ごとの色モードを解除
           this.renderPipeline?.updateBrushConfig({ usePointColor: false });
         } else {
-          const stabilized = this.stabilizer.stabilizeBatch(this.rawPoints);
-          const interpolated = this.interpolator.interpolate(stabilized);
+          const stabilized = this.stabilizer.stabilizeBatch(this.rawPoints, true);
+          // 後補正OFF時は生の補正点、ON時はRDP+Catmull-Rom済みの点列を返す。
+          // ON時に再度interpolateすると曲線が二重に丸まるため、ここでは一度だけ適用する。
+          const interpolated = this.postCorrector.getConfig().enabled
+            ? this.postCorrector.correct(stabilized)
+            : this.interpolator.interpolate(stabilized);
           const finalStroke = this.strokeManager.finalizeStroke(interpolated);
           if (finalStroke.length > 0) {
             // rebake 時に色を忠実に再現するため、各点に現在のブラシ色を焼き込む
@@ -1609,8 +1630,8 @@ class PhotonMixerApp {
    *   2. deposit = ブラシ色と smudge を wet で補間
    * 点ごとに色を持たせるため継ぎ目も色の階段も生じない
    */
-  private buildColoredStroke(): StrokePoint[] {
-    const stabilized = this.stabilizer.stabilizeBatch(this.rawPoints);
+  private buildColoredStroke(finishAtLastInput = false): StrokePoint[] {
+    const stabilized = this.stabilizer.stabilizeBatch(this.rawPoints, finishAtLastInput);
     const interpolated = this.interpolator.interpolate(stabilized);
     const stroke = this.strokeManager.finalizeStroke(interpolated);
     if (stroke.length === 0) return stroke;
@@ -1715,6 +1736,7 @@ class PhotonMixerApp {
     this.engineCtx = createEngineCtx({
       strokeManager: this.strokeManager,
       stabilizer: this.stabilizer,
+      postCorrector: this.postCorrector,
       getPipeline: () => this.renderPipeline,
       state: this.state,
     });
@@ -1850,6 +1872,28 @@ class PhotonMixerApp {
     };
     stabSlider?.addEventListener('input', () => applyStabilize(parseInt(stabSlider.value)));
     applyStabilize(parseInt(stabSlider.value)); // 初期値を反映
+
+    // 手ブレ補正方式（EMA / Pulled String）
+    const stabModeSel = document.getElementById('brush-stabilize-mode') as HTMLSelectElement;
+    stabModeSel?.addEventListener('change', () => {
+      this.engineCtx.setStabilizeMode(stabModeSel.value as 'ema' | 'pulled-string');
+    });
+
+    // 後補正（事後補正）のオン/オフ + 強度
+    const postCorrectCheck = document.getElementById('brush-post-correct') as HTMLInputElement;
+    const postCorrectSlider = document.getElementById('brush-post-correct-strength') as HTMLInputElement;
+    const postCorrectVal = document.getElementById('brush-post-correct-val')!;
+    const applyPostCorrect = () => {
+      const enabled = postCorrectCheck.checked;
+      const pct = parseInt(postCorrectSlider.value);
+      postCorrectVal.textContent = pct.toString();
+      postCorrectSlider.disabled = !enabled;
+      this.engineCtx.setPostCorrection(enabled);
+      this.engineCtx.setPostCorrectionStrength(pct);
+    };
+    postCorrectCheck?.addEventListener('change', applyPostCorrect);
+    postCorrectSlider?.addEventListener('input', applyPostCorrect);
+    applyPostCorrect();
 
     // 筆圧カーブ
     const curveSel = document.getElementById('pressure-curve') as HTMLSelectElement;

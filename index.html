@@ -377,9 +377,22 @@
         <span id="brush-wet-val" class="ctrl-val">0</span><span class="ctrl-unit">%</span>
       </div>
       <div class="ctrl-row" data-param="stabilize">
+        <span class="ctrl-label">補正方式</span>
+        <select id="brush-stabilize-mode" class="ctrl-select">
+          <option value="ema">EMA</option>
+          <option value="pulled-string">紐引き</option>
+        </select>
+      </div>
+      <div class="ctrl-row" data-param="stabilize">
         <span class="ctrl-label">補正</span>
         <input type="range" id="brush-stabilize" min="0" max="100" value="30">
         <span id="brush-stabilize-val" class="ctrl-val">30</span><span class="ctrl-unit">%</span>
+      </div>
+      <div class="ctrl-row" data-param="stabilize">
+        <span class="ctrl-label">後補正</span>
+        <input type="checkbox" id="brush-post-correct" style="flex:none;width:auto;">
+        <input type="range" id="brush-post-correct-strength" min="0" max="100" value="20" disabled>
+        <span id="brush-post-correct-val" class="ctrl-val">20</span><span class="ctrl-unit">%</span>
       </div>
       <div class="ctrl-row" data-param="curve">
         <span class="ctrl-label">筆圧</span>

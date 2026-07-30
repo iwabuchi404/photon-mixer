@@ -1,0 +1,947 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>手ブレ補正アルゴリズム図解 - PhotonMixer 調査</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --card: #181b22;
+    --border: #2a2f3a;
+    --text: #e6e6e6;
+    --muted: #8a93a6;
+    --accent: #6ea8fe;
+    --raw: #ff6b6b;
+    --smooth: #51cf66;
+    --pred: #ffd43b;
+    --pen: #6ea8fe;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Segoe UI', 'Hiragino Sans', sans-serif;
+    line-height: 1.7;
+    padding: 40px 20px;
+  }
+  .container { max-width: 1100px; margin: 0 auto; }
+  h1 {
+    font-size: 32px;
+    border-bottom: 2px solid var(--accent);
+    padding-bottom: 12px;
+    margin-bottom: 8px;
+  }
+  .subtitle { color: var(--muted); margin-bottom: 40px; font-size: 14px; }
+  .algo-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 28px;
+    margin-bottom: 28px;
+  }
+  .algo-card h2 {
+    margin-top: 0;
+    font-size: 22px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .algo-card h2 .num {
+    background: var(--accent);
+    color: #000;
+    width: 32px; height: 32px;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    font-weight: bold;
+  }
+  .algo-meta {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+  }
+  .tag {
+    background: #1e2530;
+    border: 1px solid var(--border);
+    padding: 3px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .tag.adopted { background: #1a3a2a; color: #51cf66; border-color: #2a5a3a; }
+  .tag.not-adopted { background: #3a1a1a; color: #ff6b6b; border-color: #5a2a2a; }
+  .diagram {
+    background: #0a0c10;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px;
+    margin: 20px 0;
+    text-align: center;
+  }
+  .diagram svg { max-width: 100%; height: auto; }
+  .diagram-caption {
+    color: var(--muted);
+    font-size: 13px;
+    margin-top: 8px;
+  }
+  .formula {
+    background: #0a0c10;
+    border-left: 3px solid var(--accent);
+    padding: 12px 16px;
+    margin: 16px 0;
+    font-family: 'Consolas', monospace;
+    font-size: 14px;
+    overflow-x: auto;
+  }
+  .pros-cons {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-top: 16px;
+  }
+  .pros, .cons {
+    padding: 14px;
+    border-radius: 8px;
+    font-size: 14px;
+  }
+  .pros { background: #0d2018; border: 1px solid #1a3a2a; }
+  .cons { background: #20180d; border: 1px solid #3a2a1a; }
+  .pros h4, .cons h4 { margin: 0 0 8px 0; font-size: 14px; }
+  .pros h4 { color: #51cf66; }
+  .cons h4 { color: #ffa94d; }
+  .pros ul, .cons ul { margin: 0; padding-left: 18px; }
+  .pros li, .cons li { margin-bottom: 4px; }
+  .used-by { margin-top: 12px; font-size: 13px; color: var(--muted); }
+  .used-by strong { color: var(--text); }
+  .legend {
+    display: flex;
+    gap: 20px;
+    justify-content: center;
+    margin: 20px 0;
+    flex-wrap: wrap;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+  }
+  .legend-item .swatch {
+    width: 20px; height: 3px;
+    border-radius: 2px;
+  }
+  .legend-item .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+  }
+  .summary-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 20px 0;
+    font-size: 13px;
+  }
+  .summary-table th, .summary-table td {
+    border: 1px solid var(--border);
+    padding: 8px 12px;
+    text-align: center;
+  }
+  .summary-table th {
+    background: #1e2530;
+    color: var(--accent);
+  }
+  .summary-table td.yes { color: #51cf66; }
+  .summary-table td.no { color: #ff6b6b; }
+  .summary-table td.partial { color: #ffd43b; }
+  .nav {
+    position: sticky;
+    top: 0;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 0;
+    margin: -40px -20px 30px -20px;
+    padding: 12px 20px;
+    z-index: 100;
+  }
+  .nav ul {
+    list-style: none;
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin: 0; padding: 0;
+    font-size: 13px;
+  }
+  .nav a {
+    color: var(--muted);
+    text-decoration: none;
+    transition: color 0.2s;
+  }
+  .nav a:hover { color: var(--accent); }
+  .intuition {
+    background: #0d1520;
+    border: 1px solid #1a2a3a;
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin: 16px 0;
+    font-size: 14px;
+  }
+  .intuition strong { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>手ブレ補正アルゴリズム図解</h1>
+<p class="subtitle">PhotonMixer 調査資料 / 2026-07-29 / 各手法の直感的理解と実装方式の比較</p>
+
+<div class="legend">
+  <div class="legend-item"><span class="swatch" style="background:var(--raw)"></span> 生の入力（手ブレあり）</div>
+  <div class="legend-item"><span class="swatch" style="background:var(--smooth)"></span> 補正後の出力</div>
+  <div class="legend-item"><span class="swatch" style="background:var(--pred)"></span> 予測点</div>
+  <div class="legend-item"><span class="dot" style="background:var(--pen)"></span> ペン先（カーソル）</div>
+</div>
+
+<nav class="nav">
+  <ul>
+    <li><a href="#ma">1. 移動平均</a></li>
+    <li><a href="#ema">2. EMA</a></li>
+    <li><a href="#gaussian">3. ガウシアン</a></li>
+    <li><a href="#pulled">4. Pulled String</a></li>
+    <li><a href="#inertia">5. Inertia</a></li>
+    <li><a href="#adaptive">6. 速度適応α</a></li>
+    <li><a href="#predict">7. 予測ストローク</a></li>
+    <li><a href="#post">8. 後補正</a></li>
+    <li><a href="#pressure">9. 筆圧平滑化</a></li>
+    <li><a href="#summary">比較表</a></li>
+  </ul>
+</nav>
+
+<!-- ========== 1. 移動平均 ========== -->
+<section class="algo-card" id="ma">
+  <h2><span class="num">1</span> 単純移動平均（Moving Average / FIR）</h2>
+  <div class="algo-meta">
+    <span class="tag not-adopted">PhotonMixer: 未採用</span>
+    <span class="tag">FIR フィルタ</span>
+    <span class="tag">O(1)〜O(N)</span>
+  </div>
+
+  <div class="intuition">
+    <strong>直感的理解:</strong> 過去 N 個の点の「重心」にブラシを引っ張る。窓からはみ出た古い点は忘れる。
+  </div>
+
+  <div class="formula">
+    output[i] = (input[i] + input[i-1] + ... + input[i-N+1]) / N
+  </div>
+
+  <div class="diagram">
+    <svg viewBox="0 0 600 220" width="600">
+      <!-- グリッド -->
+      <line x1="40" y1="110" x2="580" y2="110" stroke="#2a2f3a" stroke-width="1" stroke-dasharray="4,4"/>
+      <!-- 生入力（赤・ブレあり） -->
+      <polyline points="50,80 90,140 130,100 170,150 210,90 250,130 290,85 330,145 370,95 410,135 450,100 490,140 530,90 570,120"
+        fill="none" stroke="#ff6b6b" stroke-width="2" opacity="0.6"/>
+      <!-- 生入力の点 -->
+      <g fill="#ff6b6b">
+        <circle cx="50" cy="80" r="3"/><circle cx="90" cy="140" r="3"/><circle cx="130" cy="100" r="3"/>
+        <circle cx="170" cy="150" r="3"/><circle cx="210" cy="90" r="3"/><circle cx="250" cy="130" r="3"/>
+        <circle cx="290" cy="85" r="3"/><circle cx="330" cy="145" r="3"/><circle cx="370" cy="95" r="3"/>
+        <circle cx="410" cy="135" r="3"/><circle cx="450" cy="100" r="3"/><circle cx="490" cy="140" r="3"/>
+        <circle cx="530" cy="90" r="3"/><circle cx="570" cy="120" r="3"/>
+      </g>
+      <!-- 窓のハイライト（N=5） -->
+      <rect x="210" y="40" width="160" height="160" fill="#6ea8fe" opacity="0.08" stroke="#6ea8fe" stroke-width="1" stroke-dasharray="3,3"/>
+      <text x="290" y="55" fill="#6ea8fe" font-size="11" text-anchor="middle">窓 (N=5)</text>
+      <!-- 移動平均後（緑・滑らか） -->
+      <polyline points="50,80 90,120 130,116 170,117 210,113 250,111 290,109 330,110 370,110 410,111 450,113 490,116 530,115 570,113"
+        fill="none" stroke="#51cf66" stroke-width="2.5"/>
+      <!-- 矢印: 窓内の重心 -->
+      <circle cx="290" cy="109" r="5" fill="none" stroke="#51cf66" stroke-width="2"/>
+      <line x1="290" y1="85" x2="290" y2="104" stroke="#51cf66" stroke-width="1" stroke-dasharray="2,2" marker-end="url(#arrow-g)"/>
+      <defs>
+        <marker id="arrow-g" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" fill="#51cf66"/>
+        </marker>
+      </defs>
+      <text x="300" y="200" fill="#8a93a6" font-size="11">過去5点の重心 → 滑らかだが遅延する</text>
+    </svg>
+    <div class="diagram-caption">赤=生入力（手ブレ）、緑=移動平均後。窓内 N 点の重心を出力とする。</div>
+  </div>
+
+  <div class="pros-cons">
+    <div class="pros"><h4>メリット</h4><ul>
+      <li>実装が最もシンプル</li>
+      <li>窓サイズ N で直感的に強度調整</li>
+      <li>安定した平滑化</li>
+    </ul></div>
+    <div class="cons"><h4>デメリット</h4><ul>
+      <li>遅延が N/2 サンプル発生</li>
+      <li>窓内の全点を等価に扱う（最近の点も古い点も同じ重み）</li>
+      <li>鋭角が丸まる</li>
+    </ul></div>
+  </div>
+  <div class="used-by">採用: <strong>Krita Basic</strong>、<strong>LazyNezumi Moving Average</strong></div>
+</section>
+
+<!-- ========== 2. EMA ========== -->
+<section class="algo-card" id="ema">
+  <h2><span class="num">2</span> 指数移動平均（EMA / IIR）</h2>
+  <div class="algo-meta">
+    <span class="tag adopted">PhotonMixer: 採用済み</span>
+    <span class="tag">IIR フィルタ</span>
+    <span class="tag">O(1)</span>
+  </div>
+
+  <div class="intuition">
+    <strong>直感的理解:</strong> 「前の補正結果」と「新しい入力」を α:（1-α）で混ぜる。α が小さいほど古い結果を引きずる＝強い平滑化。過去すべての点が指数的に（遠ざかるほど薄れて）効く。
+  </div>
+
+  <div class="formula">
+    output[i] = α × input[i] + (1 - α) × output[i-1]<br>
+    α が小さい → 強い補正（遅延大）　／　α が大きい → 補正なし（遅延小）
+  </div>
+
+  <div class="diagram">
+    <svg viewBox="0 0 600 220" width="600">
+      <line x1="40" y1="110" x2="580" y2="110" stroke="#2a2f3a" stroke-width="1" stroke-dasharray="4,4"/>
+      <!-- 生入力 -->
+      <polyline points="50,80 90,140 130,100 170,150 210,90 250,130 290,85 330,145 370,95 410,135 450,100 490,140 530,90 570,120"
+        fill="none" stroke="#ff6b6b" stroke-width="2" opacity="0.5"/>
+      <g fill="#ff6b6b">
+        <circle cx="50" cy="80" r="3"/><circle cx="90" cy="140" r="3"/><circle cx="130" cy="100" r="3"/>
+        <circle cx="170" cy="150" r="3"/><circle cx="210" cy="90" r="3"/><circle cx="250" cy="130" r="3"/>
+        <circle cx="290" cy="85" r="3"/><circle cx="330" cy="145" r="3"/><circle cx="370" cy="95" r="3"/>
+        <circle cx="410" cy="135" r="3"/><circle cx="450" cy="100" r="3"/><circle cx="490" cy="140" r="3"/>
+        <circle cx="530" cy="90" r="3"/><circle cx="570" cy="120" r="3"/>
+      </g>
+      <!-- EMA出力 α=0.3 -->
+      <polyline points="50,80 90,98 130,99 170,110 210,106 250,113 290,106 330,116 370,110 410,117 450,112 490,120 530,114 570,116"
+        fill="none" stroke="#51cf66" stroke-width="2.5"/>
+      <!-- 混合の図示 -->
+      <circle cx="210" cy="106" r="4" fill="#51cf66"/>
+      <circle cx="210" cy="90" r="4" fill="#ff6b6b"/>
+      <line x1="210" y1="90" x2="210" y2="106" stroke="#ffd43b" stroke-width="1.5" stroke-dasharray="2,2"/>
+      <text x="220" y="85" fill="#ff6b6b" font-size="10">新しい入力</text>
+      <text x="220" y="112" fill="#51cf66" font-size="10">前の出力</text>
+      <text x="220" y="100" fill="#ffd43b" font-size="10">α=0.3 で混合</text>
+      <text x="300" y="200" fill="#8a93a6" font-size="11">α が小さいほど緑線は赤線から離れる（遅延↑）</text>
+    </svg>
+    <div class="diagram-caption">赤=生入力、緑=EMA出力（α=0.3）。各ステップで「前の出力」と「新入力」を混合。</div>
+  </div>
+
+  <div class="pros-cons">
+    <div class="pros"><h4>メリット</h4><ul>
+      <li>O(1) で計算量最小（過去全履歴不要）</li>
+      <li>α 一つで強度連続調整</li>
+      <li>直近の点を重視するので移動平均より遅延が少ない</li>
+      <li>無限の過去を指数減衰で考慮（自然な追従）</li>
+    </ul></div>
+    <div class="cons"><h4>デメリット</h4><ul>
+      <li>設定によっては遅延が目立つ</li>
+      <li>急な方向転換に弱い（慣性でオーバーシュート）</li>
+      <li>α が大きすぎると補正が効かない</li>
+    </ul></div>
+  </div>
+  <div class="used-by">採用: <strong>PhotonMixer</strong>、<strong>LazyNezumi EMA</strong></div>
+</section>
+
+<!-- ========== 3. ガウシアン ========== -->
+<section class="algo-card" id="gaussian">
+  <h2><span class="num">3</span> ガウシアン重み付き平均（Weighted Gaussian）</h2>
+  <div class="algo-meta">
+    <span class="tag not-adopted">PhotonMixer: 未採用</span>
+    <span class="tag">FIR フィルタ</span>
+    <span class="tag">O(N)</span>
+  </div>
+
+  <div class="intuition">
+    <strong>直感的理解:</strong> 移動平均の「窓内を平等に」を「中央に近いほど重く、遠いほど軽く」に変えた版。釣鐘型の重み付けで、より自然な平滑化ができる。
+  </div>
+
+  <div class="formula">
+    weight[j] = exp( -(j - center)² / (2σ²) )<br>
+    output[i] = Σ ( weight[j] × input[j] ) / Σ weight[j]
+  </div>
+
+  <div class="diagram">
+    <svg viewBox="0 0 600 280" width="600">
+      <!-- ガウスカーネルの図 -->
+      <text x="300" y="20" fill="#6ea8fe" font-size="13" text-anchor="middle">ガウシアンカーネル（釣鐘型の重み）</text>
+      <!-- 中央線 -->
+      <line x1="300" y1="40" x2="300" y2="140" stroke="#2a2f3a" stroke-width="1" stroke-dasharray="3,3"/>
+      <!-- ガウス曲線 -->
+      <path d="M 120,140 Q 180,140 210,120 Q 240,80 300,50 Q 360,80 390,120 Q 420,140 480,140"
+        fill="rgba(110,168,254,0.15)" stroke="#6ea8fe" stroke-width="2"/>
+      <!-- サンプル点 -->
+      <g>
+        <circle cx="160" cy="140" r="3" fill="#ff6b6b" opacity="0.3"/>
+        <circle cx="200" cy="138" r="3" fill="#ff6b6b" opacity="0.5"/>
+        <circle cx="240" cy="120" r="3" fill="#ff6b6b" opacity="0.7"/>
+        <circle cx="280" cy="70" r="3" fill="#ff6b6b"/>
+        <circle cx="300" cy="50" r="4" fill="#ff6b6b" stroke="#fff" stroke-width="1"/>
+        <circle cx="320" cy="70" r="3" fill="#ff6b6b" opacity="0.7"/>
+        <circle cx="360" cy="120" r="3" fill="#ff6b6b" opacity="0.5"/>
+        <circle cx="400" cy="138" r="3" fill="#ff6b6b" opacity="0.3"/>
+      </g>
+      <!-- 重みの線 -->
+      <line x1="160" y1="140" x2="160" y2="140" stroke="#6ea8fe" stroke-width="1"/>
+      <line x1="200" y1="138" x2="200" y2="138" stroke="#6ea8fe" stroke-width="1"/>
+      <text x="300" y="165" fill="#8a93a6" font-size="11" text-anchor="middle">中央の点が最も重く、遠い点は指数的に軽くなる</text>
+
+      <!-- 適用結果 -->
+      <line x1="40" y1="220" x2="580" y2="220" stroke="#2a2f3a" stroke-width="1" stroke-dasharray="4,4"/>
+      <polyline points="50,190 90,250 130,210 170,260 210,200 250,240 290,195 330,255 370,205 410,245 450,210 490,250 530,200 570,230"
+        fill="none" stroke="#ff6b6b" stroke-width="2" opacity="0.5"/>
+      <polyline points="50,190 90,215 130,220 170,225 210,222 250,220 290,218 330,220 370,220 410,222 450,222 490,225 530,222 570,222"
+        fill="none" stroke="#51cf66" stroke-width="2.5"/>
+      <text x="300" y="270" fill="#8a93a6" font-size="11" text-anchor="middle">移動平均より自然な曲線（角が丸まりすぎない）</text>
+    </svg>
+    <div class="diagram-caption">上: 釣鐘型の重み分布。下: 赤=生入力、緑=ガウシアン平滑化後。</div>
+  </div>
+
+  <div class="pros-cons">
+    <div class="pros"><h4>メリット</h4><ul>
+      <li>移動平均より自然な平滑化</li>
+      <li>直近の点を重視しつつ遠い点も考慮</li>
+      <li>角が丸まりすぎない</li>
+    </ul></div>
+    <div class="cons"><h4>デメリット</h4><ul>
+      <li>O(N) でサンプル履歴が必要</li>
+      <li>σ のチューニングが難しい</li>
+      <li>遅延は発生する</li>
+    </ul></div>
+  </div>
+  <div class="used-by">採用: <strong>Krita Weighted Smoothing</strong>（sigetch アルゴリズム改良版）</div>
+</section>
+
+<!-- ========== 4. Pulled String ========== -->
+<section class="algo-card" id="pulled">
+  <h2><span class="num">4</span> Pulled String（紐引き方式）</h2>
+  <div class="algo-meta">
+    <span class="tag not-adopted">PhotonMixer: 未採用</span>
+    <span class="tag">Dead Zone</span>
+    <span class="tag">O(1)</span>
+  </div>
+
+  <div class="intuition">
+    <strong>直感的理解:</strong> ブラシとペン先を「一定の長さの紐」で繋ぐ。ペン先が紐の半径内にいる間はブラシは動かない。紐が張ったときだけブラシが引っ張られて動く。止まると追いつく。
+  </div>
+
+  <div class="diagram">
+    <svg viewBox="0 0 600 280" width="600">
+      <!-- シーン1: 紐が緩い（描画しない） -->
+      <text x="150" y="25" fill="#8a93a6" font-size="12" text-anchor="middle">① 紐が緩い → 描画しない</text>
+      <!-- dead zone 円 -->
+      <circle cx="150" cy="80" r="40" fill="rgba(110,168,254,0.08)" stroke="#6ea8fe" stroke-width="1.5" stroke-dasharray="4,3"/>
+      <!-- ブラシ位置（中心） -->
+      <circle cx="150" cy="80" r="6" fill="#51cf66"/>
+      <text x="150" y="105" fill="#51cf66" font-size="10" text-anchor="middle">ブラシ</text>
+      <!-- ペン先（円内） -->
+      <circle cx="170" cy="70" r="5" fill="#6ea8fe"/>
+      <text x="185" y="65" fill="#6ea8fe" font-size="10">ペン先</text>
+      <!-- 紐（緩い） -->
+      <path d="M 150,80 Q 160,72 170,70" fill="none" stroke="#ffd43b" stroke-width="1.5" stroke-dasharray="2,2"/>
+      <text x="150" y="140" fill="#8a93a6" font-size="10" text-anchor="middle">半径内の移動は無視</text>
+
+      <!-- シーン2: 紐が張った（描画開始） -->
+      <text x="450" y="25" fill="#8a93a6" font-size="12" text-anchor="middle">② 紐が張った → ブラシが引かれる</text>
+      <circle cx="450" cy="80" r="40" fill="rgba(110,168,254,0.08)" stroke="#6ea8fe" stroke-width="1.5" stroke-dasharray="4,3"/>
+      <!-- ブラシ（移動後） -->
+      <circle cx="480" cy="80" r="6" fill="#51cf66"/>
+      <text x="480" y="105" fill="#51cf66" font-size="10" text-anchor="middle">ブラシ</text>
+      <!-- ペン先（円の端） -->
+      <circle cx="520" cy="80" r="5" fill="#6ea8fe"/>
+      <text x="535" y="85" fill="#6ea8fe" font-size="10">ペン先</text>
+      <!-- 張った紐 -->
+      <line x1="480" y1="80" x2="520" y2="80" stroke="#ffd43b" stroke-width="2"/>
+      <!-- 軌跡 -->
+      <polyline points="450,80 460,80 470,80 480,80" fill="none" stroke="#51cf66" stroke-width="2.5" opacity="0.5"/>
+      <text x="480" y="140" fill="#8a93a6" font-size="10" text-anchor="middle">紐の長さ＝半径を超えると描画</text>
+
+      <!-- シーン3: 鋭角が作れる -->
+      <text x="300" y="180" fill="#8a93a6" font-size="12" text-anchor="middle">③ 鋭い角も作れる（強み）</text>
+      <polyline points="200,240 280,240 280,210 320,210 320,240 400,240"
+        fill="none" stroke="#ff6b6b" stroke-width="2" opacity="0.4"/>
+      <polyline points="200,240 270,240 280,225 300,225 320,240 400,240"
+        fill="none" stroke="#51cf66" stroke-width="2.5"/>
+      <circle cx="280" cy="225" r="4" fill="none" stroke="#51cf66" stroke-width="2"/>
+      <circle cx="320" cy="225" r="4" fill="none" stroke="#51cf66" stroke-width="2"/>
+      <text x="300" y="270" fill="#8a93a6" font-size="11" text-anchor="middle">dead zone 内で方向転換 → 角が残る</text>
+    </svg>
+    <div class="diagram-caption">紐の半径=平滑化の強さ。半径内の小さな動きは無視され、鋭角が作れる。</div>
+  </div>
+
+  <div class="pros-cons">
+    <div class="pros"><h4>メリット</h4><ul>
+      <li>鋭い角を残せる（他の手法は角が丸まる）</li>
+      <li>直感的な動作（紐の長さ＝半径）</li>
+      <li>低速の精密作業に最適</li>
+      <li>停止時に自然に追従</li>
+    </ul></div>
+    <div class="cons"><h4>デメリット</h4><ul>
+      <li>高速な曲線描きには不向き</li>
+      <li>半径内で動かないと線が途切れる</li>
+      <li>動的な線には硬く感じる</li>
+    </ul></div>
+  </div>
+  <div class="used-by">採用: <strong>SAI S-1〜S-7（推測）</strong>、<strong>Photoshop Pulled String</strong>、<strong>LazyNezumi Pulled String</strong>、<strong>Krita Stabilizer</strong></div>
+</section>
+
+<!-- ========== 5. Inertia ========== -->
+<section class="algo-card" id="inertia">
+  <h2><span class="num">5</span> Inertia（慣性・物理シミュレーション）</h2>
+  <div class="algo-meta">
+    <span class="tag not-adopted">PhotonMixer: 未採用</span>
+    <span class="tag">物理シミュ</span>
+    <span class="tag">O(1)</span>
+  </div>
+
+  <div class="intuition">
+    <strong>直感的理解:</strong> ブラシに「質量」を持たせ、ペン先との距離を「力」として働かせる。ブラシは慣性で動き続け、drag（抗力）で減速する。弾むような自然な線になる。
+  </div>
+
+  <div class="formula">
+    force = (penPos - brushPos) × springK<br>
+    acceleration = force / mass - velocity × drag<br>
+    velocity += acceleration × dt<br>
+    brushPos += velocity × dt
+  </div>
+
+  <div class="diagram">
+    <svg viewBox="0 0 600 260" width="600">
+      <line x1="40" y1="130" x2="580" y2="130" stroke="#2a2f3a" stroke-width="1" stroke-dasharray="4,4"/>
+      <!-- 生入力 -->
+      <polyline points="50,100 90,160 130,105 170,165 210,95 250,150 290,90 330,160 370,100 410,155 450,105 490,150 530,95 570,140"
+        fill="none" stroke="#ff6b6b" stroke-width="2" opacity="0.5"/>
+      <!-- Inertia出力：弾むような滑らかな線 -->
+      <path d="M 50,110 Q 70,140 90,135 Q 130,110 170,140 Q 210,115 250,130 Q 290,108 330,135 Q 370,115 410,130 Q 450,118 490,130 Q 530,112 570,125"
+        fill="none" stroke="#51cf66" stroke-width="2.5"/>
+      <!-- 力の矢印 -->
+      <circle cx="250" cy="130" r="6" fill="#51cf66"/>
+      <text x="250" y="155" fill="#51cf66" font-size="10" text-anchor="middle">ブラシ(質量m)</text>
+      <circle cx="250" cy="90" r="5" fill="#6ea8fe"/>
+      <text x="250" y="80" fill="#6ea8fe" font-size="10" text-anchor="middle">ペン先</text>
+      <line x1="250" y1="90" x2="250" y2="124" stroke="#ffd43b" stroke-width="2" marker-end="url(#arrow-f)"/>
+      <defs>
+        <marker id="arrow-f" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" fill="#ffd43b"/>
+        </marker>
+      </defs>
+      <text x="270" y="110" fill="#ffd43b" font-size="10">力 = 距離 × ばね定数</text>
+      <!-- 速度ベクトル -->
+      <line x1="250" y1="130" x2="290" y2="125" stroke="#51cf66" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#arrow-v)"/>
+      <defs>
+        <marker id="arrow-v" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" fill="#51cf66"/>
+        </marker>
+      </defs>
+      <text x="310" y="123" fill="#51cf66" font-size="10">慣性(velocity)</text>
+      <text x="300" y="240" fill="#8a93a6" font-size="11" text-anchor="middle">ブラシが弾むように追従 → 流れるような線、遅延少なめ</text>
+    </svg>
+    <div class="diagram-caption">ペン先とブラシをばねで繋ぎ、ブラシに質量と抗力を与える。移動平均同等の平滑化をより少ない遅延で実現。</div>
+  </div>
+
+  <div class="pros-cons">
+    <div class="pros"><h4>メリット</h4><ul>
+      <li>移動平均同等の平滑化をより少ない遅延で実現</li>
+      <li>流れるような自然な線</li>
+      <li>筆圧を速度から自動生成（テーパリング）</li>
+      <li>書道・カリグラフィーに最適</li>
+    </ul></div>
+    <div class="cons"><h4>デメリット</h4><ul>
+      <li>パラメータが多い（mass, springK, drag）</li>
+      <li>チューニングが難しい</li>
+      <li>停止時に弾むことがある</li>
+    </ul></div>
+  </div>
+  <div class="used-by">採用: <strong>LazyNezumi Inertia</strong>（2023年追加）、<strong>CloverPaint</strong>（慣性運動タイプ）</div>
+</section>
+
+<!-- ========== 6. 速度適応α ========== -->
+<section class="algo-card" id="adaptive">
+  <h2><span class="num">6</span> 速度適応α（Speed-Adaptive Smoothing）</h2>
+  <div class="algo-meta">
+    <span class="tag adopted">PhotonMixer: 採用済み</span>
+    <span class="tag">EMA拡張</span>
+    <span class="tag">O(1)</span>
+  </div>
+
+  <div class="intuition">
+    <strong>直感的理解:</strong> EMA の α を固定値ではなく、ペンの速度に応じて動的に変える。ゆっくり描いている時は α を小さく（強い補正）、速く描いている時は α を大きく（補正を弱めて遅延を隠す）。
+  </div>
+
+  <div class="formula">
+    α = clamp(speed / threshold, minAlpha, maxAlpha)<br>
+    <span style="color:var(--muted)">低速 → α が小さい → 強い平滑化（ブレを消す）</span><br>
+    <span style="color:var(--muted)">高速 → α が大きい → 補正を弱める（遅延を隠す）</span>
+  </div>
+
+  <div class="diagram">
+    <svg viewBox="0 0 600 300" width="600">
+      <!-- αカーブ -->
+      <text x="300" y="20" fill="#6ea8fe" font-size="13" text-anchor="middle">α と速度の関係</text>
+      <!-- 軸 -->
+      <line x1="80" y1="140" x2="560" y2="140" stroke="#3a3f4a" stroke-width="1.5"/>
+      <line x1="80" y1="40" x2="80" y2="140" stroke="#3a3f4a" stroke-width="1.5"/>
+      <text x="60" y="45" fill="#8a93a6" font-size="11" text-anchor="end">α=1</text>
+      <text x="60" y="145" fill="#8a93a6" font-size="11" text-anchor="end">α=0</text>
+      <text x="80" y="160" fill="#8a93a6" font-size="11" text-anchor="middle">0</text>
+      <text x="560" y="160" fill="#8a93a6" font-size="11" text-anchor="middle">speed</text>
+      <text x="320" y="160" fill="#ffd43b" font-size="11" text-anchor="middle">threshold</text>
+      <!-- minAlpha ライン -->
+      <line x1="80" y1="110" x2="560" y2="110" stroke="#ff6b6b" stroke-width="1" stroke-dasharray="3,3" opacity="0.5"/>
+      <text x="75" y="113" fill="#ff6b6b" font-size="10" text-anchor="end">minα</text>
+      <!-- αカーブ（線形ランプ） -->
+      <polyline points="80,110 320,40 560,40" fill="none" stroke="#51cf66" stroke-width="2.5"/>
+      <!-- 領域色分け -->
+      <rect x="80" y="40" width="240" height="70" fill="rgba(81,207,102,0.08)"/>
+      <rect x="320" y="40" width="240" height="100" fill="rgba(255,107,107,0.08)"/>
+      <text x="200" y="130" fill="#51cf66" font-size="11" text-anchor="middle">低速＝強い補正</text>
+      <text x="440" y="130" fill="#ff6b6b" font-size="11" text-anchor="middle">高速＝補正なし</text>
+      <!-- threshold マーカー -->
+      <line x1="320" y1="40" x2="320" y2="140" stroke="#ffd43b" stroke-width="1" stroke-dasharray="2,2"/>
+
+      <!-- 適用イメージ -->
+      <text x="300" y="195" fill="#6ea8fe" font-size="13" text-anchor="middle">適用イメージ</text>
+      <line x1="40" y1="270" x2="580" y2="270" stroke="#2a2f3a" stroke-width="1" stroke-dasharray="4,4"/>
+      <!-- ゆっくり描いた部分（左）: 強い補正 -->
+      <polyline points="50,240 70,260 90,235 110,265 130,240 150,260 170,240"
+        fill="none" stroke="#ff6b6b" stroke-width="2" opacity="0.5"/>
+      <polyline points="50,245 90,248 130,252 170,250"
+        fill="none" stroke="#51cf66" stroke-width="2.5"/>
+      <text x="110" y="225" fill="#51cf66" font-size="10" text-anchor="middle">ゆっくり → 強く補正</text>
+      <!-- 速く描いた部分（右）: 軽い補正 -->
+      <polyline points="350,245 400,255 450,240 500,260 550,245"
+        fill="none" stroke="#ff6b6b" stroke-width="2" opacity="0.5"/>
+      <polyline points="350,246 400,253 450,242 500,258 550,246"
+        fill="none" stroke="#51cf66" stroke-width="2.5"/>
+      <text x="450" y="225" fill="#ff6b6b" font-size="10" text-anchor="middle">速く → 軽く補正</text>
+    </svg>
+    <div class="diagram-caption">上: α は速度に対して線形に立ち上がる。下: 低速部は強く平滑化、高速部は生入力に近い。</div>
+  </div>
+
+  <div class="pros-cons">
+    <div class="pros"><h4>メリット</h4><ul>
+      <li>「遅い時はブレを消す・速い時は遅延を隠す」を自動切替</li>
+      <li>ユーザーが状況に応じて補正を切り替える必要がない</li>
+      <li>EMA の上に乗せるだけ（実装が簡単）</li>
+    </ul></div>
+    <div class="cons"><h4>デメリット</h4><ul>
+      <li>threshold のチューニングが必要</li>
+      <li>中速域で補正が中途半端になることがある</li>
+      <li>マウス入力では速度が常に高めになりがち</li>
+    </ul></div>
+  </div>
+  <div class="used-by">採用: <strong>PhotonMixer</strong>、<strong>クリスタ</strong>（速度による手ブレ補正）、<strong>Krita Stabilizer</strong>（Max/Min Speed）、<strong>LazyNezumi Speed Smooth</strong></div>
+</section>
+
+<!-- ========== 7. 予測ストローク ========== -->
+<section class="algo-card" id="predict">
+  <h2><span class="num">7</span> 予測ストローク（Stroke Prediction）</h2>
+  <div class="algo-meta">
+    <span class="tag adopted">PhotonMixer: 実装済み（無効化中）</span>
+    <span class="tag">外挿予測</span>
+    <span class="tag">O(1)</span>
+  </div>
+
+  <div class="intuition">
+    <strong>直感的理解:</strong> 補正による遅延を隠すため、「ペンは次はこのへんに来るはず」と予測して先の線を仮描画する。実点が到着したら予測部分を差し替える。クリスタの「ストロークプレビュー」と同じ発想。
+  </div>
+
+  <div class="formula">
+    velocity = (lastPoint - prevPoint) / dt<br>
+    acceleration = (velocity - prevVelocity) / dt<br>
+    predictedPoint = lastPoint + velocity×dt + 0.5×acceleration×dt²
+  </div>
+
+  <div class="diagram">
+    <svg viewBox="0 0 600 240" width="600">
+      <line x1="40" y1="120" x2="580" y2="120" stroke="#2a2f3a" stroke-width="1" stroke-dasharray="4,4"/>
+      <!-- 実点（赤） -->
+      <polyline points="50,100 100,110 150,105 200,115 250,108 300,112"
+        fill="none" stroke="#ff6b6b" stroke-width="2.5"/>
+      <g fill="#ff6b6b">
+        <circle cx="50" cy="100" r="4"/><circle cx="100" cy="110" r="4"/>
+        <circle cx="150" cy="105" r="4"/><circle cx="200" cy="115" r="4"/>
+        <circle cx="250" cy="108" r="4"/><circle cx="300" cy="112" r="4"/>
+      </g>
+      <text x="175" y="90" fill="#ff6b6b" font-size="11" text-anchor="middle">実点（到着済み）</text>
+
+      <!-- 予測点（黄） -->
+      <circle cx="350" cy="114" r="5" fill="#ffd43b" stroke="#fff" stroke-width="1"/>
+      <circle cx="400" cy="116" r="4" fill="#ffd43b" opacity="0.6"/>
+      <circle cx="450" cy="118" r="3" fill="#ffd43b" opacity="0.3"/>
+      <!-- 予測線 -->
+      <polyline points="300,112 350,114 400,116 450,118"
+        fill="none" stroke="#ffd43b" stroke-width="2" stroke-dasharray="5,3"/>
+      <text x="400" y="100" fill="#ffd43b" font-size="11" text-anchor="middle">予測区間（仮描画）</text>
+
+      <!-- ペン先 -->
+      <circle cx="450" cy="118" r="6" fill="none" stroke="#6ea8fe" stroke-width="2"/>
+      <text x="465" y="122" fill="#6ea8fe" font-size="11">ペン先の現位置</text>
+
+      <!-- 速度ベクトル -->
+      <line x1="250" y1="108" x2="290" y2="111" stroke="#ffd43b" stroke-width="1.5" marker-end="url(#arrow-p)"/>
+      <defs>
+        <marker id="arrow-p" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" fill="#ffd43b"/>
+        </marker>
+      </defs>
+      <text x="270" y="135" fill="#ffd43b" font-size="10">速度ベクトル</text>
+
+      <!-- 差替え説明 -->
+      <text x="300" y="200" fill="#8a93a6" font-size="11" text-anchor="middle">実点が到着 → 予測部分を破棄 → 実点で再描画</text>
+      <text x="300" y="220" fill="#ff6b6b" font-size="11" text-anchor="middle">※「ストローク全体再描画」方式では予測点が毎フレーム変化してシャギーが出る</text>
+      <text x="300" y="235" fill="#51cf66" font-size="11" text-anchor="middle">→ PhotonMixer では現状 predict=false で運用（アーキ更新後に有効化）</text>
+    </svg>
+    <div class="diagram-caption">最後の実点から速度・加速度で予測点を外挿し、先の線を仮描画して遅延を隠す。</div>
+  </div>
+
+  <div class="pros-cons">
+    <div class="pros"><h4>メリット</h4><ul>
+      <li>補正による遅延を体感上隠せる</li>
+      <li>高速描画での追従性が改善</li>
+      <li>クリスタも採用（ストロークプレビュー）</li>
+    </ul></div>
+    <div class="cons"><h4>デメリット</h4><ul>
+      <li>予測が外れると線が揺らぐ（シャギー）</li>
+      <li>「先端だけ別描画して差し替え」方式が必要</li>
+      <li>「全体再描画」方式とは相性が悪い</li>
+    </ul></div>
+  </div>
+  <div class="used-by">採用: <strong>PhotonMixer</strong>（実装済・無効化中）、<strong>クリスタ</strong>（ストロークプレビュー）</div>
+</section>
+
+<!-- ========== 8. 後補正 ========== -->
+<section class="algo-card" id="post">
+  <h2><span class="num">8</span> 後補正（Post-Correction / 事後補正）</h2>
+  <div class="algo-meta">
+    <span class="tag not-adopted">PhotonMixer: 未採用</span>
+    <span class="tag">曲線フィッティング</span>
+    <span class="tag">O(N)〜O(N²)</span>
+  </div>
+
+  <div class="intuition">
+    <strong>直感的理解:</strong> リアルタイム補正とは全く違うアプローチ。ストロークを描き終わった後（ペンアップ時）に、線全体を見て「一番近い滑らかな曲線」に再構成する。「描いた後に線がシュッと整う」やつ。
+  </div>
+
+  <div class="diagram">
+    <svg viewBox="0 0 600 280" width="600">
+      <!-- ステップ1: 描画中（リアルタイム補正ありだがブレ残る） -->
+      <text x="150" y="25" fill="#8a93a6" font-size="12" text-anchor="middle">① 描画中（ブレあり）</text>
+      <polyline points="50,80 70,95 90,75 110,90 130,70 150,85 170,72 190,88 210,70 230,82 250,75"
+        fill="none" stroke="#ff6b6b" stroke-width="2.5"/>
+      <g fill="#ff6b6b">
+        <circle cx="50" cy="80" r="3"/><circle cx="90" cy="75" r="3"/><circle cx="130" cy="70" r="3"/>
+        <circle cx="170" cy="72" r="3"/><circle cx="210" cy="70" r="3"/><circle cx="250" cy="75" r="3"/>
+      </g>
+      <circle cx="250" cy="75" r="6" fill="none" stroke="#6ea8fe" stroke-width="2"/>
+      <text x="250" y="110" fill="#6ea8fe" font-size="10" text-anchor="middle">ペン先</text>
+
+      <!-- 矢印 -->
+      <text x="300" y="80" fill="#ffd43b" font-size="20">→</text>
+      <text x="300" y="100" fill="#8a93a6" font-size="10" text-anchor="middle">ペンアップ</text>
+
+      <!-- ステップ2: 後補正後 -->
+      <text x="450" y="25" fill="#8a93a6" font-size="12" text-anchor="middle">② 後補正後（シュッと整う）</text>
+      <!-- 元の点（薄く） -->
+      <g fill="#ff6b6b" opacity="0.25">
+        <circle cx="370" cy="80" r="3"/><circle cx="410" cy="75" r="3"/><circle cx="450" cy="70" r="3"/>
+        <circle cx="490" cy="72" r="3"/><circle cx="530" cy="70" r="3"/><circle cx="570" cy="75" r="3"/>
+      </g>
+      <!-- ベジェ近似曲線 -->
+      <path d="M 370,78 Q 410,72 450,71 Q 490,70 530,71 Q 560,73 570,75"
+        fill="none" stroke="#51cf66" stroke-width="3"/>
+      <text x="470" y="110" fill="#51cf66" font-size="10" text-anchor="middle">ベジェ曲線で再構成</text>
+
+      <!-- 下段: アルゴリズム比較 -->
+      <text x="300" y="160" fill="#6ea8fe" font-size="13" text-anchor="middle">主なアルゴリズム</text>
+
+      <text x="150" y="195" fill="#e6e6e6" font-size="12" text-anchor="middle">曲線フィッティング</text>
+      <text x="150" y="215" fill="#8a93a6" font-size="11" text-anchor="middle">点列に最も近いベジェ/B-splineを求解</text>
+      <text x="150" y="232" fill="#8a93a6" font-size="11" text-anchor="middle">→ 滑らかだが計算コスト高</text>
+
+      <text x="450" y="195" fill="#e6e6e6" font-size="12" text-anchor="middle">間引き + 補間</text>
+      <text x="450" y="215" fill="#8a93a6" font-size="11" text-anchor="middle">特徴点だけ残して曲線で補間</text>
+      <text x="450" y="232" fill="#8a93a6" font-size="11" text-anchor="middle">→ 角を保持しつつ滑らかに</text>
+    </svg>
+    <div class="diagram-caption">ペンアップ時に線全体を再平滑化。リアルタイム補正の弱点（ラグ・揺らぎ）を補完。</div>
+  </div>
+
+  <div class="pros-cons">
+    <div class="pros"><h4>メリット</h4><ul>
+      <li>線全体を見られるので最も精度が高い</li>
+      <li>リアルタイム補正の遅延・揺らぎを気にしなくてよい</li>
+      <li>「描いた後にシュッと整う」体験が気持ちいい</li>
+      <li>角を保持しつつ滑らかにできる</li>
+    </ul></div>
+    <div class="cons"><h4>デメリット</h4><ul>
+      <li>リアルタイムではない（確定後の補正）</li>
+      <li>計算コストが高い（特に曲線フィッティング）</li>
+      <li>実装が複雑</li>
+      <li>細かい描き込みには不向き</li>
+    </ul></div>
+  </div>
+  <div class="used-by">採用: <strong>クリスタ</strong>（後補正）、<strong>ibisPaint</strong>（事後補正）、<strong>SAI</strong>（ペン入れレイヤーのベジェ変換）</div>
+</section>
+
+<!-- ========== 9. 筆圧平滑化 ========== -->
+<section class="algo-card" id="pressure">
+  <h2><span class="num">9</span> 筆圧平滑化（Pressure Smoothing）</h2>
+  <div class="algo-meta">
+    <span class="tag not-adopted">PhotonMixer: 未採用</span>
+    <span class="tag">EMA / 移動平均</span>
+    <span class="tag">O(1)</span>
+  </div>
+
+  <div class="intuition">
+    <strong>直感的理解:</strong> 位置の平滑化と同じことを筆圧にも適用する。安価なタブレットでは筆圧センサーがノイズを含むことが多く、太さがブレるのを防ぐ。
+  </div>
+
+  <div class="diagram">
+    <svg viewBox="0 0 600 240" width="600">
+      <!-- 筆圧グラフ -->
+      <text x="300" y="20" fill="#6ea8fe" font-size="13" text-anchor="middle">筆圧の時間変化</text>
+      <!-- 軸 -->
+      <line x1="60" y1="200" x2="580" y2="200" stroke="#3a3f4a" stroke-width="1.5"/>
+      <line x1="60" y1="40" x2="60" y2="200" stroke="#3a3f4a" stroke-width="1.5"/>
+      <text x="50" y="45" fill="#8a93a6" font-size="10" text-anchor="end">1.0</text>
+      <text x="50" y="205" fill="#8a93a6" font-size="10" text-anchor="end">0.0</text>
+      <text x="60" y="220" fill="#8a93a6" font-size="10" text-anchor="middle">開始</text>
+      <text x="580" y="220" fill="#8a93a6" font-size="10" text-anchor="middle">終了</text>
+
+      <!-- 生筆圧（ノイズあり） -->
+      <polyline points="60,180 90,170 120,175 150,160 180,165 210,150 240,155 270,140 300,148 330,130 360,138 390,120 420,128 450,110 480,118 510,100 540,108 570,95"
+        fill="none" stroke="#ff6b6b" stroke-width="2" opacity="0.6"/>
+      <text x="300" y="60" fill="#ff6b6b" font-size="11" text-anchor="middle">生筆圧（ノイズでガタガタ）</text>
+
+      <!-- 平滑化後 -->
+      <polyline points="60,180 90,175 120,172 150,168 180,163 210,158 240,153 270,148 300,143 330,136 360,132 390,126 420,122 450,116 480,112 510,107 540,103 570,99"
+        fill="none" stroke="#51cf66" stroke-width="2.5"/>
+      <text x="300" y="235" fill="#51cf66" font-size="11" text-anchor="middle">平滑化後（EMA α=0.3）</text>
+
+      <!-- 太さのイメージ -->
+      <text x="300" y="80" fill="#8a93a6" font-size="11" text-anchor="middle">→ 線の太さがブレない</text>
+    </svg>
+    <div class="diagram-caption">筆圧センサーのノイズをEMA等で平滑化。線の太さが安定する。</div>
+  </div>
+
+  <div class="pros-cons">
+    <div class="pros"><h4>メリット</h4><ul>
+      <li>安価なタブレットで効果絶大</li>
+      <li>実装が簡単（位置のEMAと同じロジック）</li>
+      <li>線の太さが安定</li>
+      <li>オン/オフ切り替え可能</li>
+    </ul></div>
+    <div class="cons"><h4>デメリット</h4><ul>
+      <li>筆圧の素早い変化が鈍る</li>
+      <li>テーパリング（先細り）が弱くなる</li>
+      <li>高級タブレットでは不要なことが多い</li>
+    </ul></div>
+  </div>
+  <div class="used-by">採用: <strong>Krita</strong>（Smooth Pressure オプション）、<strong>LazyNezumi</strong>（4つの筆圧モード）</div>
+</section>
+
+<!-- ========== サマリー表 ========== -->
+<section class="algo-card" id="summary">
+  <h2>比較サマリー表</h2>
+  <table class="summary-table">
+    <thead>
+      <tr>
+        <th>手法</th>
+        <th>遅延</th>
+        <th>角の保持</th>
+        <th>実装コスト</th>
+        <th>PhotonMixer</th>
+        <th>主な採用ソフト</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>移動平均</td>
+        <td>中</td>
+        <td class="no">✗</td>
+        <td>低</td>
+        <td class="no">✗</td>
+        <td>Krita Basic, LazyNezumi MA</td>
+      </tr>
+      <tr>
+        <td>EMA</td>
+        <td>小〜中</td>
+        <td class="no">✗</td>
+        <td>低</td>
+        <td class="yes">✓</td>
+        <td><strong>PhotonMixer</strong>, LazyNezumi EMA</td>
+      </tr>
+      <tr>
+        <td>ガウシアン</td>
+        <td>中</td>
+        <td class="partial">△</td>
+        <td>中</td>
+        <td class="no">✗</td>
+        <td>Krita Weighted</td>
+      </tr>
+      <tr>
+        <td>Pulled String</td>
+        <td>大（動的）</td>
+        <td class="yes">✓</td>
+        <td>中</td>
+        <td class="no">✗</td>
+        <td>SAI S系, Photoshop, LazyNezumi, Krita</td>
+      </tr>
+      <tr>
+        <td>Inertia</td>
+        <td>小</td>
+        <td class="no">✗</td>
+        <td>中</td>
+        <td class="no">✗</td>
+        <td>LazyNezumi Inertia, CloverPaint</td>
+      </tr>
+      <tr>
+        <td>速度適応α</td>
+        <td>動的</td>
+        <td class="partial">△</td>
+        <td>低</td>
+        <td class="yes">✓</td>
+        <td><strong>PhotonMixer</strong>, クリスタ, Krita, LazyNezumi</td>
+      </tr>
+      <tr>
+        <td>予測ストローク</td>
+        <td>隠蔽</td>
+        <td>—</td>
+        <td>中</td>
+        <td class="partial">△(無効化中)</td>
+        <td><strong>PhotonMixer</strong>, クリスタ</td>
+      </tr>
+      <tr>
+        <td>後補正</td>
+        <td>なし（事後）</td>
+        <td class="yes">✓</td>
+        <td>高</td>
+        <td class="no">✗</td>
+        <td>クリスタ, ibisPaint, SAIペン入れ</td>
+      </tr>
+      <tr>
+        <td>筆圧平滑化</td>
+        <td>—</td>
+        <td>—</td>
+        <td>低</td>
+        <td class="no">✗</td>
+        <td>Krita, LazyNezumi</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="intuition" style="margin-top:24px">
+    <strong>PhotonMixer の現状:</strong> EMA + 速度適応α + 予測ストローク（無効化中）+ 終点収束 + サンプリングレート吸収。<br>
+    主要ソフトの中でも基本機能は網羅している。次に足りないのは <strong>Pulled String</strong>（精密線画用）と <strong>後補正</strong>（仕上げ用）と <strong>筆圧平滑化</strong>（安価タブレット用）。
+  </div>
+</section>
+
+</div>
+</body>
+</html>

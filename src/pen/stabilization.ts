@@ -28,8 +28,12 @@ const DEFAULT_CONFIG: StabilizationConfig = {
  */
 export class Stabilizer {
   private config: StabilizationConfig;
-  private lastPoint: PointerPoint | null = null;
+  /** 速度計算用。補正結果ではなく直前の生入力を保持する。 */
+  private lastRawPoint: PointerPoint | null = null;
+  /** EMAの直前出力。 */
+  private lastOutputPoint: PointerPoint | null = null;
   private lastVelocity: number = 0;
+  private static readonly NOMINAL_INTERVAL_MS = 1000 / 120;
 
   constructor(config: Partial<StabilizationConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -40,41 +44,56 @@ export class Stabilizer {
    */
   stabilize(point: PointerPoint): PointerPoint {
     // 最初の点はそのまま返す
-    if (!this.lastPoint) {
-      this.lastPoint = point;
+    if (!this.lastRawPoint || !this.lastOutputPoint) {
+      this.lastRawPoint = point;
+      this.lastOutputPoint = point;
       return point;
     }
 
-    // 速度を計算
-    const velocity = this.calculateVelocity(this.lastPoint, point);
+    // 速度は補正済みの遅れた点ではなく、生入力点同士から計算する。
+    const velocity = this.calculateVelocity(this.lastRawPoint, point);
     this.lastVelocity = velocity;
 
-    // αを決定（速度に応じて）
-    const alpha = this.calculateAlpha(velocity);
+    // 基準αをサンプル間隔に合わせて時間補正する。120Hz相当を基準にすることで、
+    // 入力デバイスのサンプリング周波数が変わってもフィルターの時定数を保つ。
+    const baseAlpha = this.calculateAlpha(velocity);
+    const dt = Math.max(0, point.timestamp - this.lastRawPoint.timestamp);
+    const alpha = this.timeAdjustedAlpha(baseAlpha, dt);
 
     // EMAフィルター適用
     const stabilized: PointerPoint = {
-      x: this.ema(this.lastPoint.x, point.x, alpha),
-      y: this.ema(this.lastPoint.y, point.y, alpha),
+      x: this.ema(this.lastOutputPoint.x, point.x, alpha),
+      y: this.ema(this.lastOutputPoint.y, point.y, alpha),
       pressure: point.pressure, // 筆圧は補正しない
       tiltX: point.tiltX,
       tiltY: point.tiltY,
       timestamp: point.timestamp,
     };
 
-    this.lastPoint = stabilized;
+    this.lastRawPoint = point;
+    this.lastOutputPoint = stabilized;
     return stabilized;
   }
 
   /**
    * 複数の点を補正（バッチ処理）
    */
-  stabilizeBatch(points: PointerPoint[]): PointerPoint[] {
+  stabilizeBatch(points: PointerPoint[], finishAtLastInput = false): PointerPoint[] {
     this.reset(); // バッチ処理の前にリセット
     const result: PointerPoint[] = [];
 
     for (const point of points) {
       result.push(this.stabilize(point));
+    }
+
+    // ペンアップ確定時は、EMAの遅延で線が途中で止まらないよう最後の生入力へ収束させる。
+    // 補正点を置換せず終端点を追加し、補間側が自然な接続を生成できるようにする。
+    if (finishAtLastInput && points.length > 0 && result.length > 0) {
+      const rawEnd = points[points.length - 1];
+      const filteredEnd = result[result.length - 1];
+      if (Math.hypot(rawEnd.x - filteredEnd.x, rawEnd.y - filteredEnd.y) > 0.01) {
+        result.push({ ...rawEnd });
+      }
     }
 
     return result;
@@ -99,14 +118,19 @@ export class Stabilizer {
    * 高速時: 大きいα（補正なし）
    */
   private calculateAlpha(velocity: number): number {
-    // 速度 / 閾値で0-1の範囲に正規化
-    const normalized = Math.min(velocity / this.config.threshold, 1.0);
+    const ratio = this.config.threshold > 0 ? velocity / this.config.threshold : 1;
+    return Math.max(this.config.minAlpha, Math.min(this.config.maxAlpha, ratio));
+  }
 
-    // minAlpha - maxAlpha の範囲にマッピング
-    const alpha =
-      this.config.minAlpha + normalized * (this.config.maxAlpha - this.config.minAlpha);
-
-    return alpha;
+  /**
+   * 基準間隔におけるαを、実際の経過時間へ変換する。
+   * 1 - (1 - α)^(dt / nominalDt) は、連続時間で同じ減衰率を保つ。
+   */
+  private timeAdjustedAlpha(baseAlpha: number, dtMs: number): number {
+    if (baseAlpha >= 1) return 1;
+    if (dtMs <= 0) return 0;
+    const intervals = dtMs / Stabilizer.NOMINAL_INTERVAL_MS;
+    return 1 - Math.pow(1 - baseAlpha, intervals);
   }
 
   /**
@@ -121,7 +145,8 @@ export class Stabilizer {
    * 内部状態をリセット
    */
   reset(): void {
-    this.lastPoint = null;
+    this.lastRawPoint = null;
+    this.lastOutputPoint = null;
     this.lastVelocity = 0;
   }
 

@@ -1,29 +1,27 @@
 /**
- * Catmull-Rom スプライン補間
- * 入力点間の滑らかな補間点を生成
+ * 弧長リサンプリング + centripetal Catmull-Rom 補間
+ *
+ * 入力イベントの密度に依存せず、太い線でも曲率が不均一になりにくい
+ * 中心軌跡を生成する。
  */
 
 import type { PointerPoint } from './input.js';
 
-/**
- * 補間設定
- */
 export interface InterpolationConfig {
-  spacing: number;       // 基本補間間隔（px）
-  speedThreshold: number; // 高速判定閾値（px/sec）
+  /** 最終的な描画点の目標間隔（px） */
+  spacing: number;
+  /** Catmull-Romへ渡す制御点を揃える間隔（px） */
+  inputSpacing: number;
+  /** 高速先端予測を行う速度閾値（px/sec） */
+  speedThreshold: number;
 }
 
-/**
- * デフォルト設定
- */
 const DEFAULT_CONFIG: InterpolationConfig = {
-  spacing: 4,        // 4px間隔で補間
-  speedThreshold: 2000, // 2000px/sec以上で高速とみなす
+  spacing: 4,
+  inputSpacing: 2,
+  speedThreshold: 2000,
 };
 
-/**
- * Catmull-Rom 補間クラス
- */
 export class Interpolator {
   private config: InterpolationConfig;
 
@@ -32,159 +30,230 @@ export class Interpolator {
   }
 
   /**
-   * 点列間を補間
-   * @param points 入力点列（少なくとも2点必要）
-   * @returns 補間された点列
+   * 点列を一定弧長へ揃えてからcentripetal Catmull-Romで補間する。
+   *
+   * predict=true は将来の「末尾1区間だけ仮描画」用。現在のライブ描画では
+   * ストローク全体を再描画するため、呼び出し側はfalseのまま使用する。
    */
-  interpolate(points: PointerPoint[]): PointerPoint[] {
-    if (points.length < 2) {
-      return points; // 補間不可
-    }
+  interpolate(points: PointerPoint[], predict = false): PointerPoint[] {
+    if (points.length < 2) return points.map(p => ({ ...p }));
 
-    const result: PointerPoint[] = [points[0]];
-
-    for (let i = 0; i < points.length - 1; i++) {
-      const p0 = points[Math.max(0, i - 1)];
-      const p1 = points[i];
-      const p2 = points[i + 1];
-      const p3 = points[Math.min(points.length - 1, i + 2)];
-
-      // 区間の速度を計算
-      const velocity = this.calculateVelocity(p1, p2);
-      const isHighSpeed = velocity > this.config.speedThreshold;
-
-      // 高速時は予測描画用の仮点を追加
-      if (isHighSpeed && i === points.length - 2) {
-        // 最後の区間のみ先端予測
-        const predictedPoints = this.interpolateSegment(
-          p1,
-          p2,
-          p3,
-          p2, // p3は次の点がないのでp2で代用
-          true,
-        );
-        result.push(...predictedPoints);
-      } else {
-        // 通常の補間
-        const segmentPoints = this.interpolateSegment(p0, p1, p2, p3, false);
-        result.push(...segmentPoints.slice(1)); // 最初の点は重複するのでスキップ
+    const source = points.map(p => ({ ...p }));
+    if (predict) {
+      const last = source[source.length - 1];
+      const prev = source[source.length - 2];
+      if (this.calculateVelocity(prev, last) > this.config.speedThreshold) {
+        const predicted = this.predictNextPoint(source);
+        if (predicted) source.push(predicted);
       }
     }
 
+    const controls = this.resampleByArcLength(source, this.config.inputSpacing);
+    if (controls.length < 2) return controls;
+
+    const result: PointerPoint[] = [{ ...controls[0] }];
+    for (let i = 0; i < controls.length - 1; i++) {
+      const p1 = controls[i];
+      const p2 = controls[i + 1];
+      const p0 = i > 0
+        ? controls[i - 1]
+        : this.extrapolateEndpoint(p1, p2);
+      const p3 = i + 2 < controls.length
+        ? controls[i + 2]
+        : this.extrapolateEndpoint(p2, p1);
+
+      const segment = this.interpolateSegment(p0, p1, p2, p3);
+      result.push(...segment.slice(1));
+    }
+
+    // 浮動小数誤差が累積しても、確定ストロークの終端は入力終端と一致させる。
+    result[result.length - 1] = { ...source[source.length - 1] };
     return result;
   }
 
   /**
-   * 単一区間の補間
+   * 入力点を一定距離間隔へ並べ直す。区間をまたぐ余り距離を保持するため、
+   * 元イベントの間隔が不均一でも出力密度は均一になる。
    */
+  resampleByArcLength(points: PointerPoint[], spacing = this.config.inputSpacing): PointerPoint[] {
+    if (points.length < 2 || spacing <= 0) return points.map(p => ({ ...p }));
+
+    const result: PointerPoint[] = [{ ...points[0] }];
+    let previous = { ...points[0] };
+    let distanceToNext = spacing;
+
+    for (let i = 1; i < points.length; i++) {
+      const target = points[i];
+      let dx = target.x - previous.x;
+      let dy = target.y - previous.y;
+      let segmentLength = Math.hypot(dx, dy);
+
+      // 同一点は位置の制御点として追加せず、終端属性だけ最後に保持する。
+      if (segmentLength <= 1e-6) {
+        previous = { ...target };
+        continue;
+      }
+
+      while (segmentLength + 1e-9 >= distanceToNext) {
+        const t = distanceToNext / segmentLength;
+        const sample = this.lerpPoint(previous, target, t);
+        result.push(sample);
+        previous = sample;
+        dx = target.x - previous.x;
+        dy = target.y - previous.y;
+        segmentLength = Math.hypot(dx, dy);
+        distanceToNext = spacing;
+      }
+
+      distanceToNext -= segmentLength;
+      previous = { ...target };
+    }
+
+    const end = points[points.length - 1];
+    const last = result[result.length - 1];
+    if (Math.hypot(end.x - last.x, end.y - last.y) > 1e-6) {
+      result.push({ ...end });
+    } else {
+      result[result.length - 1] = { ...end };
+    }
+    return result;
+  }
+
   private interpolateSegment(
     p0: PointerPoint,
     p1: PointerPoint,
     p2: PointerPoint,
     p3: PointerPoint,
-    predict: boolean,
   ): PointerPoint[] {
+    const chord = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+    const numPoints = Math.max(1, Math.ceil(chord / Math.max(this.config.spacing, 0.01)));
     const result: PointerPoint[] = [];
-    const distance = Math.sqrt(
-      (p2.x - p1.x) ** 2 + (p2.y - p1.y) ** 2,
-    );
 
-    // 補間点数を決定
-    const numPoints = Math.max(2, Math.floor(distance / this.config.spacing));
+    const t0 = 0;
+    const t1 = t0 + this.knotInterval(p0, p1);
+    const t2 = t1 + this.knotInterval(p1, p2);
+    const t3 = t2 + this.knotInterval(p2, p3);
 
-    // i <= numPoints にして終点(t=1.0)を含める
-    // i < numPoints だと終点が欠け、セグメント境界で gap = 2×spacing になっていた
     for (let i = 0; i <= numPoints; i++) {
-      const t = i / numPoints;
-      const point = this.catmullRom(p0, p1, p2, p3, t, p1, p2, predict);
-      result.push(point);
+      const u = i / numPoints;
+      const t = t1 + (t2 - t1) * u;
+      const { x, y } = this.centripetalPosition(p0, p1, p2, p3, t0, t1, t2, t3, t);
+      result.push({
+        x,
+        y,
+        pressure: this.lerp(p1.pressure, p2.pressure, u),
+        tiltX: this.lerp(p1.tiltX, p2.tiltX, u),
+        tiltY: this.lerp(p1.tiltY, p2.tiltY, u),
+        timestamp: this.lerp(p1.timestamp, p2.timestamp, u),
+      });
     }
-
     return result;
   }
 
   /**
-   * Catmull-Rom スプライン計算
-   * P(t) = 0.5 * ((2*P1) + (-P0 + P2)*t + (2*P0 - 5*P1 + 4*P2 - P3)*t^2 + (-P0 + 3*P1 - 3*P2 + P3)*t^3)
+   * Barry-Goldman形式のcentripetal Catmull-Rom。
+   * knot interval = distance^0.5（alpha=0.5）。
    */
-  private catmullRom(
+  private centripetalPosition(
     p0: PointerPoint,
     p1: PointerPoint,
     p2: PointerPoint,
     p3: PointerPoint,
+    t0: number,
+    t1: number,
+    t2: number,
+    t3: number,
     t: number,
-    startPoint: PointerPoint,
-    endPoint: PointerPoint,
-    predict: boolean,
-  ): PointerPoint {
-    // 予測モードの場合、p3を仮想的に生成
-    if (predict) {
-      const dx = p2.x - p1.x;
-      const dy = p2.y - p1.y;
-      p3 = {
-        x: p2.x + dx,
-        y: p2.y + dy,
-        pressure: p2.pressure,
-        tiltX: p2.tiltX,
-        tiltY: p2.tiltY,
-        timestamp: p2.timestamp + (p2.timestamp - p1.timestamp),
-      };
-    }
-
-    const t2 = t * t;
-    const t3 = t2 * t;
-
-    // Catmull-Rom の係数
-    const c0 = -0.5 * t3 + t2 - 0.5 * t;
-    const c1 = 1.5 * t3 - 2.5 * t2 + 1.0;
-    const c2 = -1.5 * t3 + 2.0 * t2 + 0.5 * t;
-    const c3 = 0.5 * t3 - 0.5 * t2;
-
-    // 位置の計算
-    const x = c0 * p0.x + c1 * p1.x + c2 * p2.x + c3 * p3.x;
-    const y = c0 * p0.y + c1 * p1.y + c2 * p2.y + c3 * p3.y;
-
-    // 筆圧・傾きは線形補間
-    const pressure = this.lerp(p1.pressure, p2.pressure, t);
-    const tiltX = this.lerp(p1.tiltX, p2.tiltX, t);
-    const tiltY = this.lerp(p1.tiltY, p2.tiltY, t);
-
-    // タイムスタンプは線形補間
-    const timestamp = this.lerp(p1.timestamp, p2.timestamp, t);
-
-    return { x, y, pressure, tiltX, tiltY, timestamp };
+  ): { x: number; y: number } {
+    const a1 = this.mixPosition(p0, p1, this.ratio(t0, t1, t));
+    const a2 = this.mixPosition(p1, p2, this.ratio(t1, t2, t));
+    const a3 = this.mixPosition(p2, p3, this.ratio(t2, t3, t));
+    const b1 = this.mixPosition(a1, a2, this.ratio(t0, t2, t));
+    const b2 = this.mixPosition(a2, a3, this.ratio(t1, t3, t));
+    return this.mixPosition(b1, b2, this.ratio(t1, t2, t));
   }
 
-  /**
-   * 線形補間
-   */
+  private knotInterval(a: PointerPoint, b: PointerPoint): number {
+    // 完全な重複点でも分母を0にしない。
+    return Math.max(1e-4, Math.sqrt(Math.hypot(b.x - a.x, b.y - a.y)));
+  }
+
+  private ratio(start: number, end: number, value: number): number {
+    const width = end - start;
+    return width > 1e-9 ? (value - start) / width : 0;
+  }
+
+  private mixPosition(
+    a: { x: number; y: number },
+    b: { x: number; y: number },
+    t: number,
+  ): { x: number; y: number } {
+    return { x: this.lerp(a.x, b.x, t), y: this.lerp(a.y, b.y, t) };
+  }
+
+  private extrapolateEndpoint(anchor: PointerPoint, neighbor: PointerPoint): PointerPoint {
+    return {
+      x: anchor.x + (anchor.x - neighbor.x),
+      y: anchor.y + (anchor.y - neighbor.y),
+      pressure: anchor.pressure,
+      tiltX: anchor.tiltX,
+      tiltY: anchor.tiltY,
+      timestamp: anchor.timestamp - (neighbor.timestamp - anchor.timestamp),
+    };
+  }
+
+  private predictNextPoint(points: PointerPoint[]): PointerPoint | null {
+    if (points.length < 2) return null;
+    const last = points[points.length - 1];
+    const prev = points[points.length - 2];
+    const dt = Math.max(1, last.timestamp - prev.timestamp);
+    const vx = (last.x - prev.x) / dt;
+    const vy = (last.y - prev.y) / dt;
+
+    let ax = 0;
+    let ay = 0;
+    if (points.length >= 3) {
+      const prev2 = points[points.length - 3];
+      const dt0 = Math.max(1, prev.timestamp - prev2.timestamp);
+      ax = (vx - (prev.x - prev2.x) / dt0) / dt;
+      ay = (vy - (prev.y - prev2.y) / dt0) / dt;
+    }
+
+    return {
+      x: last.x + vx * dt + 0.5 * ax * dt * dt,
+      y: last.y + vy * dt + 0.5 * ay * dt * dt,
+      pressure: last.pressure,
+      tiltX: last.tiltX,
+      tiltY: last.tiltY,
+      timestamp: last.timestamp + dt,
+    };
+  }
+
+  private lerpPoint(a: PointerPoint, b: PointerPoint, t: number): PointerPoint {
+    return {
+      x: this.lerp(a.x, b.x, t),
+      y: this.lerp(a.y, b.y, t),
+      pressure: this.lerp(a.pressure, b.pressure, t),
+      tiltX: this.lerp(a.tiltX, b.tiltX, t),
+      tiltY: this.lerp(a.tiltY, b.tiltY, t),
+      timestamp: this.lerp(a.timestamp, b.timestamp, t),
+    };
+  }
+
   private lerp(a: number, b: number, t: number): number {
     return a + (b - a) * t;
   }
 
-  /**
-   * 速度を計算（px/sec）
-   */
   private calculateVelocity(from: PointerPoint, to: PointerPoint): number {
-    const dx = to.x - from.x;
-    const dy = to.y - from.y;
-    const distance = Math.sqrt(dx * dx + dy * dy);
     const dt = to.timestamp - from.timestamp;
-
     if (dt <= 0) return 0;
-    return (distance / dt) * 1000;
+    return (Math.hypot(to.x - from.x, to.y - from.y) / dt) * 1000;
   }
 
-  /**
-   * 設定を取得
-   */
   getConfig(): InterpolationConfig {
     return { ...this.config };
   }
 
-  /**
-   * 設定を更新
-   */
   updateConfig(config: Partial<InterpolationConfig>): void {
     this.config = { ...this.config, ...config };
   }

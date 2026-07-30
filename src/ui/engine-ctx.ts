@@ -9,7 +9,8 @@
  */
 
 import type { StrokeManager, PressureSizeConfig } from '../pen/stroke.js';
-import type { Stabilizer } from '../pen/stabilization.js';
+import type { StabilizationController, StabilizationMode } from '../pen/stabilization-mode.js';
+import type { PostCorrector } from '../pen/post-correction.js';
 import type { RenderPipeline } from '../render/pipeline.js';
 import type { BrushMixMode } from '../render/brush.js';
 import type { LinearColor } from '../color/types.js';
@@ -28,7 +29,8 @@ export interface SharedState {
 
 export interface EngineDeps {
   strokeManager: StrokeManager;
-  stabilizer: Stabilizer;
+  stabilizer: StabilizationController;
+  postCorrector: PostCorrector;
   getPipeline: () => RenderPipeline | null;
   state: SharedState;
 }
@@ -43,6 +45,12 @@ export interface EngineCtx {
   setWet(w01: number): void;
   /** 手ブレ補正 0..100(%)。0=補正なし, 100=最も滑らか */
   setStabilize(pct: number): void;
+  /** 手ブレ補正方式（EMA / Pulled String） */
+  setStabilizeMode(mode: StabilizationMode): void;
+  /** 後補正のオン/オフ */
+  setPostCorrection(enabled: boolean): void;
+  /** 後補正強度 0..100(%) */
+  setPostCorrectionStrength(pct: number): void;
   /** 混色方式 */
   setMixMode(mode: BrushMixMode): void;
   /** 筆圧カーブ */
@@ -54,7 +62,7 @@ export interface EngineCtx {
 }
 
 export function createEngineCtx(deps: EngineDeps): EngineCtx {
-  const { strokeManager, stabilizer, getPipeline, state } = deps;
+  const { strokeManager, stabilizer, postCorrector, getPipeline, state } = deps;
   return {
     setSize(px) {
       const maxSize = Math.max(1, Math.min(100, Math.round(px)));
@@ -70,9 +78,23 @@ export function createEngineCtx(deps: EngineDeps): EngineCtx {
       getPipeline()?.updateBrushConfig({ wetRatio: w01 });
     },
     setStabilize(pct) {
-      // 0% → minAlpha=1.0（補正オフ）, 100% → minAlpha=0.1（強い補正）
+      // EMA: 0% → minAlpha=1.0（補正オフ）, 100% → minAlpha=0.1（強い補正）
       const minAlpha = 1.0 - (pct / 100) * 0.9;
-      stabilizer.updateConfig({ minAlpha });
+      stabilizer.updateEmaConfig({ minAlpha });
+      // Pulled String: 0% → radius=0px（補正オフ）, 100% → radius=50px（強い補正）
+      const radius = (pct / 100) * 50;
+      stabilizer.updatePulledStringConfig({ radius });
+    },
+    setStabilizeMode(mode) {
+      stabilizer.setMode(mode);
+    },
+    setPostCorrection(enabled) {
+      postCorrector.updateConfig({ enabled });
+    },
+    setPostCorrectionStrength(pct) {
+      // 0% = tolerance=0.5px（弱）, 100% = tolerance=10px（強）
+      const tolerance = 0.5 + (pct / 100) * 9.5;
+      postCorrector.updateConfig({ tolerance });
     },
     setMixMode(mode) {
       state.mixMode = mode;

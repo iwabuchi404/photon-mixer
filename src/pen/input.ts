@@ -33,7 +33,6 @@ export type PenInputHandler = (event: PenInputEvent) => void;
  */
 export class PenInputManager {
   private handlers: PenInputHandler[] = [];
-  private lastTimestamp: number = 0;
 
   constructor(private canvas: HTMLCanvasElement) {
     this.setupEventListeners();
@@ -50,7 +49,7 @@ export class PenInputManager {
 
     // pointermove: ペンが動いた
     this.canvas.addEventListener('pointermove', (e) => {
-      this.handlePointerEvent(e, 'move');
+      this.handlePointerMove(e);
     });
 
     // pointerup: ペンが離れた
@@ -67,6 +66,23 @@ export class PenInputManager {
     this.canvas.addEventListener('pointercancel', (e) => {
       this.handlePointerEvent(e, 'up');
     });
+  }
+
+  /**
+   * OSが1回のpointermoveへまとめた高密度サンプルを発生順に処理する。
+   * getCoalescedEvents() 非対応環境では通常イベント1点へフォールバックする。
+   */
+  private handlePointerMove(e: PointerEvent): void {
+    if (e.pointerType === 'touch') return;
+
+    const coalesced = typeof e.getCoalescedEvents === 'function'
+      ? e.getCoalescedEvents()
+      : [];
+    const samples = coalesced.length > 0 ? coalesced : [e];
+
+    for (const sample of samples) {
+      this.handlePointerEvent(sample, 'move');
+    }
   }
 
   /**
@@ -96,15 +112,10 @@ export class PenInputManager {
       pressure,
       tiltX,
       tiltY,
-      timestamp: performance.now(),
+      // performance.now() で受信時刻を付け直すと、coalesced event が全て同時刻に
+      // なって速度計算が壊れる。ブラウザが各サンプルへ付けた時刻を保持する。
+      timestamp: Number.isFinite(e.timeStamp) ? e.timeStamp : performance.now(),
     };
-
-    // サンプリングレートの検出（デバッグ用）
-    if (this.lastTimestamp > 0) {
-      const interval = point.timestamp - this.lastTimestamp;
-      // あまりに頻繁な場合はスキップ（今後の調整用）
-    }
-    this.lastTimestamp = point.timestamp;
 
     // ハンドラーを呼び出し
     for (const handler of this.handlers) {

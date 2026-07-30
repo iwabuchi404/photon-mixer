@@ -8,6 +8,7 @@
 
 import type { Renderer } from '../core/renderer.js';
 import type { StrokePoint, StrokeRecord } from '../pen/stroke.js';
+import { alignBrushBbox4x } from './brush-bbox.js';
 import { BrushRenderer, type BrushConfig } from './brush.js';
 import { CompositeRenderer } from './composite.js';
 import { DownsampleRenderer } from './downsample.js';
@@ -56,7 +57,8 @@ export class RenderPipeline {
   private transformRenderer: TransformRenderer;
   private filterRenderer: FilterRenderer;
 
-  private brushTexture4x!: GPUTexture;
+  private brushBboxTexture: GPUTexture | null = null;
+  private brushBboxSize: { w: number; h: number } = { w: 0, h: 0 };
   private isolatedTexture!: GPUTexture;
   // レイヤー合成用
   private displayA!: GPUTexture;
@@ -136,11 +138,8 @@ export class RenderPipeline {
     this.canvasWidth = width;
     this.canvasHeight = height;
 
-    this.brushTexture4x = this.renderer.device.createTexture({
-      size: [width * 4, height * 4],
-      format: BUFFER_FORMAT,
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-    });
+    // brushBboxTexture はストロークごとにサイズが変わるため createTextures では確保しない。
+    // drawToIsolated で必要に応じて (再)確保する。
     this.isolatedTexture = this.renderer.device.createTexture({
       size: [width, height],
       format: BUFFER_FORMAT,
@@ -231,14 +230,57 @@ export class RenderPipeline {
     const { device } = this.renderer;
     // アルファロックをブラシに反映（既存 committed.a でマスク）
     this.brushRenderer.updateConfig({ alphaLock: this.drawAlphaLock });
+
+    // 仕様（docs/spec.md）: 4x サブピクセルバッファは「ブラシ範囲のみ」。
+    // ストローク点列から 4x 座標系のバウンディングボックスを計算し、
+    // そのサイズのテクスチャだけ確保・クリア・描画・ダウンサンプルする。
+    const SCALE = 4;
+    const cw4 = this.canvasWidth * SCALE;
+    const ch4 = this.canvasHeight * SCALE;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const p of points) {
+      const x4 = p.x * SCALE;
+      const y4 = p.y * SCALE;
+      const r4 = p.size * SCALE; // size は半径（brush.wgsl の offset = ±size）
+      minX = Math.min(minX, x4 - r4);
+      minY = Math.min(minY, y4 - r4);
+      maxX = Math.max(maxX, x4 + r4);
+      maxY = Math.max(maxY, y4 + r4);
+    }
+    // 4x原点と終端を1xピクセル境界（4の倍数）へ外向きに揃える。
+    // 幅だけを4の倍数にして原点に端数を残すと、4xサンプルと1x書込先の
+    // 位相がずれ、ストローク位置によって輪郭品質が変わる。
+    const aligned = alignBrushBbox4x(minX, minY, maxX, maxY, cw4, ch4, SCALE);
+    minX = aligned.minX;
+    minY = aligned.minY;
+    const bboxW4 = aligned.width;
+    const bboxH4 = aligned.height;
+
+    // bbox 4x テクスチャを（サイズが変われば再）確保
+    if (!this.brushBboxTexture || this.brushBboxSize.w !== bboxW4 || this.brushBboxSize.h !== bboxH4) {
+      this.brushBboxTexture?.destroy();
+      this.brushBboxTexture = device.createTexture({
+        size: [bboxW4, bboxH4],
+        format: BUFFER_FORMAT,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      });
+      this.brushBboxSize = { w: bboxW4, h: bboxH4 };
+    }
+
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
-      colorAttachments: [{ view: this.brushTexture4x.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' }],
+      colorAttachments: [{ view: this.brushBboxTexture!.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' }],
     });
-    this.brushRenderer.renderStroke(pass, points, this.committedTexture, 4.0);
+    this.brushRenderer.renderStroke(
+      pass, points, this.committedTexture, SCALE,
+      minX, minY, bboxW4, bboxH4,
+    );
     pass.end();
     device.queue.submit([encoder.finish()]);
-    this.downsampleRenderer.downsample(this.brushTexture4x, this.isolatedTexture);
+
+    // ダウンサンプル: bbox 4x → isolatedTexture の 1x オフセット位置へ
+    // 1x オフセット = bbox 原点(4x) / 4
+    this.downsampleRenderer.downsample(this.brushBboxTexture!, this.isolatedTexture, minX / SCALE, minY / SCALE);
   }
 
   /**
@@ -1061,7 +1103,9 @@ export class RenderPipeline {
     if (this.moveActive) this.cancelMove();
     if (this.filterActive) this.cancelFilter();
     this.brushRenderer.resize(w * 4, h * 4);
-    this.brushTexture4x.destroy();
+    this.brushBboxTexture?.destroy();
+    this.brushBboxTexture = null;
+    this.brushBboxSize = { w: 0, h: 0 };
     this.isolatedTexture.destroy();
     this.displayA.destroy(); this.displayB.destroy(); this.activeComposite.destroy();
     this.filterScratch.destroy();
@@ -1144,7 +1188,7 @@ export class RenderPipeline {
     this.filterRenderer.dispose();
     this._clearTransformState();
     this._clearFilterState();
-    this.brushTexture4x?.destroy();
+    this.brushBboxTexture?.destroy();
     this.isolatedTexture?.destroy();
     this.displayA?.destroy(); this.displayB?.destroy(); this.activeComposite?.destroy();
     this.filterScratch?.destroy();

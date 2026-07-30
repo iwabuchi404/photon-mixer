@@ -55,7 +55,7 @@ export class BrushRenderer {
     this.shaderPath = shaderPath;
 
     this.uniformBuffer = device.createBuffer({
-      size: 64, // 16 floats（テクスチャ・選択フラグ）
+      size: 80, // 16 floats + bbox_origin(2) + bbox_size(2) = 20 floats
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -122,7 +122,7 @@ export class BrushRenderer {
   }
 
   private updateUniforms(canvasWidth: number, canvasHeight: number): void {
-    const buf = new ArrayBuffer(64); // 16 floats（選択フラグ追加で 16-align）
+    const buf = new ArrayBuffer(80); // 20 floats（bbox 追加で 20-align）
     const f32 = new Float32Array(buf);
     const u32 = new Uint32Array(buf);
     f32[0] = canvasWidth;
@@ -138,10 +138,36 @@ export class BrushRenderer {
     f32[10] = this.config.textureScale;
     u32[11] = this.config.alphaLock ? 1 : 0;
     u32[12] = this.selectionTexture ? 1 : 0; // use_selection
+    // f32[13..15] は _pad1..3。bbox は renderStroke 側で上書きするためここでは 0 のまま。
     this.device.queue.writeBuffer(this.uniformBuffer, 0, buf);
   }
 
-  renderStroke(renderPass: GPURenderPassEncoder, points: StrokePoint[], committedTexture: GPUTexture, scale = 1.0): void {
+  /**
+   * ブラシ bbox（4x キャンバス座標系）を uniform 末尾へ書き込む。
+   * 仕様（docs/spec.md）: 4x サブピクセルバッファはブラシ範囲のみ。
+   * brush.wgsl の vertex_main はこの bbox を使って NDC へ映射する。
+   */
+  private updateBboxUniform(bboxOriginX: number, bboxOriginY: number, bboxSizeX: number, bboxSizeY: number): void {
+    // uniform 末尾 16 bytes（offset 64）に bbox_origin(2) + bbox_size(2) を書き込む
+    const buf = new ArrayBuffer(16);
+    const f32 = new Float32Array(buf);
+    f32[0] = bboxOriginX;
+    f32[1] = bboxOriginY;
+    f32[2] = bboxSizeX;
+    f32[3] = bboxSizeY;
+    this.device.queue.writeBuffer(this.uniformBuffer, 64, buf);
+  }
+
+  renderStroke(
+    renderPass: GPURenderPassEncoder,
+    points: StrokePoint[],
+    committedTexture: GPUTexture,
+    scale = 1.0,
+    bboxOriginX = 0,
+    bboxOriginY = 0,
+    bboxSizeX = 0,
+    bboxSizeY = 0,
+  ): void {
     if (points.length === 0 || !this.pipeline) return;
 
     const c = this.config.color;
@@ -161,6 +187,9 @@ export class BrushRenderer {
     }
 
     this.device.queue.writeBuffer(this.pointBuffer, 0, pointData);
+
+    // ブラシ bbox（4x 座標）を uniform 末尾へ反映。NDC 映射に使用される。
+    this.updateBboxUniform(bboxOriginX, bboxOriginY, bboxSizeX, bboxSizeY);
 
     if (this.bindGroupDirty || !this.bindGroup || this.lastCommittedTexture !== committedTexture) {
       const textureToUse = this.brushTexture ?? this.dummyTexture;

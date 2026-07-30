@@ -98,11 +98,19 @@ related:
 
 ## Phase 分類（サマリ）
 
-| ID | 重要度 | 概要 | 対応フェーズ目安 |
-|---|---|---|---|
-| C2 | critical | 高速時の先端予測描画が機能していない | Phase 02 |
-| C3 | critical | Normal/Overlay ブレンドが Oklab 仕様と不一致 | Phase 02 / 03（[[color-pipeline]] と連携） |
-| C1 | critical | 4x バッファが全画面サイズ確保（VRAM/性能） | Phase 03 |
-| M1 | minor | 手ブレ補正 α 計算式が仕様と不一致 | Phase 02 |
-| S1 | code-smell | サンプリングレート吸収が未実装 | Phase 03 |
-| S2 | code-smell | 筆圧判定の冗長な条件式 | Phase 03 |
+| ID | 重要度 | 概要 | 状態 | 対応内容 |
+|---|---|---|---|---|
+| C2 | critical | 高速時の先端予測描画が機能していない | ✅ 完了 | `interpolation.ts` に `predictNextPoint` を実装。現行の「ストローク全体再描画」方式では予測点がシャギーを生むため `predict=false` で運用（アーキテクチャ更新後に有効化） |
+| C3 | critical | Normal/Overlay ブレンドが Oklab 仕様と不一致 | ✅ 完了 | `blend.wgsl` に `linear_to_oklab` / `oklab_to_linear` を実装。Normal は Oklab 空間で補間、Overlay は Oklab L 軸で閾値判定後にリニア演算 |
+| C1 | critical | 4x バッファが全画面サイズ確保（VRAM/性能） | ✅ 完了 | `brushTexture4x`（全画面 4x）を廃止し、ストローク bbox に基づく動的 `brushBboxTexture` を生成。`brush.wgsl` は `bbox_origin` / `bbox_size` で NDC マッピング、`downsample.wgsl` は `dst_offset_x/y` で本体テクスチャへ書き込み |
+| M1 | minor | 手ブレ補正 α 計算式が仕様と不一致 | ✅ 完了 | `stabilization.ts` の `calculateAlpha` を仕様通りの `clamp(speed/threshold, minAlpha, maxAlpha)` 形式に修正 |
+| S1 | code-smell | サンプリングレート吸収が未実装 | ✅ 完了 | `stabilization.ts` に `timeAdjustedAlpha` を追加。120Hz 基準で `1 - (1 - α)^(dt/nominalDt)` によりサンプリング周波数のばらつきを吸収。`lastRawPoint` / `lastOutputPoint` を分離し速度は生入力同士から計算。`stabilizeBatch(points, finishAtLastInput)` でペンアップ時に最終生入力へ収束 |
+| S2 | code-smell | 筆圧判定の冗長な条件式 | ⏳ 未対応 | `input.ts:87` の `e.pointerType === 'pen' && e.pressure !== 0.5 ? e.pressure : 0.5` を `e.pointerType === 'pen' ? e.pressure : 0.5` に簡略化予定 |
+
+---
+
+## 検証
+
+- `npm run build`: ✅ 通過
+- `npm test`: ✅ 183/183 通過
+- `scripts/verify-*.mjs`: ✅ エラーなし、~60 FPS
