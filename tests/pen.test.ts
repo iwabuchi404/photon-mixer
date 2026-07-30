@@ -1156,10 +1156,15 @@ describe('ペン入力統合テスト', () => {
       assert.strictEqual(all[0].kind, 'fill');
     });
 
-    test('maxUndo(50)を超えると古いレコードが捨てられる', () => {
+    test('maxUndo(50)を超えた古いレコードはUndo対象外だが再ベイク用に残る', () => {
       const history = new StrokeHistory();
       for (let i = 0; i < 60; i++) history.addRecord(strokeRecord(i));
       assert.strictEqual(history.getRecordCount(), 50, '最大50件に制限される');
+      assert.strictEqual(history.getAllRecords().length, 60, '全描画は再ベイク用に保持される');
+
+      for (let i = 0; i < 50; i++) assert.ok(history.undo());
+      assert.strictEqual(history.undo(), null, 'Undoできるのは直近50件まで');
+      assert.strictEqual(history.getAllRecords().length, 10, 'Undo上限より古い描画は残る');
     });
 
     test('クリアですべての操作を削除できる', () => {

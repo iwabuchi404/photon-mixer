@@ -170,6 +170,9 @@ export type StrokeRecord =
  * Undo/Redo を管理するクラス
  */
 export class StrokeHistory {
+  // Undo 上限より古い操作も、再ベイクの基準として保持する。
+  // Undo 対象にはしないが、捨てると次回の再ベイクで描画自体が消えてしまう。
+  private baseRecords: StrokeRecord[] = [];
   private undoStack: StrokeRecord[] = [];
   private redoStack: StrokeRecord[] = [];
   private readonly maxUndo = 50;
@@ -181,9 +184,10 @@ export class StrokeHistory {
     this.undoStack.push(record);
     this.redoStack = []; // 新しい操作で Redo スタックをクリア
 
-    // 最大数を超えたら古いものから削除
+    // 最大数を超えたら、Undo 対象外の再ベイク基準へ移す
     if (this.undoStack.length > this.maxUndo) {
-      this.undoStack.shift();
+      const record = this.undoStack.shift();
+      if (record) this.baseRecords.push(record);
     }
   }
 
@@ -191,7 +195,7 @@ export class StrokeHistory {
    * すべての操作レコードを取得（rebake 用）
    */
   getAllRecords(): StrokeRecord[] {
-    return [...this.undoStack];
+    return [...this.baseRecords, ...this.undoStack];
   }
 
   /**
@@ -216,6 +220,7 @@ export class StrokeHistory {
    * すべてクリア
    */
   clear(): void {
+    this.baseRecords = [];
     this.undoStack = [];
     this.redoStack = [];
   }

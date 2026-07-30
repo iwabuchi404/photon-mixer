@@ -278,6 +278,11 @@ export class RenderPipeline {
     pass.end();
     device.queue.submit([encoder.finish()]);
 
+    // isolatedTexture は全キャンバスを合成元として参照されるため、bbox 外に
+    // 前回ストロークが残っていると、Undo の再ベイク時などに残像まで再合成される。
+    // 部分ダウンサンプルの前に全体を透明へ戻し、今回の bbox だけを書き込む。
+    this.clearTextureContent(this.isolatedTexture);
+
     // ダウンサンプル: bbox 4x → isolatedTexture の 1x オフセット位置へ
     // 1x オフセット = bbox 原点(4x) / 4
     this.downsampleRenderer.downsample(this.brushBboxTexture!, this.isolatedTexture, minX / SCALE, minY / SCALE);
