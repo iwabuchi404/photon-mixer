@@ -14,7 +14,7 @@ struct Uniforms {
   texture_scale: f32,    // テクスチャのスケール（繰り返し回数）
   use_alpha_lock: u32,   // 1=透明部分保護（既存αでマスク）
   use_selection: u32,    // 1=選択範囲マスクを適用
-  _pad1: u32,
+  use_pressure_opacity: u32, // 1=筆圧で不透明度を反映
   _pad2: u32,
   _pad3: u32,
   // ブラシ bbox（4x キャンバス座標系）。NDC マッピングのみに使用。
@@ -34,12 +34,14 @@ struct VertexOutput {
   @location(0) uv: vec2<f32>,
   @location(1) canvas_uv: vec2<f32>,
   @location(2) point_color: vec4<f32>,
+  @location(3) pressure: f32,
 }
 
 struct FragmentInput {
   @location(0) uv: vec2<f32>,
   @location(1) canvas_uv: vec2<f32>,
   @location(2) point_color: vec4<f32>,
+  @location(3) pressure: f32,
 }
 
 @group(0) @binding(0)
@@ -123,6 +125,7 @@ fn vertex_main(@builtin(instance_index) instance_id: u32, @builtin(vertex_index)
   // キャンバス座標系 UV (0-1)
   output.canvas_uv = vec2<f32>(pos.x / uniforms.canvas_width, pos.y / uniforms.canvas_height);
   output.point_color = point.color;
+  output.pressure = point.data.w;
 
   return output;
 }
@@ -137,11 +140,16 @@ fn fragment_main(input: FragmentInput) -> @location(0) vec4<f32> {
 
   var stamp_alpha: f32;
 
+  // 筆圧で不透明度反映（共通）: ONなら α に pressure を掛ける
+  let pressure_alpha = select(base_color.a, base_color.a * input.pressure, uniforms.use_pressure_opacity != 0u);
+
   // テクスチャブラシか円形ブラシか
   if (uniforms.use_texture != 0u) {
-    // テクスチャブラシ：キャンバス座標系でテクスチャをサンプリング
-    // input.canvas_uv を texture_scale 倍して繰り返しサンプリング
-    let tex_uv = input.canvas_uv * uniforms.texture_scale;
+    // テクスチャブラシ：ブラシ中心からの相対UVでサンプリング（ストローク追従）
+    // input.uv は [-1,1] のブラシローカル座標 → [0,1] に変換
+    // texture_scale でタイル繰り返し（1.0=ブラシ1個分に1タイル、大きいほど細かいパターン）
+    let local_uv = (input.uv + 1.0) * 0.5;
+    let tex_uv = local_uv * uniforms.texture_scale;
     let tex_color = textureSampleLevel(brush_texture, brush_sampler, tex_uv, 0.0);
     // 輝度をマスクに使う（黒=透明・白=不透明、グレースケール素材に対応）
     // α も併用して、α付き素材は α でも抜けるようにする
@@ -150,14 +158,20 @@ fn fragment_main(input: FragmentInput) -> @location(0) vec4<f32> {
     // 円形フォールオフも掛けてスタンプの角を丸める
     let dist = length(input.uv);
     let falloff = 1.0 - smoothstep(0.8, 1.0, dist);
-    stamp_alpha = mask * base_color.a * falloff;
+    // 筆圧反映（鉛筆質感）:
+    // 1. 筆圧が弱いほどテクスチャの隙間（紙の目）が目立つ → mask をそのまま使う
+    // 2. 筆圧が強いほど隙間が埋まる → mask 1.0（完全不透明）に近づく
+    // 3. 全体の濃度も筆圧で変化（弱=薄、強=濃）
+    let pressure_mask = mix(mask, 1.0, smoothstep(0.5, 1.0, input.pressure));
+    let pressure_intensity = mix(0.3, 1.0, input.pressure);
+    stamp_alpha = pressure_mask * pressure_intensity * pressure_alpha * falloff;
   } else {
     // 円形ブラシ
     let dist = length(input.uv);
     if (dist >= 1.0) {
       return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
-    stamp_alpha = base_color.a * (1.0 - smoothstep(0.8, 1.0, dist));
+    stamp_alpha = pressure_alpha * (1.0 - smoothstep(0.8, 1.0, dist));
   }
 
   var target_color = base_color.rgb;

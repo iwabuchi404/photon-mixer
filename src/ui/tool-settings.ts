@@ -8,7 +8,7 @@
 
 import type { Tool, ParamKey, ParamDef, ToolDef } from './tool-config.js';
 
-export type ParamValue = number | string;
+export type ParamValue = number | string | boolean;
 
 export class ToolSettingsStore {
   private store = new Map<Tool, Map<ParamKey, ParamValue>>();
@@ -53,6 +53,12 @@ export class ToolSettingsStore {
       const step = def.step ?? 1;
       v = def.min + Math.round((v - def.min) / step) * step;
       return Math.max(def.min, Math.min(def.max, v));
+    }
+    if (def.kind === 'checkbox') {
+      if (typeof value === 'boolean') return value;
+      if (value === 'true') return true;
+      if (value === 'false') return false;
+      return undefined;
     }
     // select: 許可値のみ
     const sv = String(value);

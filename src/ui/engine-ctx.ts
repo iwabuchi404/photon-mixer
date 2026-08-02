@@ -25,6 +25,7 @@ export interface SharedState {
   textureScale: number;
   bucketTolerance: number;
   useTexture: boolean;
+  pressureOpacity: boolean;
 }
 
 export interface EngineDeps {
@@ -41,6 +42,8 @@ export interface EngineCtx {
   setSize(px: number): void;
   /** 不透明度 0..1（描画色のα。色自体は共有） */
   setOpacity(a01: number): void;
+  /** 筆圧を不透明度へ反映する */
+  setPressureOpacity(enabled: boolean): void;
   /** にじみ 0..1 */
   setWet(w01: number): void;
   /** 手ブレ補正 0..100(%)。0=補正なし, 100=最も滑らか */
@@ -72,6 +75,10 @@ export function createEngineCtx(deps: EngineDeps): EngineCtx {
     setOpacity(a01) {
       state.currentColor.a = a01;
       getPipeline()?.updateBrushConfig({ color: { ...state.currentColor } });
+    },
+    setPressureOpacity(enabled) {
+      state.pressureOpacity = enabled;
+      getPipeline()?.updateBrushConfig({ pressureOpacity: enabled });
     },
     setWet(w01) {
       state.wetRatio = w01;

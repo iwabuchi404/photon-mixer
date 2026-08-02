@@ -1,38 +1,26 @@
 /**
- * .pmx ネイティブ形式の保存/読み込み
+ * .pmx ネイティブ形式の保存/読み込み（v2: 3オブジェクト構造対応）
  *
  * ZIP コンテナ:
- *   manifest.json   バージョン・キャンバスサイズ・レイヤー構成・View設定・スウォッチ・効果レイヤー
- *   layers/<id>.f16 各ペイントレイヤーの tight packed float16 RGBA（プリマルチプライド・リニア）
+ *   manifest.json   バージョン・キャンバスサイズ・レイヤーツリー・ルート効果チェーン・View設定・スウォッチ
+ *   layers/<id>.f16 各セルの tight packed float16 RGBA（プリマルチプライド・リニア）
  *
- * 効果（非破壊）レイヤーはピクセルを持たず manifest にパラメータのみ保存する。
- * stackOrder で paint/effect の積み順を保持する。
+ * v2 ではレイヤーツリー（FolderNode/CellNode）とルート効果チェーンを manifest に保存する。
+ * 効果チェーンはセルまたはルートに付属し、ピクセルを持たない。
+ *
+ * 旧形式（v1.x）からの自動変換は行わない（手動マイグレーション）。
  */
 
 import * as fflate from 'fflate';
-import type { LayerInfo } from './render/pipeline.js';
+import type { LayerNode, CellNode, EffectChainItem } from './render/layer-model.js';
 import type { TonemapId, DisplayModeId } from './color/display.js';
-import type { FilterType, FilterParams } from './render/filter.js';
-import type { CurvePoint } from './color/curve.js';
 
-const PMX_VERSION = '1.1';
+const PMX_VERSION = '2.0';
 
-export interface PmxLayer {
-  info: LayerInfo;
+/** セルの保存用データ（ピクセル + セル情報） */
+export interface PmxCellData {
+  cell: CellNode;
   data: Uint16Array; // tight packed float16 RGBA
-}
-
-export interface PmxEffectLayer {
-  id: string;
-  name: string;
-  visible: boolean;
-  opacity: number;
-  blendMode: 'normal';
-  kind: 'effect';
-  filterType: FilterType;
-  params: FilterParams;
-  curvePoints?: CurvePoint[];
-  source?: string; // 入力ソース: 'below' or ペイントレイヤーID
 }
 
 export interface PmxDocumentSettings {
@@ -42,8 +30,6 @@ export interface PmxDocumentSettings {
 
 export interface PmxSaveExtras {
   documentSettings?: PmxDocumentSettings;
-  effectLayers?: PmxEffectLayer[];
-  stackOrder?: string[]; // 全レイヤー（paint+effect）の id を積み順で
 }
 
 export interface PmxManifest {
@@ -51,40 +37,44 @@ export interface PmxManifest {
   app: string;
   width: number;
   height: number;
-  activeId: string;
-  layers: (LayerInfo & { file: string })[];
-  effectLayers?: PmxEffectLayer[];
-  stackOrder?: string[];
+  activeCellId: string;
+  rootNodes: LayerNode[];
+  rootEffects: EffectChainItem[];
   documentSettings?: PmxDocumentSettings;
 }
 
 export interface PmxLoadResult {
   width: number;
   height: number;
-  activeId: string;
-  layers: PmxLayer[];
-  effectLayers: PmxEffectLayer[];
-  stackOrder: string[];
+  activeCellId: string;
+  rootNodes: LayerNode[];
+  rootEffects: EffectChainItem[];
+  cellData: { cellId: string; data: Uint16Array }[];
   documentSettings?: PmxDocumentSettings;
 }
 
 /** .pmx を生成 */
-export function savePmx(width: number, height: number, layers: PmxLayer[], activeId: string, extras: PmxSaveExtras = {}): Blob {
+export function savePmx(
+  width: number, height: number,
+  rootNodes: LayerNode[], rootEffects: EffectChainItem[],
+  cellData: { cellId: string; data: Uint16Array }[],
+  activeCellId: string,
+  extras: PmxSaveExtras = {},
+): Blob {
   const manifest: PmxManifest = {
     version: PMX_VERSION,
     app: 'PhotonMixer',
-    width, height, activeId,
-    layers: layers.map(l => ({ ...l.info, file: `layers/${l.info.id}.f16` })),
-    effectLayers: extras.effectLayers,
-    stackOrder: extras.stackOrder,
+    width, height, activeCellId,
+    rootNodes,
+    rootEffects,
     documentSettings: extras.documentSettings,
   };
 
   const files: Record<string, Uint8Array> = {
     'manifest.json': new TextEncoder().encode(JSON.stringify(manifest, null, 2)),
   };
-  for (const l of layers) {
-    files[`layers/${l.info.id}.f16`] = new Uint8Array(l.data.buffer, l.data.byteOffset, l.data.byteLength);
+  for (const { cellId, data } of cellData) {
+    files[`layers/${cellId}.f16`] = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
   }
 
   const zipped = fflate.zipSync(files);
@@ -100,21 +90,35 @@ export async function loadPmx(blob: Blob): Promise<PmxLoadResult> {
   if (!manifestBytes) throw new Error('Invalid .pmx: manifest.json not found');
   const manifest: PmxManifest = JSON.parse(new TextDecoder().decode(manifestBytes));
 
-  const layers: PmxLayer[] = [];
-  for (const entry of manifest.layers) {
-    const bytes = unzipped[entry.file];
-    if (!bytes) throw new Error(`Invalid .pmx: ${entry.file} not found`);
-    const copy = bytes.slice();
-    const data = new Uint16Array(copy.buffer, copy.byteOffset, copy.byteLength / 2);
-    const { file, ...info } = entry;
-    layers.push({ info, data });
+  // v2 形式のみ対応（旧形式は手動マイグレーション）
+  if (!manifest.rootNodes) {
+    throw new Error('Unsupported .pmx format (v1.x). Manual migration required.');
   }
 
-  const effectLayers = manifest.effectLayers ?? [];
-  const stackOrder = manifest.stackOrder ?? [...layers.map(l => l.info.id), ...effectLayers.map(e => e.id)];
+  // 各セルのピクセルデータを読み込み
+  const cellData: { cellId: string; data: Uint16Array }[] = [];
+  const collectCells = (nodes: LayerNode[]) => {
+    for (const n of nodes) {
+      if (n.kind === 'cell') {
+        const bytes = unzipped[`layers/${n.id}.f16`];
+        if (bytes) {
+          const copy = bytes.slice();
+          const data = new Uint16Array(copy.buffer, copy.byteOffset, copy.byteLength / 2);
+          cellData.push({ cellId: n.id, data });
+        }
+      } else if (n.kind === 'folder') {
+        collectCells(n.children);
+      }
+    }
+  };
+  collectCells(manifest.rootNodes);
 
   return {
-    width: manifest.width, height: manifest.height, activeId: manifest.activeId,
-    layers, effectLayers, stackOrder, documentSettings: manifest.documentSettings,
+    width: manifest.width, height: manifest.height,
+    activeCellId: manifest.activeCellId,
+    rootNodes: manifest.rootNodes,
+    rootEffects: manifest.rootEffects ?? [],
+    cellData,
+    documentSettings: manifest.documentSettings,
   };
 }

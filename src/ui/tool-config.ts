@@ -18,7 +18,8 @@ export type Category = 'draw' | 'fill' | 'select';
 
 export type ParamKey =
   | 'size' | 'opacity' | 'wet' | 'stabilize'
-  | 'textureScale' | 'tolerance' | 'mixMode' | 'curve';
+  | 'textureScale' | 'tolerance' | 'mixMode' | 'curve'
+  | 'pressureOpacity';
 
 /** コントロール種別ごとの定義（判別可能ユニオン） */
 export type ParamDef =
@@ -31,6 +32,10 @@ export type ParamDef =
       key: ParamKey; kind: 'select'; label: string;
       options: [value: string, label: string][];
       default: string; apply(v: string, e: EngineCtx): void;
+    }
+  | {
+      key: ParamKey; kind: 'checkbox'; label: string;
+      default: boolean; apply(v: boolean, e: EngineCtx): void;
     };
 
 export interface ToolDef {
@@ -52,6 +57,7 @@ export const CATEGORIES: { id: Category; label: string }[] = [
 export const PARAM_DEFS: Record<ParamKey, ParamDef> = {
   size:         { key: 'size',         kind: 'range', label: 'サイズ', min: 1, max: 100, unit: 'px', default: 20, apply: (v, e) => e.setSize(v) },
   opacity:      { key: 'opacity',      kind: 'range', label: '不透明', min: 1, max: 100, unit: '%',  default: 100, apply: (v, e) => e.setOpacity(v / 100) },
+  pressureOpacity: { key: 'pressureOpacity', kind: 'checkbox', label: '筆圧濃度', default: false, apply: (v, e) => e.setPressureOpacity(v) },
   wet:          { key: 'wet',          kind: 'range', label: 'にじみ', min: 0, max: 100, unit: '%',  default: 0,   apply: (v, e) => e.setWet(v / 100) },
   stabilize:    { key: 'stabilize',    kind: 'range', label: '補正',   min: 0, max: 100, unit: '%',  default: 30,  apply: (v, e) => e.setStabilize(v) },
   textureScale: { key: 'textureScale', kind: 'range', label: 'スケール', min: 1, max: 20, unit: 'x', default: 1,   apply: (v, e) => e.setTextureScale(v) },
@@ -69,8 +75,8 @@ export const PARAM_DEFS: Record<ParamKey, ParamDef> = {
 };
 
 export const TOOLS: ToolDef[] = [
-  { id: 'brush',     label: 'ブラシ',   icon: '🖌️', category: 'draw',   shortcut: 'b', params: ['size', 'opacity', 'wet', 'mixMode', 'stabilize', 'curve', 'textureScale'] },
-  { id: 'eraser',    label: '消しゴム', icon: '🧹', category: 'draw',   shortcut: 'e', params: ['size', 'opacity', 'stabilize', 'curve'] },
+  { id: 'brush',     label: 'ブラシ',   icon: '🖌️', category: 'draw',   shortcut: 'b', params: ['size', 'opacity', 'pressureOpacity', 'wet', 'mixMode', 'stabilize', 'curve', 'textureScale'] },
+  { id: 'eraser',    label: '消しゴム', icon: '🧹', category: 'draw',   shortcut: 'e', params: ['size', 'opacity', 'pressureOpacity', 'stabilize', 'curve'] },
   { id: 'blur',      label: 'ぼかし',   icon: '💧', category: 'draw',   shortcut: 'u', params: ['size', 'stabilize'] },
   { id: 'line',      label: '直線',     icon: '📏', category: 'draw',   shortcut: 'v', params: ['size', 'opacity'] },
   { id: 'spoit',     label: 'スポイト', icon: '🧪', category: 'fill',   shortcut: 'i', params: [] },

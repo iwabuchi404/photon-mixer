@@ -163,7 +163,7 @@ export class StrokeManager {
  * - fill  : バケツ塗り（実行直後の committed スナップショットを保持し、rebake で上書き再現）
  */
 export type StrokeRecord =
-  | { kind: 'stroke'; points: StrokePoint[]; erase: boolean; alphaLock?: boolean }
+  | { kind: 'stroke'; points: StrokePoint[]; erase: boolean; alphaLock?: boolean; pressureOpacity?: boolean }
   | { kind: 'fill'; snapshot: Uint16Array; bytesPerRow: number };
 
 /**

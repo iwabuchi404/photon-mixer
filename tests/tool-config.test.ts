@@ -65,6 +65,7 @@ describe('tool-config 整合性', () => {
     const mock: EngineCtx = {
       setSize: (v) => calls.push(`size:${v}`),
       setOpacity: (v) => calls.push(`opacity:${v}`),
+      setPressureOpacity: (v) => calls.push(`pressureOpacity:${v}`),
       setWet: (v) => calls.push(`wet:${v}`),
       setStabilize: (v) => calls.push(`stab:${v}`),
       setMixMode: (v) => calls.push(`mix:${v}`),
@@ -74,8 +75,16 @@ describe('tool-config 整合性', () => {
     };
     (PARAM_DEFS.size as any).apply(40, mock);
     (PARAM_DEFS.opacity as any).apply(50, mock);   // 50% → 0.5
+    (PARAM_DEFS.pressureOpacity as any).apply(true, mock);
     (PARAM_DEFS.tolerance as any).apply(20, mock);  // 20% → 0.2
     (PARAM_DEFS.mixMode as any).apply('progressive', mock);
-    assert.deepStrictEqual(calls, ['size:40', 'opacity:0.5', 'tol:0.2', 'mix:progressive']);
+    assert.deepStrictEqual(calls, ['size:40', 'opacity:0.5', 'pressureOpacity:true', 'tol:0.2', 'mix:progressive']);
+  });
+
+  test('筆圧濃度はブラシと消しゴムに表示される', () => {
+    assert.ok(getToolDef('brush').params.includes('pressureOpacity'));
+    assert.ok(getToolDef('eraser').params.includes('pressureOpacity'));
+    assert.strictEqual(PARAM_DEFS.pressureOpacity.kind, 'checkbox');
+    assert.strictEqual(PARAM_DEFS.pressureOpacity.default, false);
   });
 });

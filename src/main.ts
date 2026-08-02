@@ -9,6 +9,7 @@ import { Interpolator } from './pen/interpolation.js';
 import { PostCorrector } from './pen/post-correction.js';
 import { StrokeManager, StrokeHistory } from './pen/stroke.js';
 import { RenderPipeline } from './render/pipeline.js';
+import type { LayerNode, CellNode, EffectChainItem } from './render/layer-model.js';
 import { PerfMonitor } from './ui/perf-monitor.js';
 import { Viewport } from './viewport.js';
 import { srgbToLinear, linearColorToSrgb } from './color/linear.js';
@@ -93,12 +94,14 @@ interface AppState {
   textureScale: number;
   bucketTolerance: number; // 0-1（塗りつぶし／自動選択の色差許容）
   selectMode: 'rect' | 'lasso' | 'wand'; // 選択ツールのモード
+  pressureOpacity: boolean; // 筆圧で不透明度を反映
 }
 
 /** パラメータ → 対応するDOMコントロールのID（値の保存/復元に使う） */
 const PARAM_CONTROLS: Record<ParamKey, { id: string; num?: string; val?: string }> = {
   size:         { id: 'brush-size', num: 'brush-size-num' },
   opacity:      { id: 'brush-alpha', val: 'brush-alpha-val' },
+  pressureOpacity: { id: 'brush-pressure-opacity' },
   wet:          { id: 'brush-wet', val: 'brush-wet-val' },
   stabilize:    { id: 'brush-stabilize', val: 'brush-stabilize-val' },
   curve:        { id: 'pressure-curve' },
@@ -147,6 +150,7 @@ class PhotonMixerApp {
     textureScale: 1.0,
     bucketTolerance: 0,
     selectMode: 'rect',
+    pressureOpacity: false,
   };
 
   private rawPoints: import('./pen/input.js').PointerPoint[] = [];
@@ -255,12 +259,15 @@ class PhotonMixerApp {
       if (!this.renderPipeline) return;
       try {
         const { width, height } = this.renderPipeline.getCanvasSize();
-        const layers = await this.renderPipeline.readAllLayers();
-        const blob = savePmx(width, height, layers, this.renderPipeline.getActiveLayerId(), {
-          documentSettings: { view: this.currentViewSettings(), swatches: this.colorPicker?.getSwatches() ?? [] },
-          effectLayers: this.renderPipeline.getEffectSpecs(),
-          stackOrder: this.renderPipeline.getStackOrder(),
-        });
+        const cellData = await this.renderPipeline.readAllCells();
+        const blob = savePmx(
+          width, height,
+          this.renderPipeline.getRootNodes(),
+          this.renderPipeline.getRootEffects(),
+          cellData.map(({ cell, data }) => ({ cellId: cell.id, data })),
+          this.renderPipeline.getActiveLayerId(),
+          { documentSettings: { view: this.currentViewSettings(), swatches: this.colorPicker?.getSwatches() ?? [] } },
+        );
         await saveAutosave(blob);
       } catch (e) {
         console.warn('autosave failed:', e);
@@ -291,93 +298,201 @@ class PhotonMixerApp {
   }
 
   /**
-   * レイヤーパネルを現在の状態から再構築する
-   * 上が前面になるようリスト逆順で表示
+   * レイヤーパネルを現在の状態から再構築する（3オブジェクト構造・26px行デザイン）
+   * ツリーを再帰的に表示。上が前面になるよう逆順で表示。
+   * ブレンドモード・不透明度は選択セルの共有ストリップで編集（行には表示しない）
    */
   private rebuildLayerPanel(): void {
     const list = document.getElementById('layer-list');
     if (!list || !this.renderPipeline) return;
-    const layers = this.renderPipeline.getLayers();
+    const nodes = this.renderPipeline.getRootNodes();
     const activeId = this.renderPipeline.getActiveLayerId();
-    const blendModes: { v: string; label: string }[] = [
-      { v: 'normal', label: '通常' },
-      { v: 'multiply', label: '乗算' },
-      { v: 'screen', label: 'スクリーン' },
-      { v: 'overlay', label: 'オーバーレイ' },
-      { v: 'add', label: '加算（光）' },
-    ];
 
     list.innerHTML = '';
-    // 前面（配列末尾）が上に来るよう逆順
-    for (let i = layers.length - 1; i >= 0; i--) {
-      const layer = layers[i];
-      const isActive = layer.id === activeId;
-      const row = document.createElement('div');
-      row.style.cssText = `padding: 5px 8px; border-bottom: 1px solid #333; cursor: pointer; ${isActive ? 'background:#1c3a1c;' : ''}`;
-      row.addEventListener('click', () => {
-        this.renderPipeline?.setActiveLayer(layer.id);
-        this.rebuildLayerPanel();
-        this.refreshEffectEdit(); // 効果レイヤーなら編集パネル表示
-      });
-      const isEffect = layer.kind === 'effect';
+    // 前面（配列末尾）が上に来るよう逆順で表示
+    const renderNodes = (nodeList: LayerNode[], depth: number) => {
+      for (let i = nodeList.length - 1; i >= 0; i--) {
+        const node = nodeList[i];
+        const row = document.createElement('div');
+        row.className = 'layer-row' + (node.kind === 'folder' ? ' folder-row' : '');
+        row.style.paddingLeft = `${6 + depth * 14}px`;
+        if (node.id === activeId) row.classList.add('active');
 
-      // 1行目: 表示トグル + 名前
-      const top = document.createElement('div');
-      top.style.cssText = 'display:flex; align-items:center; gap:6px;';
+        if (node.kind === 'folder') {
+          // フォルダ行: 畳み展开 + 表示 + 名前
+          const collapse = document.createElement('span');
+          collapse.className = 'collapse-arrow';
+          collapse.textContent = node.collapsed ? '▸' : '▾';
+          collapse.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.renderPipeline?.setFolderCollapsed(node.id, !node.collapsed);
+            this.rebuildLayerPanel();
+          });
+          const eye = document.createElement('span');
+          eye.className = 'layer-eye' + (node.visible ? '' : ' hidden');
+          eye.textContent = node.visible ? '◉' : '○';
+          eye.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.renderPipeline?.setLayerVisible(node.id, !node.visible);
+            this.rebuildLayerPanel();
+          });
+          const nameEl = document.createElement('span');
+          nameEl.className = 'layer-name';
+          nameEl.textContent = node.name;
+          row.appendChild(collapse);
+          row.appendChild(eye);
+          row.appendChild(nameEl);
+          list.appendChild(row);
+          if (!node.collapsed) {
+            renderNodes(node.children, depth + 1);
+          }
+        } else {
+          // セル行: 表示 + 名前 + アルファロック + 不透明度帯
+          // 不透明度の帯（行背景右側にオレンジの幅で表現）
+          const band = document.createElement('div');
+          band.className = 'opacity-band';
+          band.style.width = `${Math.round(node.opacity * 100)}%`;
+          row.appendChild(band);
+
+          const eye = document.createElement('span');
+          eye.className = 'layer-eye' + (node.visible ? '' : ' hidden');
+          eye.textContent = node.visible ? '◉' : '○';
+          eye.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.renderPipeline?.setLayerVisible(node.id, !node.visible);
+            this.rebuildLayerPanel();
+          });
+          const nameEl = document.createElement('span');
+          nameEl.className = 'layer-name';
+          nameEl.textContent = node.name;
+          const lock = document.createElement('span');
+          lock.className = 'layer-lock' + (node.alphaLock ? ' on' : '');
+          lock.textContent = node.alphaLock ? '🔒' : '🔓';
+          lock.title = '透明部分を保護';
+          lock.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.renderPipeline?.setLayerAlphaLock(node.id, !node.alphaLock);
+            this.rebuildLayerPanel();
+          });
+          row.appendChild(eye);
+          row.appendChild(nameEl);
+          row.appendChild(lock);
+          row.addEventListener('click', () => {
+            this.renderPipeline?.setActiveLayer(node.id);
+            this.rebuildLayerPanel();
+            this.refreshEffectEdit();
+          });
+          list.appendChild(row);
+        }
+      }
+    };
+    renderNodes(nodes, 0);
+
+    // 選択セルの共有ストリップ（ブレンドモード + 不透明度）を更新
+    this.updateActiveStrip();
+    // 効果チェーンパネルも更新
+    this.rebuildEffectChainPanel();
+  }
+
+  /** 選択セルの共有ストリップ（ブレンドモード + 不透明度）を更新 */
+  private updateActiveStrip(): void {
+    const strip = document.getElementById('layer-active-strip');
+    if (!strip || !this.renderPipeline) return;
+    const activeId = this.renderPipeline.getActiveLayerId();
+    if (!activeId) { strip.style.display = 'none'; return; }
+    // アクティブセルを検索
+    const nodes = this.renderPipeline.getRootNodes();
+    const findCell = (list: LayerNode[]): CellNode | null => {
+      for (const n of list) {
+        if (n.kind === 'cell' && n.id === activeId) return n;
+        if (n.kind === 'folder') { const c = findCell(n.children); if (c) return c; }
+      }
+      return null;
+    };
+    const cell = findCell(nodes);
+    if (!cell) { strip.style.display = 'none'; return; }
+    strip.style.display = '';
+    const blendSel = document.getElementById('strip-blend-mode') as HTMLSelectElement;
+    const opSlider = document.getElementById('strip-opacity') as HTMLInputElement;
+    const opVal = document.getElementById('strip-opacity-val');
+    if (blendSel) {
+      blendSel.value = cell.blendMode;
+      blendSel.onchange = () => {
+        this.renderPipeline?.setLayerBlendMode(activeId, blendSel.value as any);
+        this.rebuildLayerPanel();
+      };
+    }
+    if (opSlider && opVal) {
+      opSlider.value = Math.round(cell.opacity * 100).toString();
+      opVal.textContent = String(Math.round(cell.opacity * 100));
+      opSlider.oninput = () => {
+        const v = parseInt(opSlider.value) / 100;
+        this.renderPipeline?.setLayerOpacity(activeId, v);
+        // 行の帯を即時更新（パネル再構築なしで）
+        const band = document.querySelector('.layer-row.active .opacity-band') as HTMLElement;
+        if (band) band.style.width = `${Math.round(v * 100)}%`;
+        opVal.textContent = String(Math.round(v * 100));
+      };
+    }
+  }
+
+  /** 効果チェーンパネルを再構築 */
+  private effectTab: 'cell' | 'root' = 'cell';
+  private rebuildEffectChainPanel(): void {
+    const list = document.getElementById('effect-chain-list');
+    if (!list || !this.renderPipeline) return;
+    list.innerHTML = '';
+    let effects: EffectChainItem[];
+    if (this.effectTab === 'root') {
+      effects = this.renderPipeline.getRootEffects();
+    } else {
+      const activeId = this.renderPipeline.getActiveLayerId();
+      if (!activeId) { return; }
+      const nodes = this.renderPipeline.getRootNodes();
+      const findCell = (list: LayerNode[]): CellNode | null => {
+        for (const n of list) {
+          if (n.kind === 'cell' && n.id === activeId) return n;
+          if (n.kind === 'folder') { const c = findCell(n.children); if (c) return c; }
+        }
+        return null;
+      };
+      const cell = findCell(nodes);
+      effects = cell?.effects ?? [];
+    }
+    for (const eff of effects) {
+      const row = document.createElement('div');
+      row.className = 'effect-chain-row' + (eff.id === this.editingEffectId ? ' active' : '');
       const eye = document.createElement('span');
-      eye.textContent = layer.visible ? '👁' : '—';
-      eye.style.cssText = 'cursor:pointer; width:16px;';
+      eye.className = 'eff-eye';
+      eye.textContent = eff.visible ? '◉' : '○';
+      eye.style.color = eff.visible ? '' : 'var(--pm-text-faint)';
       eye.addEventListener('click', (e) => {
         e.stopPropagation();
-        this.renderPipeline?.setLayerVisible(layer.id, !layer.visible);
-        this.rebuildLayerPanel();
+        this.renderPipeline?.setEffectVisible(eff.id, !eff.visible);
+        this.rebuildEffectChainPanel();
       });
       const nameEl = document.createElement('span');
-      nameEl.textContent = layer.name;
-      nameEl.style.cssText = 'flex:1; color:' + (isActive ? '#9f9' : '#ccc');
-      // アルファロック（透明部分保護）トグル
-      const lock = document.createElement('span');
-      lock.textContent = layer.alphaLock ? '🔒' : '🔓';
-      lock.title = '透明部分を保護';
-      lock.style.cssText = `cursor:pointer; width:16px; ${layer.alphaLock ? '' : 'opacity:0.4;'}`;
-      lock.addEventListener('click', (e) => {
+      nameEl.className = 'eff-name';
+      nameEl.textContent = eff.name;
+      const del = document.createElement('span');
+      del.className = 'eff-del';
+      del.textContent = '×';
+      del.title = '効果を削除';
+      del.addEventListener('click', (e) => {
         e.stopPropagation();
-        this.renderPipeline?.setLayerAlphaLock(layer.id, !layer.alphaLock);
-        this.rebuildLayerPanel();
+        this.renderPipeline?.removeEffect(eff.id);
+        if (this.editingEffectId === eff.id) this.editingEffectId = null;
+        this.rebuildEffectChainPanel();
+        this.refreshEffectEdit();
       });
-      top.appendChild(eye);
-      top.appendChild(nameEl);
-      if (!isEffect) top.appendChild(lock); // 効果レイヤーにアルファロックは無い
-
-      // 2行目: 合成モード + 不透明度
-      const ctl = document.createElement('div');
-      ctl.style.cssText = 'display:flex; align-items:center; gap:4px; margin-top:3px;';
-      const sel = document.createElement('select');
-      sel.style.cssText = 'flex:1; background:#1a1a1a; color:#fff; border:1px solid #444; font-family:monospace; font-size:10px;';
-      for (const m of blendModes) {
-        const opt = document.createElement('option');
-        opt.value = m.v; opt.textContent = m.label;
-        if (m.v === 'add') opt.title = 'Linear Dodge: リニア空間で光量を足します';
-        if (m.v === layer.blendMode) opt.selected = true;
-        sel.appendChild(opt);
-      }
-      sel.addEventListener('click', (e) => e.stopPropagation());
-      sel.addEventListener('change', () => {
-        this.renderPipeline?.setLayerBlendMode(layer.id, sel.value as any);
+      row.appendChild(eye);
+      row.appendChild(nameEl);
+      row.appendChild(del);
+      row.addEventListener('click', () => {
+        this.editingEffectId = eff.id;
+        this.rebuildEffectChainPanel();
+        this.refreshEffectEdit();
       });
-      const op = document.createElement('input');
-      op.type = 'range'; op.min = '0'; op.max = '100';
-      op.value = Math.round(layer.opacity * 100).toString();
-      op.style.cssText = 'width:60px;';
-      op.addEventListener('click', (e) => e.stopPropagation());
-      op.addEventListener('input', () => {
-        this.renderPipeline?.setLayerOpacity(layer.id, parseInt(op.value) / 100);
-      });
-      if (!isEffect) ctl.appendChild(sel); // 効果レイヤーは合成モード非対応（不透明度=効果の強さ）
-      ctl.appendChild(op);
-
-      row.appendChild(top);
-      row.appendChild(ctl);
       list.appendChild(row);
     }
   }
@@ -389,13 +504,16 @@ class PhotonMixerApp {
     if (!this.renderPipeline) return;
     try {
       const { width, height } = this.renderPipeline.getCanvasSize();
-      const layers = await this.renderPipeline.readAllLayers();
+      const cellData = await this.renderPipeline.readAllCells();
       const activeId = this.renderPipeline.getActiveLayerId();
-      const blob = savePmx(width, height, layers, activeId, {
-        documentSettings: { view: this.currentViewSettings(), swatches: this.colorPicker?.getSwatches() ?? [] },
-        effectLayers: this.renderPipeline.getEffectSpecs(),
-        stackOrder: this.renderPipeline.getStackOrder(),
-      });
+      const blob = savePmx(
+        width, height,
+        this.renderPipeline.getRootNodes(),
+        this.renderPipeline.getRootEffects(),
+        cellData.map(({ cell, data }) => ({ cellId: cell.id, data })),
+        activeId,
+        { documentSettings: { view: this.currentViewSettings(), swatches: this.colorPicker?.getSwatches() ?? [] } },
+      );
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -414,8 +532,12 @@ class PhotonMixerApp {
   private async openPmxFile(file: File): Promise<void> {
     if (!this.renderPipeline) return;
     try {
-      const { width, height, activeId, layers, effectLayers, stackOrder, documentSettings } = await loadPmx(file);
-      this.renderPipeline.loadDocument(width, height, layers, effectLayers, stackOrder, activeId);
+      const { width, height, activeCellId, rootNodes, rootEffects, cellData, documentSettings } = await loadPmx(file);
+      this.renderPipeline.loadDocument(width, height, rootNodes, rootEffects, activeCellId);
+      // セルのピクセルデータをテクスチャに書き込む
+      for (const { cellId, data } of cellData) {
+        this.renderPipeline.writeCellData(cellId, data);
+      }
       // View 設定・スウォッチを復元
       if (documentSettings) {
         this.applyViewSettings(documentSettings.view);
@@ -516,8 +638,6 @@ class PhotonMixerApp {
 
   private handlePenInput(event: import('./pen/input.js').PenInputEvent): void {
     if (this.state.isPanning) return;
-    // 効果（非破壊）レイヤーが選択中はキャンバス操作を受け付けない（描画対象はペイントレイヤーのみ）
-    if (this.renderPipeline?.isActiveEffect()) return;
 
     const { type, point } = event;
 
@@ -737,7 +857,11 @@ class PhotonMixerApp {
           if (line.length > 0) {
             this.bakeColorIntoPoints(line);
             this.renderPipeline?.commitStroke(line);
-            this.activeHistory().addRecord({ kind: 'stroke', points: line, erase: false, alphaLock: this.renderPipeline?.getActiveLayerAlphaLock() ?? false });
+            this.activeHistory().addRecord({
+              kind: 'stroke', points: line, erase: false,
+              alphaLock: this.renderPipeline?.getActiveLayerAlphaLock() ?? false,
+              pressureOpacity: this.state.pressureOpacity,
+            });
           }
           this.renderPipeline?.setCurrentStroke([]);
           this.lineStart = null;
@@ -761,7 +885,11 @@ class PhotonMixerApp {
           const colored = this.buildColoredStroke(true);
           if (colored.length > 0) {
             this.renderPipeline?.commitStroke(colored);
-            this.activeHistory().addRecord({ kind: 'stroke', points: colored, erase, alphaLock: this.renderPipeline?.getActiveLayerAlphaLock() ?? false });
+            this.activeHistory().addRecord({
+              kind: 'stroke', points: colored, erase,
+              alphaLock: this.renderPipeline?.getActiveLayerAlphaLock() ?? false,
+              pressureOpacity: this.state.pressureOpacity,
+            });
           }
           // 点ごとの色モードを解除
           this.renderPipeline?.updateBrushConfig({ usePointColor: false });
@@ -777,7 +905,11 @@ class PhotonMixerApp {
             // rebake 時に色を忠実に再現するため、各点に現在のブラシ色を焼き込む
             this.bakeColorIntoPoints(finalStroke);
             this.renderPipeline?.commitStroke(finalStroke);
-            this.activeHistory().addRecord({ kind: 'stroke', points: finalStroke, erase, alphaLock: this.renderPipeline?.getActiveLayerAlphaLock() ?? false });
+            this.activeHistory().addRecord({
+              kind: 'stroke', points: finalStroke, erase,
+              alphaLock: this.renderPipeline?.getActiveLayerAlphaLock() ?? false,
+              pressureOpacity: this.state.pressureOpacity,
+            });
           }
         }
 
@@ -1268,7 +1400,10 @@ class PhotonMixerApp {
   private saveToolSettings(tool: Tool): void {
     for (const key of getToolDef(tool).params) {
       const el = document.getElementById(PARAM_CONTROLS[key].id) as HTMLInputElement | HTMLSelectElement | null;
-      if (el) this.toolSettings.set(tool, key, el.value);
+      if (el) {
+        const value = el instanceof HTMLInputElement && el.type === 'checkbox' ? el.checked : el.value;
+        this.toolSettings.set(tool, key, value);
+      }
     }
   }
 
@@ -1279,7 +1414,8 @@ class PhotonMixerApp {
       if (v === undefined) continue;
       const ctrl = PARAM_CONTROLS[key];
       const el = document.getElementById(ctrl.id) as HTMLInputElement | HTMLSelectElement | null;
-      if (el) el.value = String(v);
+      if (el instanceof HTMLInputElement && el.type === 'checkbox') el.checked = Boolean(v);
+      else if (el) el.value = String(v);
       if (ctrl.num) {
         const n = document.getElementById(ctrl.num) as HTMLInputElement | null;
         if (n) n.value = String(v);
@@ -1289,8 +1425,8 @@ class PhotonMixerApp {
         if (s) s.textContent = String(v);
       }
       const def = PARAM_DEFS[key];
-      const applyValue = def.kind === 'range' ? Number(v) : String(v);
-      (def.apply as (val: number | string, e: EngineCtx) => void)(applyValue, this.engineCtx);
+      const applyValue = def.kind === 'range' ? Number(v) : def.kind === 'checkbox' ? Boolean(v) : String(v);
+      (def.apply as (val: number | string | boolean, e: EngineCtx) => void)(applyValue, this.engineCtx);
     }
   }
 
@@ -1330,12 +1466,19 @@ class PhotonMixerApp {
     curve: [],
   };
 
-  /** 効果（非破壊エフェクト）レイヤーを追加して編集対象にする */
+  /** 効果を追加（タブ状態に応じてセルまたはルートへ） */
   private addEffect(type: FilterType): void {
     if (!this.renderPipeline) return;
-    const id = this.renderPipeline.addEffectLayer(type);
-    this.renderPipeline.setActiveLayer(id);
-    this.rebuildLayerPanel();
+    let id: string;
+    if (this.effectTab === 'root') {
+      id = this.renderPipeline.addEffectToRoot(type);
+    } else {
+      const activeId = this.renderPipeline.getActiveLayerId();
+      if (!activeId) return;
+      id = this.renderPipeline.addEffectToCell(activeId, type);
+    }
+    this.editingEffectId = id;
+    this.rebuildEffectChainPanel();
     this.refreshEffectEdit();
   }
 
@@ -1375,7 +1518,7 @@ class PhotonMixerApp {
 
   /** アクティブレイヤーが効果なら編集パネルを表示、そうでなければ隠す */
   private refreshEffectEdit(): void {
-    const id = this.renderPipeline?.getActiveLayerId();
+    const id = this.editingEffectId;
     const eff = id ? this.renderPipeline?.getEffect(id) : null;
     const params = document.getElementById('filter-params');
     if (!id || !eff) {
@@ -1383,16 +1526,17 @@ class PhotonMixerApp {
       if (params) params.style.display = 'none';
       return;
     }
-    this.editingEffectId = id;
     const title = document.getElementById('effect-editor-title');
-    const layer = this.renderPipeline?.getLayers().find(l => l.id === id);
-    if (title) title.textContent = `⚙ ${layer?.name ?? '効果'} の設定`;
+    const ownerLabel = eff.owner.kind === 'root' ? '撮影スタック' : `セル: ${eff.owner.cellId}`;
+    if (title) title.textContent = `⚙ ${ownerLabel} の効果設定`;
     const visible = new Set(PhotonMixerApp.FILTER_PARAMS[eff.filterType]);
     document.querySelectorAll<HTMLElement>('#filter-params [data-fparam]').forEach(row => {
       row.style.display = visible.has(row.dataset.fparam!) ? '' : 'none';
     });
     this.setFilterControls(eff.params);
-    this.populateSourceSelect(id, eff.source);
+    // 入力ソース選択は新モデルでは不要（効果はセルまたはルートに付属）
+    const sourceSel = document.getElementById('filter-source');
+    if (sourceSel) sourceSel.style.display = 'none';
     const curveEd = document.getElementById('filter-curve-editor');
     if (curveEd) curveEd.style.display = eff.filterType === 'curve' ? '' : 'none';
     if (eff.filterType === 'curve' && this.curveEditor) this.curveEditor.setPoints(eff.curvePoints ?? [{ x: 0, y: 0 }, { x: 1, y: 1 }]);
@@ -1404,30 +1548,19 @@ class PhotonMixerApp {
     if (this.editingEffectId) this.renderPipeline?.setEffectParams(this.editingEffectId, this.currentFilterParams());
   }
 
-  /** 効果の入力ソース選択肢を構築（下の全結果 ＋ 各ペイントレイヤー） */
-  private populateSourceSelect(effectId: string, current: string): void {
-    const sel = document.getElementById('filter-source') as HTMLSelectElement | null;
-    if (!sel || !this.renderPipeline) return;
-    sel.innerHTML = '';
-    const add = (value: string, label: string) => {
-      const o = document.createElement('option');
-      o.value = value; o.textContent = label;
-      if (value === current) o.selected = true;
-      sel.appendChild(o);
-    };
-    add('below', '下の全結果');
-    for (const l of this.renderPipeline.getLayers()) {
-      if (l.kind === 'paint' && l.id !== effectId) add(l.id, `レイヤー: ${l.name}`);
-    }
-  }
-
   /** Freeze（焼き込み）: 効果をピクセルに確定する */
-  private freezeEffect(mode: 'withBelow' | 'toBelow'): void {
+  private freezeEffect(): void {
     if (!this.editingEffectId || !this.renderPipeline) return;
-    if (mode === 'withBelow') this.renderPipeline.freezeEffectWithBelow(this.editingEffectId);
-    else this.renderPipeline.freezeEffectToBelow(this.editingEffectId);
+    const eff = this.renderPipeline.getEffect(this.editingEffectId);
+    if (!eff) return;
+    if (eff.owner.kind === 'root') {
+      this.renderPipeline.freezeRootEffects();
+    } else {
+      this.renderPipeline.freezeCellEffects(eff.owner.cellId);
+    }
     // レイヤー構造が変わるため履歴はクリア（焼き込みは Undo 非対応）
     this.layerHistories.clear();
+    this.editingEffectId = null;
     this.rebuildLayerPanel();
     this.refreshEffectEdit();
   }
@@ -1676,6 +1809,7 @@ class PhotonMixerApp {
 
       // ② deposit = ブラシ色と smudge を wet で補間（ぼかしは wet=1 → smudge そのもの）
       const dep = oklabToLinear(mixOklab(origOklab, linearToOklab(smudge), wet));
+      // 筆圧によるα変化はシェーダーで一度だけ適用する。
       p.color = { r: dep.r, g: dep.g, b: dep.b, a: orig.a };
     }
 
@@ -1723,11 +1857,14 @@ class PhotonMixerApp {
 
   /**
    * 各点に現在のブラシ色を焼き込む（Undo/Redo の rebake で色を忠実に再現するため）
+   * 筆圧によるα変化はシェーダー側で適用し、履歴には元のαを保持する。
    */
   private bakeColorIntoPoints(points: StrokePoint[]): void {
     const c = this.state.currentColor;
     for (const p of points) {
-      if (!p.color) p.color = { r: c.r, g: c.g, b: c.b, a: c.a };
+      if (!p.color) {
+        p.color = { r: c.r, g: c.g, b: c.b, a: c.a };
+      }
     }
   }
 
@@ -1797,6 +1934,14 @@ class PhotonMixerApp {
       this.engineCtx.setOpacity(parseInt(alphaSlider.value) / 100);
     });
 
+    // 筆圧で不透明度反映 ON/OFF
+    const pressureOpacityCheckbox = document.getElementById('brush-pressure-opacity') as HTMLInputElement;
+    pressureOpacityCheckbox?.addEventListener('change', () => {
+      const enabled = pressureOpacityCheckbox.checked;
+      this.toolSettings.set(this.state.currentTool, 'pressureOpacity', enabled);
+      this.engineCtx.setPressureOpacity(enabled);
+    });
+
     wetSlider.addEventListener('input', () => {
       wetVal.textContent = wetSlider.value;
       this.engineCtx.setWet(parseInt(wetSlider.value) / 100);
@@ -1847,6 +1992,10 @@ class PhotonMixerApp {
       this.rebuildLayerPanel();
       this.refreshEffectEdit();
     });
+    document.getElementById('layer-add-folder')?.addEventListener('click', () => {
+      this.renderPipeline?.addFolder();
+      this.rebuildLayerPanel();
+    });
     document.getElementById('layer-del')?.addEventListener('click', () => {
       const id = this.renderPipeline?.getActiveLayerId();
       this.renderPipeline?.removeActiveLayer();
@@ -1861,6 +2010,22 @@ class PhotonMixerApp {
     document.getElementById('layer-down')?.addEventListener('click', () => {
       this.renderPipeline?.moveActiveLayer('down');
       this.rebuildLayerPanel();
+    });
+
+    // 効果チェーン パネル タブ（セル / 撮影スタック）
+    document.getElementById('effect-tab-cell')?.addEventListener('click', () => {
+      this.effectTab = 'cell';
+      document.getElementById('effect-tab-cell')?.classList.add('active');
+      document.getElementById('effect-tab-root')?.classList.remove('active');
+      this.rebuildEffectChainPanel();
+    });
+    document.getElementById('effect-tab-root')?.addEventListener('click', () => {
+      this.effectTab = 'root';
+      document.getElementById('effect-tab-root')?.classList.add('active');
+      document.getElementById('effect-tab-cell')?.classList.remove('active');
+      this.editingEffectId = null;
+      this.rebuildEffectChainPanel();
+      this.refreshEffectEdit();
     });
 
     // 手ブレ補正の強度（0%=補正なし, 100%=最も滑らか）
@@ -1909,11 +2074,8 @@ class PhotonMixerApp {
     document.getElementById('filter-levels')?.addEventListener('click', () => this.addEffect('levels'));
     document.getElementById('filter-curve')?.addEventListener('click', () => this.addEffect('curve'));
     // Freeze（焼き込み）
-    document.getElementById('freeze-with-below')?.addEventListener('click', () => this.freezeEffect('withBelow'));
-    document.getElementById('freeze-to-below')?.addEventListener('click', () => this.freezeEffect('toBelow'));
-    document.getElementById('filter-source')?.addEventListener('change', (e) => {
-      if (this.editingEffectId) this.renderPipeline?.setEffectSource(this.editingEffectId, (e.target as HTMLSelectElement).value);
-    });
+    document.getElementById('freeze-effect')?.addEventListener('click', () => this.freezeEffect());
+    // 入力ソース選択は新モデルでは廃止（効果はセルまたはルートに付属）
     // トーンカーブエディタ（変更で編集中の効果へ反映）
     const curveContainer = document.getElementById('filter-curve-editor');
     if (curveContainer) {
@@ -2126,6 +2288,7 @@ class PhotonMixerApp {
       useTexture: this.state.useTexture,
       textureScale: this.state.textureScale,
       alphaLock: false,
+      pressureOpacity: this.state.pressureOpacity,
     };
   }
 
@@ -2133,38 +2296,51 @@ class PhotonMixerApp {
    * ブラシ設定を適用
    */
   private applyBrushConfig(config: BrushConfig): void {
+    // 旧プリセットには pressureOpacity が無い場合があるため、ここで既定値を補う
+    const normalizedConfig: BrushConfig = {
+      ...config,
+      pressureOpacity: Boolean(config.pressureOpacity),
+    };
+
     // 色を適用
-    this.updateCurrentColor(config.color);
+    this.updateCurrentColor(normalizedConfig.color);
 
     // 不透明度スライダーを更新
     const alphaSlider = document.getElementById('brush-alpha') as HTMLInputElement;
     const alphaVal = document.getElementById('brush-alpha-val')!;
-    const alpha = Math.round(config.color.a * 100);
+    const alpha = Math.round(normalizedConfig.color.a * 100);
     alphaSlider.value = alpha.toString();
     alphaVal.textContent = alpha.toString();
+
+    // 筆圧濃度チェックボックスを更新
+    const pressureOpacityCheckbox = document.getElementById('brush-pressure-opacity') as HTMLInputElement;
+    if (pressureOpacityCheckbox) {
+      pressureOpacityCheckbox.checked = normalizedConfig.pressureOpacity;
+      this.state.pressureOpacity = normalizedConfig.pressureOpacity;
+    }
 
     // にじみスライダーを更新
     const wetSlider = document.getElementById('brush-wet') as HTMLInputElement;
     const wetVal = document.getElementById('brush-wet-val')!;
-    const wet = Math.round(config.wetRatio * 100);
+    const wet = Math.round(normalizedConfig.wetRatio * 100);
     wetSlider.value = wet.toString();
     wetVal.textContent = wet.toString();
-    this.state.wetRatio = config.wetRatio;
+    this.state.wetRatio = normalizedConfig.wetRatio;
 
     // 方式セレクトを更新
     const mixModeSelect = document.getElementById('mix-mode') as HTMLSelectElement;
-    mixModeSelect.value = config.mixMode;
-    this.state.mixMode = config.mixMode;
+    mixModeSelect.value = normalizedConfig.mixMode;
+    this.state.mixMode = normalizedConfig.mixMode;
 
     // テクスチャスケールを更新
     const textureScaleSlider = document.getElementById('texture-scale') as HTMLInputElement;
     const textureScaleVal = document.getElementById('texture-scale-val')!;
-    textureScaleSlider.value = config.textureScale.toString();
-    textureScaleVal.textContent = config.textureScale.toString();
-    this.state.textureScale = config.textureScale;
+    textureScaleSlider.value = normalizedConfig.textureScale.toString();
+    textureScaleVal.textContent = normalizedConfig.textureScale.toString();
+    this.state.textureScale = normalizedConfig.textureScale;
 
     // RenderPipeline に適用
-    this.renderPipeline?.updateBrushConfig(config);
+    this.renderPipeline?.updateBrushConfig(normalizedConfig);
   }
 
   private handleResize(): void {

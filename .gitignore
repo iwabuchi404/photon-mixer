@@ -12,3 +12,8 @@ release/
 
 # エディタ・AI 設定
 .codex/
+.claude/
+
+# 診断・検証ログ・スクリーンショット
+.kamox/
+diag-out/

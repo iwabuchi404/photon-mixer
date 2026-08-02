@@ -14,6 +14,7 @@ export interface BrushConfig {
   useTexture: boolean;
   textureScale: number;
   alphaLock: boolean; // 透明部分保護（既存の不透明部分にのみ描画）
+  pressureOpacity: boolean; // 筆圧で不透明度を反映
 }
 
 const DEFAULT_BRUSH_CONFIG: BrushConfig = {
@@ -24,6 +25,7 @@ const DEFAULT_BRUSH_CONFIG: BrushConfig = {
   useTexture: false,
   textureScale: 1.0,
   alphaLock: false,
+  pressureOpacity: false,
 };
 
 export class BrushRenderer {
@@ -138,7 +140,8 @@ export class BrushRenderer {
     f32[10] = this.config.textureScale;
     u32[11] = this.config.alphaLock ? 1 : 0;
     u32[12] = this.selectionTexture ? 1 : 0; // use_selection
-    // f32[13..15] は _pad1..3。bbox は renderStroke 側で上書きするためここでは 0 のまま。
+    u32[13] = this.config.pressureOpacity ? 1 : 0; // use_pressure_opacity
+    // f32[14..15] は _pad2..3。bbox は renderStroke 側で上書きするためここでは 0 のまま。
     this.device.queue.writeBuffer(this.uniformBuffer, 0, buf);
   }
 
@@ -220,6 +223,10 @@ export class BrushRenderer {
   updateConfig(config: Partial<BrushConfig>): void {
     this.config = { ...this.config, ...config };
     this.updateUniforms(this.canvasSize.width, this.canvasSize.height);
+  }
+
+  getConfig(): BrushConfig {
+    return { ...this.config, color: { ...this.config.color } };
   }
 
   /**

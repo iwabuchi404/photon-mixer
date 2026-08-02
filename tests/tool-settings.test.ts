@@ -14,6 +14,7 @@ describe('ToolSettingsStore', () => {
     const s = newStore();
     assert.strictEqual(s.get('brush', 'size'), 20);
     assert.strictEqual(s.get('brush', 'opacity'), 100);
+    assert.strictEqual(s.get('brush', 'pressureOpacity'), false);
     assert.strictEqual(s.get('bucket', 'tolerance'), 0);
     // brush は wet を持つが eraser は持たない
     assert.strictEqual(s.get('eraser', 'wet'), undefined);
@@ -51,6 +52,14 @@ describe('ToolSettingsStore', () => {
     assert.strictEqual(s.set('brush', 'mixMode', 'progressive'), 'progressive');
     assert.strictEqual(s.set('brush', 'mixMode', 'bogus'), undefined);
     assert.strictEqual(s.get('brush', 'mixMode'), 'progressive', '不正値で上書きされない');
+  });
+
+  test('checkbox はbooleanだけを正規化して保持する', () => {
+    const s = newStore();
+    assert.strictEqual(s.set('brush', 'pressureOpacity', true), true);
+    assert.strictEqual(s.set('brush', 'pressureOpacity', 'false'), false);
+    assert.strictEqual(s.set('brush', 'pressureOpacity', 'bogus'), undefined);
+    assert.strictEqual(s.get('brush', 'pressureOpacity'), false);
   });
 
   test('getAll はツールの全保持値を返す', () => {

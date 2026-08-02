@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>PhotonMixer Phase 1</title>
+  <title>PhotonMixer</title>
   <script type="importmap">
   {
     "imports": {
@@ -28,7 +28,7 @@
 
     body {
       overflow: hidden;
-      background: #1a1a1a;
+      background: #161616;
       font-family: 'Segoe UI', sans-serif;
     }
 
@@ -38,260 +38,331 @@
       cursor: crosshair;
     }
 
+    /* === 色スキーマ: グレースケール基調 + オレンジ(光量/HDR) + 赤(破壊的操作) === */
+    :root {
+      --pm-bg: #161616;
+      --pm-panel: rgba(20, 20, 20, 0.94);
+      --pm-border: #333;
+      --pm-border-soft: #2a2a2a;
+      --pm-text: #ddd;
+      --pm-text-dim: #888;
+      --pm-text-faint: #666;
+      --pm-accent: #ff7a1a;       /* オレンジ: 光量/HDR関連 */
+      --pm-accent-soft: #b85a14;
+      --pm-danger: #d44;          /* 赤: 破壊的操作 */
+      --pm-select: #2a2a2a;       /* 選択行の背景 */
+      --pm-select-bar: #ddd;      /* 選択行の左端バー */
+    }
+
     #perf-monitor {
       position: fixed;
       top: 10px;
-      left: 10px;
-      background: rgba(0, 0, 0, 0.8);
-      color: #0f0;
-      padding: 10px 15px;
-      border-radius: 5px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.7);
+      color: #aaa;
+      padding: 6px 12px;
+      border-radius: 4px;
       font-family: monospace;
-      font-size: 12px;
+      font-size: 11px;
       pointer-events: none;
       z-index: 1000;
+      display: flex;
+      gap: 14px;
     }
+    .perf-value { color: #fff; }
 
-    .perf-value {
-      color: #fff;
-    }
-
-    .perf-warning {
-      color: #ff0;
-    }
-
-    .perf-error {
-      color: #f00;
-    }
-
-    #brush-controls {
+    /* === 左サイド: ツールバー + ツール設定 === */
+    #left-dock {
       position: fixed;
+      left: 10px;
       top: 10px;
-      right: 10px;
-      background: rgba(0, 0, 0, 0.8);
-      color: #fff;
-      padding: 10px 14px;
-      border-radius: 5px;
-      font-family: monospace;
-      font-size: 12px;
+      bottom: 10px;
+      width: 220px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
       z-index: 1000;
       user-select: none;
-      min-width: 190px;
-    }
-
-    .ctrl-row {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      margin-bottom: 6px;
-    }
-
-    .ctrl-label {
-      width: 58px;
-      color: #aaa;
-    }
-
-    input[type="range"] {
-      width: 80px;
-      cursor: pointer;
-      accent-color: #0f0;
-    }
-
-    .ctrl-val {
-      width: 26px;
-      text-align: right;
-    }
-
-    #clear-btn {
-      width: 100%;
-      margin-top: 4px;
-      padding: 4px 0;
-      background: #2a2a2a;
-      color: #ccc;
-      border: 1px solid #444;
-      border-radius: 3px;
-      cursor: pointer;
-      font-family: monospace;
-      font-size: 11px;
-    }
-
-    #clear-btn:hover {
-      background: #383838;
-      color: #fff;
-    }
-
-    .tool-btn {
-      flex: 1;
-      padding: 6px 0;
-      background: #2a2a2a;
-      color: #888;
-      border: 1px solid #444;
-      border-radius: 3px;
-      cursor: pointer;
-      font-family: monospace;
-      font-size: 11px;
-    }
-
-    .tool-btn.active {
-      background: #0f0;
-      color: #000;
-      border-color: #0f0;
     }
 
     /* 左の縦ツールバー（カテゴリ別） */
     #tool-bar {
-      position: fixed;
-      left: 10px;
-      top: 96px;
+      flex: none;
       display: flex;
-      flex-direction: column;
-      gap: 8px;
-      background: rgba(0, 0, 0, 0.8);
-      padding: 8px;
+      flex-direction: row;
+      gap: 4px;
+      background: var(--pm-panel);
+      border: 1px solid var(--pm-border);
       border-radius: 6px;
-      z-index: 1000;
-      user-select: none;
+      padding: 6px;
+      flex-wrap: wrap;
     }
     .pm-tool-group {
       display: flex;
-      flex-direction: column;
+      flex-direction: row;
       gap: 4px;
     }
     .pm-tool-group + .pm-tool-group {
-      border-top: 1px solid #444;
-      padding-top: 8px;
+      border-left: 1px solid var(--pm-border);
+      padding-left: 6px;
     }
     #tool-bar .tool-btn {
       flex: none;
-      width: 40px;
-      height: 40px;
-      font-size: 18px;
+      width: 34px;
+      height: 34px;
+      font-size: 16px;
       display: flex;
       align-items: center;
       justify-content: center;
     }
-    #tool-bar .tool-btn:hover {
-      background: #383838;
-      color: #fff;
-    }
-    #tool-bar .tool-btn.active:hover {
-      background: #0f0;
-      color: #000;
-    }
 
-    /* 右ドック（縦に複数パネルを並べてスクロール） */
-    #right-dock {
-      position: fixed;
-      right: 10px;
-      top: 10px;
-      bottom: 10px;
-      width: 240px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-      overflow-y: auto;
-      z-index: 1000;
-      user-select: none;
+    /* 共通ボタン */
+    .tool-btn {
+      padding: 5px 0;
+      background: #2a2a2a;
+      color: #999;
+      border: 1px solid var(--pm-border);
+      border-radius: 3px;
+      cursor: pointer;
+      font-family: monospace;
+      font-size: 11px;
+      transition: background 0.1s, color 0.1s;
     }
+    .tool-btn:hover { background: #383838; color: #fff; }
+    .tool-btn.active {
+      background: var(--pm-accent);
+      color: #000;
+      border-color: var(--pm-accent);
+    }
+    .tool-btn.danger:hover { background: var(--pm-danger); color: #fff; border-color: var(--pm-danger); }
+
+    /* パネル共通 */
     .panel {
-      background: rgba(18, 18, 18, 0.92);
-      border: 1px solid #3a3a3a;
-      border-radius: 8px;
-      padding: 12px;
-      color: #eee;
+      background: var(--pm-panel);
+      border: 1px solid var(--pm-border);
+      border-radius: 6px;
+      padding: 10px;
+      color: var(--pm-text);
       font-family: monospace;
       font-size: 12px;
-      flex: none;
     }
     .panel-title {
-      font-size: 11px;
-      color: #7fb2ff;
-      letter-spacing: 0.08em;
-      margin: 0 0 10px;
+      font-size: 10px;
+      color: var(--pm-text-dim);
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      margin: 0 0 8px;
       padding-bottom: 6px;
-      border-bottom: 1px solid #333;
+      border-bottom: 1px solid var(--pm-border-soft);
     }
-    /* ツール設定ヘッダー（左ツールバーとの連動を明示） */
+    /* ツール設定ヘッダー */
     .tool-header {
       display: flex;
       align-items: center;
       gap: 8px;
       margin-bottom: 10px;
       padding-bottom: 8px;
-      border-bottom: 1px solid #333;
+      border-bottom: 1px solid var(--pm-border-soft);
     }
-    .tool-header-icon { font-size: 22px; line-height: 1; }
-    .tool-header-name { font-size: 14px; font-weight: bold; color: #fff; flex: 1; }
+    .tool-header-icon { font-size: 20px; line-height: 1; }
+    .tool-header-name { font-size: 13px; font-weight: bold; color: #fff; flex: 1; }
     .tool-header-badge {
-      font-size: 9px; color: #8aa; border: 1px solid #3a5a5a;
+      font-size: 9px; color: var(--pm-text-dim); border: 1px solid var(--pm-border);
       border-radius: 9px; padding: 1px 7px;
     }
     .tool-hint {
-      color: #9a9; font-size: 11px; line-height: 1.6;
-      background: rgba(80,140,90,0.08); border-left: 2px solid #4a7;
+      color: var(--pm-text-dim); font-size: 11px; line-height: 1.6;
+      background: rgba(255,122,26,0.06); border-left: 2px solid var(--pm-accent-soft);
       padding: 8px 10px; border-radius: 4px; margin-bottom: 4px;
     }
 
-    /* 共通の行レイアウト（余白を広げて視認性UP） */
-    .ctrl-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+    /* 共通の行レイアウト */
+    .ctrl-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
     .ctrl-row:last-child { margin-bottom: 0; }
-    .ctrl-label { width: 56px; flex: none; color: #aaa; }
-    .ctrl-row input[type="range"] { flex: 1; min-width: 0; }
+    .ctrl-label { width: 56px; flex: none; color: var(--pm-text-dim); }
+    .ctrl-row input[type="range"] { flex: 1; min-width: 0; accent-color: var(--pm-accent); }
     .ctrl-val { width: 30px; text-align: right; color: #fff; }
-    .ctrl-unit { color: #888; font-size: 10px; }
+    .ctrl-unit { color: var(--pm-text-faint); font-size: 10px; }
     .ctrl-num {
-      width: 46px; background: #1a1a1a; color: #fff; border: 1px solid #444;
+      width: 46px; background: #1a1a1a; color: #fff; border: 1px solid var(--pm-border);
       border-radius: 3px; padding: 4px; font-family: monospace; font-size: 11px;
     }
     .ctrl-select {
-      flex: 1; background: #1a1a1a; color: #fff; border: 1px solid #444;
+      flex: 1; background: #1a1a1a; color: #fff; border: 1px solid var(--pm-border);
       border-radius: 3px; padding: 4px; font-family: monospace; font-size: 11px; cursor: pointer;
     }
     .ctrl-color {
       width: 30px; height: 24px; flex: none; background: none;
-      border: 1px solid #444; border-radius: 3px; cursor: pointer;
+      border: 1px solid var(--pm-border); border-radius: 3px; cursor: pointer;
     }
     .panel-btn {
-      display: block; width: 100%; margin-top: 8px; padding: 8px 0;
-      background: #2a2a2a; color: #ccc; border: 1px solid #444; border-radius: 4px;
+      display: block; width: 100%; margin-top: 6px; padding: 7px 0;
+      background: #2a2a2a; color: #ccc; border: 1px solid var(--pm-border); border-radius: 4px;
       cursor: pointer; font-family: monospace; font-size: 11px;
     }
     .panel-btn:hover { background: #383838; color: #fff; }
 
-    /* アコーディオン（背景・プリセットなど補助設定） */
-    .accordion { margin-top: 10px; border-top: 1px solid #333; padding-top: 8px; }
+    /* アコーディオン */
+    .accordion { margin-top: 8px; border-top: 1px solid var(--pm-border-soft); padding-top: 8px; }
     .accordion > summary {
-      cursor: pointer; color: #bbb; font-size: 11px; list-style: none;
+      cursor: pointer; color: var(--pm-text-dim); font-size: 11px; list-style: none;
       user-select: none; padding: 2px 0;
     }
     .accordion > summary::-webkit-details-marker { display: none; }
-    .accordion > summary::before { content: '▸ '; color: #666; }
+    .accordion > summary::before { content: '▸ '; color: var(--pm-text-faint); }
     .accordion[open] > summary::before { content: '▾ '; }
-    .accordion > .ctrl-row { margin-top: 8px; }
+    .accordion > .ctrl-row { margin-top: 6px; }
 
-    /* レイヤーパネル */
+    /* === 右サイド: カラー / 表示 / レイヤー / 効果チェーン / ファイル === */
+    #right-dock {
+      position: fixed;
+      right: 10px;
+      top: 10px;
+      bottom: 10px;
+      width: 260px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      overflow-y: auto;
+      z-index: 1000;
+      user-select: none;
+    }
+    #right-dock .panel { flex: none; }
+
+    /* === レイヤーパネル === */
     .layer-head {
       display: flex; align-items: center; gap: 4px;
-      margin-bottom: 8px; padding-bottom: 6px; border-bottom: 1px solid #333;
+      margin-bottom: 8px; padding-bottom: 6px; border-bottom: 1px solid var(--pm-border-soft);
     }
-    .icon-btn { width: 26px; height: 24px; flex: none; padding: 0; }
-    #layer-list { max-height: 200px; overflow-y: auto; border: 1px solid #2a2a2a; border-radius: 4px; }
-    .effects-label {
-      font-size: 10px; color: #9ab; letter-spacing: .04em;
-      margin: 10px 0 6px; border-top: 1px solid #333; padding-top: 8px;
+    .layer-head-title {
+      flex: 1; color: var(--pm-text-dim); letter-spacing: 0.1em;
+      font-size: 10px; text-transform: uppercase;
+    }
+    .icon-btn { width: 24px; height: 22px; flex: none; padding: 0; font-size: 12px; }
+    #layer-list {
+      max-height: 240px; overflow-y: auto;
+      border: 1px solid var(--pm-border-soft); border-radius: 4px;
+      background: #111;
+    }
+    /* レイヤー行: 26px固定高 */
+    .layer-row {
+      height: 26px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0 6px;
+      border-bottom: 1px solid #1c1c1c;
+      cursor: pointer;
+      position: relative;
+      font-size: 11px;
+      color: var(--pm-text);
+    }
+    .layer-row:hover { background: #1e1e1e; }
+    .layer-row.active {
+      background: var(--pm-select);
+      color: #fff;
+    }
+    .layer-row.active::before {
+      content: '';
+      position: absolute;
+      left: 0; top: 0; bottom: 0;
+      width: 3px;
+      background: var(--pm-select-bar);
+    }
+    /* 不透明度の帯（行背景右側にオレンジの幅で表現） */
+    .layer-row .opacity-band {
+      position: absolute;
+      right: 0; top: 0; bottom: 0;
+      background: linear-gradient(90deg, transparent, rgba(255,122,26,0.08));
+      pointer-events: none;
+      z-index: 0;
+    }
+    .layer-row > * { position: relative; z-index: 1; }
+    .layer-row .layer-eye {
+      width: 16px; text-align: center; cursor: pointer; color: var(--pm-text-dim);
+      flex: none;
+    }
+    .layer-row .layer-eye:hover { color: #fff; }
+    .layer-row .layer-eye.hidden { color: var(--pm-text-faint); }
+    .layer-row .layer-name {
+      flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .layer-row .layer-lock {
+      width: 14px; text-align: center; cursor: pointer; flex: none;
+      color: var(--pm-text-faint);
+    }
+    .layer-row .layer-lock.on { color: var(--pm-accent); }
+    .layer-row.folder-row { color: var(--pm-text-dim); }
+    .layer-row.folder-row .layer-name::before { content: '📁 '; }
+    .layer-row .collapse-arrow {
+      width: 12px; text-align: center; cursor: pointer; flex: none;
+      color: var(--pm-text-faint);
     }
 
-    /* Color EV スライダー: 左半分=SDR(通常), 右半分=HDR(発光) を視覚分離 */
+    /* 選択セルの共有ストリップ（ブレンドモード + 不透明度） */
+    #layer-active-strip {
+      display: flex; align-items: center; gap: 6px;
+      padding: 6px; margin-top: 6px;
+      background: #1a1a1a; border: 1px solid var(--pm-border-soft); border-radius: 4px;
+      font-size: 10px;
+    }
+    #layer-active-strip .strip-label { color: var(--pm-text-dim); font-size: 9px; }
+    #layer-active-strip select {
+      flex: 1; background: #111; color: #fff; border: 1px solid var(--pm-border);
+      border-radius: 3px; padding: 2px; font-family: monospace; font-size: 10px;
+    }
+    #layer-active-strip input[type="range"] { width: 70px; accent-color: var(--pm-accent); }
+    #layer-active-strip .strip-val { width: 26px; text-align: right; color: #fff; }
+
+    /* === 効果チェーン専用パネル === */
+    #effect-panel { display: flex; flex-direction: column; }
+    .effect-tabs {
+      display: flex; gap: 2px; margin-bottom: 8px;
+      border-bottom: 1px solid var(--pm-border-soft); padding-bottom: 6px;
+    }
+    .effect-tab {
+      flex: 1; padding: 4px 0; text-align: center;
+      background: #1a1a1a; color: var(--pm-text-dim);
+      border: 1px solid var(--pm-border-soft); border-radius: 3px;
+      cursor: pointer; font-size: 10px;
+    }
+    .effect-tab.active { background: var(--pm-accent-soft); color: #fff; border-color: var(--pm-accent-soft); }
+    #effect-chain-list {
+      max-height: 120px; overflow-y: auto;
+      border: 1px solid var(--pm-border-soft); border-radius: 4px;
+      background: #111; margin-bottom: 8px;
+    }
+    .effect-chain-row {
+      height: 24px; display: flex; align-items: center; gap: 6px;
+      padding: 0 6px; border-bottom: 1px solid #1c1c1c;
+      cursor: pointer; font-size: 10px; color: var(--pm-text);
+    }
+    .effect-chain-row:hover { background: #1e1e1e; }
+    .effect-chain-row.active { background: var(--pm-select); color: #fff; }
+    .effect-chain-row.active::before {
+      content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 2px; background: var(--pm-select-bar);
+    }
+    .effect-chain-row { position: relative; }
+    .effect-chain-row .eff-eye { width: 14px; text-align: center; cursor: pointer; color: var(--pm-text-dim); flex: none; }
+    .effect-chain-row .eff-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .effect-chain-row .eff-del { width: 14px; text-align: center; cursor: pointer; color: var(--pm-text-faint); flex: none; }
+    .effect-chain-row .eff-del:hover { color: var(--pm-danger); }
+    .effect-add-row {
+      display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px;
+    }
+    .effect-add-row .tool-btn { flex: 1 1 44%; }
+
+    /* Color EV スライダー: 左半分=SDR, 右半分=HDR(オレンジ) */
     #cp-ev-slider {
       -webkit-appearance: none;
       appearance: none;
       height: 14px;
       border-radius: 7px;
-      /* 中央(=EV 0)で区切り。左=ニュートラル、右=発光グラデーション */
       background: linear-gradient(90deg,
         #4a4a4a 0%, #4a4a4a 49.5%,
-        #ffd24a 50%,                /* 境界ノッチ */
-        #6a4513 50.5%, #ff7a1a 100%);
+        var(--pm-accent) 50%,
+        #6a4513 50.5%, var(--pm-accent) 100%);
       outline: none;
     }
     #cp-ev-slider::-webkit-slider-thumb {
@@ -329,13 +400,11 @@
       </div>
     </div>
   </div>
-  <!-- 左の縦ツールバー（TOOLS 定義から Lit が自動生成） -->
-  <pm-tool-bar id="tool-bar"></pm-tool-bar>
 
-  <!-- 右ドック：ツール設定 / カラー / ファイル / レイヤー を縦に分離 -->
-  <div id="right-dock">
-    <!-- ツール設定（左ツールバーのアクティブツールに連動） -->
-    <section class="panel" id="tool-panel">
+  <!-- 左サイド: ツールバー + ツール設定 -->
+  <div id="left-dock">
+    <pm-tool-bar id="tool-bar"></pm-tool-bar>
+    <section class="panel" id="tool-panel" style="flex:1; overflow-y:auto;">
       <div class="tool-header">
         <span class="tool-header-icon" id="tool-header-icon">🖌️</span>
         <span class="tool-header-name" id="tool-header-name">ブラシ</span>
@@ -370,6 +439,11 @@
         <span class="ctrl-label">不透明度</span>
         <input type="range" id="brush-alpha" min="1" max="100" value="100">
         <span id="brush-alpha-val" class="ctrl-val">100</span><span class="ctrl-unit">%</span>
+      </div>
+      <div class="ctrl-row" data-param="pressureOpacity">
+        <span class="ctrl-label">筆圧濃度</span>
+        <input type="checkbox" id="brush-pressure-opacity" style="flex:none;width:auto;">
+        <span style="color:var(--pm-text-dim); font-size:10px;">ONで筆圧が濃さに反映</span>
       </div>
       <div class="ctrl-row" data-param="wet">
         <span class="ctrl-label">にじみ</span>
@@ -426,17 +500,19 @@
         <span id="bucket-tolerance-val" class="ctrl-val">0</span><span class="ctrl-unit">%</span>
       </div>
     </section>
+  </div>
 
+  <!-- 右サイド: カラー / 表示 / レイヤー / 効果チェーン / ファイル -->
+  <div id="right-dock">
     <!-- カラー（全ツール共通） -->
     <section class="panel" id="color-panel">
       <div class="panel-title">カラー</div>
       <div id="color-picker"></div>
       <input type="color" id="brush-color" value="#ffffff" style="display:none;">
-      <!-- スポイト知覚ギャップ表示（内部値 vs 表示）。条件成立時のみ表示 -->
       <div id="spoit-gap" style="display:none; margin-top:8px;"></div>
     </section>
 
-    <!-- 表示（光のコントロール：露出・トーンマップ・表示モード） -->
+    <!-- 表示（光のコントロール） -->
     <section class="panel" id="view-panel">
       <div class="panel-title">表示（光）</div>
       <div class="ctrl-row">
@@ -463,31 +539,51 @@
       </div>
     </section>
 
-    <!-- レイヤー / 効果（統合パネル：スタックと効果設定を一体化） -->
+    <!-- レイヤー（ツリー表示のみ。効果は別パネル） -->
     <section class="panel" id="layer-panel">
       <div class="layer-head">
-        <span style="flex:1;color:#7fb2ff;letter-spacing:.08em;">レイヤー / 効果</span>
-        <button id="layer-add" class="tool-btn icon-btn" title="ペイントレイヤー追加">＋</button>
-        <button id="layer-del" class="tool-btn icon-btn" title="削除">－</button>
+        <span class="layer-head-title">レイヤー</span>
+        <button id="layer-add" class="tool-btn icon-btn" title="セル追加">＋</button>
+        <button id="layer-add-folder" class="tool-btn icon-btn" title="フォルダ追加">📁+</button>
+        <button id="layer-del" class="tool-btn icon-btn danger" title="削除">－</button>
         <button id="layer-up" class="tool-btn icon-btn" title="上へ">▲</button>
         <button id="layer-down" class="tool-btn icon-btn" title="下へ">▼</button>
       </div>
       <div id="layer-list"></div>
-      <div class="effects-label">＋ 効果レイヤーを追加</div>
-      <div class="ctrl-row" id="filter-start-row" style="flex-wrap:wrap;">
-        <button id="filter-blur" class="tool-btn" style="flex:1 1 44%;">ぼかし</button>
-        <button id="filter-glow" class="tool-btn" style="flex:1 1 44%;">グロー</button>
-        <button id="filter-sharpen" class="tool-btn" style="flex:1 1 44%;">シャープ</button>
-        <button id="filter-exposure" class="tool-btn" style="flex:1 1 44%;">露出</button>
-        <button id="filter-levels" class="tool-btn" style="flex:1 1 44%;">レベル補正</button>
-        <button id="filter-curve" class="tool-btn" style="flex:1 1 44%;">トーンカーブ</button>
+      <!-- 選択セルの共有ストリップ（ブレンドモード + 不透明度） -->
+      <div id="layer-active-strip" style="display:none;">
+        <span class="strip-label">合成</span>
+        <select id="strip-blend-mode">
+          <option value="normal">通常</option>
+          <option value="multiply">乗算</option>
+          <option value="screen">スクリーン</option>
+          <option value="overlay">オーバーレイ</option>
+          <option value="add">加算（光）</option>
+        </select>
+        <span class="strip-label">不透明</span>
+        <input type="range" id="strip-opacity" min="0" max="100" value="100">
+        <span id="strip-opacity-val" class="strip-val">100</span>
+      </div>
+    </section>
+
+    <!-- 効果チェーン専用パネル -->
+    <section class="panel" id="effect-panel">
+      <div class="panel-title">効果チェーン</div>
+      <div class="effect-tabs">
+        <div class="effect-tab active" id="effect-tab-cell" data-tab="cell">セル</div>
+        <div class="effect-tab" id="effect-tab-root" data-tab="root">撮影スタック</div>
+      </div>
+      <div id="effect-chain-list"></div>
+      <div class="effect-add-row">
+        <button id="filter-blur" class="tool-btn">ぼかし</button>
+        <button id="filter-glow" class="tool-btn">グロー</button>
+        <button id="filter-sharpen" class="tool-btn">シャープ</button>
+        <button id="filter-exposure" class="tool-btn">露出</button>
+        <button id="filter-levels" class="tool-btn">レベル</button>
+        <button id="filter-curve" class="tool-btn">カーブ</button>
       </div>
       <div id="filter-params" style="display:none;">
-        <div id="effect-editor-title" class="effects-label" style="color:#9f9; border-top-color:#2a4a2a;">⚙ 効果の設定</div>
-        <div class="ctrl-row" id="filter-source-row">
-          <span class="ctrl-label">入力</span>
-          <select id="filter-source" class="ctrl-select"></select>
-        </div>
+        <div id="effect-editor-title" class="effects-label" style="color:var(--pm-accent); border-top-color:var(--pm-accent-soft); font-size:10px; margin:6px 0; padding-top:6px;">⚙ 効果の設定</div>
         <div id="filter-curve-editor" style="display:none; margin-bottom:10px;"></div>
         <div class="ctrl-row" data-fparam="radius">
           <span class="ctrl-label">半径</span>
@@ -534,10 +630,9 @@
           <input type="range" id="filter-intensity" min="0" max="4" step="0.05" value="1">
           <span id="filter-intensity-val" class="ctrl-val">1.0</span>
         </div>
-        <div class="ctrl-row" style="margin-top:8px; border-top:1px solid #333; padding-top:8px;">
+        <div class="ctrl-row" style="margin-top:8px; border-top:1px solid var(--pm-border-soft); padding-top:8px;">
           <span class="ctrl-label">確定</span>
-          <button id="freeze-with-below" class="tool-btn" style="flex:1;" title="この効果と下のレイヤーを1枚に統合（焼き込み）">効果+下を統合</button>
-          <button id="freeze-to-below" class="tool-btn" style="flex:1;" title="効果を直下のレイヤーに焼き込む">直下に焼込</button>
+          <button id="freeze-effect" class="tool-btn danger" style="flex:1;" title="効果をピクセルに焼き込む（破壊的操作）">焼き込み</button>
         </div>
       </div>
     </section>
@@ -567,14 +662,13 @@
         </div>
       </details>
     </section>
-
   </div>
+
   <input type="file" id="texture-file-input" accept="image/*" style="display: none;">
   <input type="file" id="preset-file-input" accept=".zip" style="display: none;">
   <input type="file" id="pmx-file-input" accept=".pmx" style="display: none;">
 
   <canvas id="canvas"></canvas>
-  <!-- 選択範囲オーバーレイ（点線枠をスクリーン座標で描画） -->
   <canvas id="selection-overlay" style="position: fixed; left: 0; top: 0; pointer-events: none; z-index: 1400;"></canvas>
   <div id="brush-cursor" style="position: fixed; border: 1px solid rgba(255,255,255,0.7); border-radius: 50%; pointer-events: none; transform: translate(-50%, -50%); z-index: 1500; display: none; mix-blend-mode: difference;"></div>
   <script type="module" src="dist/src/main.js"></script>

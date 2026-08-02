@@ -17,36 +17,17 @@ import { TransformRenderer } from './transform.js';
 import { FilterRenderer, type FilterType, type FilterParams } from './filter.js';
 import { buildCurveLut, type CurvePoint } from '../color/curve.js';
 import { rasterizePolygon, floodFillMask, maskBounds, invertMask } from '../selection/mask.js';
-import type { PmxLayer, PmxEffectLayer } from '../pmx.js';
-
-/** 効果レイヤーの既定パラメータ */
-const DEFAULT_FILTER_PARAMS: FilterParams = {
-  radius: 8, threshold: 1, intensity: 1, ev: 0,
-  inLow: 0, inHigh: 1, gamma: 1, outLow: 0, outHigh: 1,
-};
+import {
+  type LayerNode, type FolderNode, type CellNode, type EffectChainItem,
+  findNode, findCell, findParent, flattenCells, visibleCells, findEffect,
+  createCell, createFolder, createEffect, removeNode, moveNode,
+} from './layer-model.js';
 import { linearToDisplaySrgb, TONEMAP_IDS, DISPLAY_MODE_IDS, type TonemapId, type DisplayModeId } from '../color/display.js';
 
 const BUFFER_FORMAT: GPUTextureFormat = 'rgba16float';
 
-export interface LayerInfo {
-  id: string;
-  name: string;
-  visible: boolean;
-  opacity: number;
-  blendMode: BlendMode;
-  alphaLock: boolean;
-  kind: 'paint' | 'effect';        // effect=非破壊エフェクト（下の合成結果に適用）
-  filterType?: FilterType;         // kind==='effect' のみ
-  source?: string;                 // effect の入力ソース: 'below'（下の全結果）or ペイントレイヤーID
-}
-
-interface LayerTex extends LayerInfo {
-  committed: GPUTexture;           // paint の描画先（effect でも確保しておく＝不変条件維持）
-  params?: FilterParams;           // effect のパラメータ
-  curvePoints?: CurvePoint[];      // effect(curve) の制御点
-}
-
-let layerIdCounter = 0;
+// レイヤーモデルの型を再エクスポート（旧API互換用）
+export type { LayerNode, FolderNode, CellNode, EffectChainItem } from './layer-model.js';
 
 export class RenderPipeline {
   private renderer: Renderer;
@@ -65,9 +46,14 @@ export class RenderPipeline {
   private displayB!: GPUTexture;
   private activeComposite!: GPUTexture; // アクティブレイヤー committed + 現在ストローク
   private filterScratch!: GPUTexture;   // 効果（レイヤー入力）の処理結果一時バッファ
+  private cellProcTemp!: GPUTexture;    // セル効果チェーン処理用（ping-pong）
 
-  private layers: LayerTex[] = [];
-  private activeIndex = 0;
+  // 3オブジェクト構造: レイヤーツリー + ルート効果チェーン（撮影スタック）
+  private rootNodes: LayerNode[] = [];
+  private rootEffects: EffectChainItem[] = [];
+  private activeCellId: string | null = null;
+  // セルID → committed テクスチャのマップ（実行時データ）
+  private cellTextures: Map<string, GPUTexture> = new Map();
 
   private currentStroke: StrokePoint[] = [];
   private eraseMode = false;
@@ -92,9 +78,12 @@ export class RenderPipeline {
     this.filterRenderer = new FilterRenderer(renderer.device);
   }
 
-  // アクティブレイヤーの committed テクスチャ（既存の描画系メソッドが参照する）
+  // アクティブセルの committed テクスチャ（既存の描画系メソッドが参照する）
   private get committedTexture(): GPUTexture {
-    return this.layers[this.activeIndex].committed;
+    if (!this.activeCellId) throw new Error('No active cell');
+    const tex = this.cellTextures.get(this.activeCellId);
+    if (!tex) throw new Error(`Active cell ${this.activeCellId} has no texture`);
+    return tex;
   }
 
   async init(): Promise<void> {
@@ -157,24 +146,29 @@ export class RenderPipeline {
       size: [width, height], format: BUFFER_FORMAT,
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
+    // セル効果チェーン処理用のテクスチャ（ping-pong）
+    this.cellProcTemp = this.renderer.device.createTexture({
+      size: [width, height], format: BUFFER_FORMAT,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
 
-    // レイヤーを初期化（1枚）
-    for (const l of this.layers) l.committed.destroy();
-    this.layers = [this.createLayer('レイヤー 1')];
-    this.activeIndex = 0;
+    // レイヤーを初期化（1枚のセル）
+    this.destroyAllCellTextures();
+    this.rootNodes = [this.createCellWithTexture('レイヤー 1')];
+    this.rootEffects = [];
+    this.activeCellId = this.rootNodes[0].id;
   }
 
-  private createLayer(name: string): LayerTex {
-    return {
-      id: `layer-${++layerIdCounter}`,
-      name,
-      visible: true,
-      opacity: 1.0,
-      blendMode: 'normal',
-      alphaLock: false,
-      kind: 'paint',
-      committed: this.makeLayerTexture(),
-    };
+  private destroyAllCellTextures(): void {
+    for (const tex of this.cellTextures.values()) tex.destroy();
+    this.cellTextures.clear();
+  }
+
+  /** セルを作成し committed テクスチャを割り当てる */
+  private createCellWithTexture(name: string): CellNode {
+    const cell = createCell(name);
+    this.cellTextures.set(cell.id, this.makeLayerTexture());
+    return cell;
   }
 
   private clearTextureContent(texture: GPUTexture): void {
@@ -216,7 +210,7 @@ export class RenderPipeline {
 
   commitStroke(points: StrokePoint[]): void {
     if (points.length > 0) {
-      this.drawAlphaLock = this.layers[this.activeIndex].alphaLock;
+      this.drawAlphaLock = this.getActiveLayerAlphaLock();
       this.drawToIsolated(points);
       this.compositeRenderer.bake(this.isolatedTexture, this.committedTexture, this.eraseMode);
     }
@@ -290,59 +284,91 @@ export class RenderPipeline {
 
   /**
    * 全レイヤーを下から合成して結果テクスチャを返す
-   * @param includeLiveStroke true ならアクティブレイヤーに現在ストロークを重ねる
+   * 3オブジェクト構造: セルを積み順に合成 → ルート効果チェーンを適用
+   * @param includeLiveStroke true ならアクティブセルに現在ストロークを重ねる
    */
-  private compositeLayers(includeLiveStroke: boolean, endIndex = this.layers.length - 1, transparentBg = false): GPUTexture {
+  private compositeLayers(includeLiveStroke: boolean, transparentBg = false): GPUTexture {
     const { device } = this.renderer;
 
-    // アクティブレイヤー用のソース（現在ストロークを焼き込んだ一時テクスチャ）
+    // アクティブセルのソース（現在ストロークを焼き込んだ一時テクスチャ）
     let activeSrc: GPUTexture | null = null;
-    if (includeLiveStroke && this.currentStroke.length > 0) {
-      this.drawAlphaLock = this.layers[this.activeIndex].alphaLock;
-      this.drawToIsolated(this.currentStroke);
-      // active.committed をコピーしてから isolated を over/erase で重ねる
-      const copyEnc = device.createCommandEncoder();
-      copyEnc.copyTextureToTexture(
-        { texture: this.committedTexture }, { texture: this.activeComposite },
-        [this.canvasWidth, this.canvasHeight],
-      );
-      device.queue.submit([copyEnc.finish()]);
-      this.compositeRenderer.bake(this.isolatedTexture, this.activeComposite, this.eraseMode);
-      activeSrc = this.activeComposite;
+    if (includeLiveStroke && this.currentStroke.length > 0 && this.activeCellId) {
+      const activeCell = findCell(this.rootNodes, this.activeCellId);
+      if (activeCell) {
+        this.drawAlphaLock = activeCell.alphaLock;
+        this.drawToIsolated(this.currentStroke);
+        // active.committed をコピーしてから isolated を over/erase で重ねる
+        const copyEnc = device.createCommandEncoder();
+        copyEnc.copyTextureToTexture(
+          { texture: this.committedTexture }, { texture: this.activeComposite },
+          [this.canvasWidth, this.canvasHeight],
+        );
+        device.queue.submit([copyEnc.finish()]);
+        this.compositeRenderer.bake(this.isolatedTexture, this.activeComposite, this.eraseMode);
+        activeSrc = this.activeComposite;
+      }
     }
 
     // ping-pong 合成。acc を背景色（or 透明）にクリアして下から重ねる
-    // 焼き込み等で背景を含めたくない場合は透明クリア
     if (transparentBg) this.clearTextureContent(this.displayA);
     else this.clearToBackground(this.displayA);
     let acc = this.displayA;
     let other = this.displayB;
 
-    for (let i = 0; i <= endIndex; i++) {
-      const layer = this.layers[i];
-      if (!layer.visible || layer.opacity <= 0) continue;
-      if (layer.kind === 'effect' && layer.filterType && layer.params) {
-        if (layer.filterType === 'curve' && layer.curvePoints) {
-          this.filterRenderer.setCurveLut(buildCurveLut(layer.curvePoints));
-        }
-        // 入力ソースが特定ペイントレイヤーなら、そのレイヤーを入力に処理し acc へ重ねる
-        const srcLayer = (layer.source && layer.source !== 'below')
-          ? this.layers.find(l => l.id === layer.source && l.kind === 'paint')
-          : undefined;
-        if (srcLayer) {
-          this.filterRenderer.apply(layer.filterType, layer.params, srcLayer.committed, null, this.filterScratch, 1.0);
-          this.blendRenderer.blend(acc, this.filterScratch, other, 'normal', layer.opacity);
-        } else {
-          // 下の合成結果(acc)に適用して other へ（効果不透明度=opacity）
-          this.filterRenderer.apply(layer.filterType, layer.params, acc, null, other, layer.opacity);
-        }
-      } else {
-        const src = (i === this.activeIndex && activeSrc) ? activeSrc : layer.committed;
-        this.blendRenderer.blend(acc, src, other, layer.blendMode, layer.opacity);
+    // セルを積み順に合成（フォルダの表示状態を考慮）
+    const cells = visibleCells(this.rootNodes);
+    for (const cell of cells) {
+      if (cell.opacity <= 0) continue;
+      // セルの committed テクスチャを取得
+      const committed = this.cellTextures.get(cell.id);
+      if (!committed) continue;
+
+      // セルの効果チェーンを適用（効果がある場合）
+      let src: GPUTexture = committed;
+      if (cell.effects.length > 0) {
+        src = this.applyCellEffects(cell, committed, activeSrc && cell.id === this.activeCellId ? activeSrc : null);
+      } else if (cell.id === this.activeCellId && activeSrc) {
+        src = activeSrc;
       }
+
+      this.blendRenderer.blend(acc, src, other, cell.blendMode, cell.opacity);
       const tmp = acc; acc = other; other = tmp;
     }
+
+    // ルート効果チェーン（撮影スタック）を適用
+    for (const eff of this.rootEffects) {
+      if (!eff.visible || eff.opacity <= 0) continue;
+      if (eff.filterType === 'curve' && eff.curvePoints) {
+        this.filterRenderer.setCurveLut(buildCurveLut(eff.curvePoints));
+      }
+      // acc に効果を適用して other へ
+      this.filterRenderer.apply(eff.filterType, eff.params, acc, null, other, eff.opacity);
+      const tmp = acc; acc = other; other = tmp;
+    }
+
     return acc;
+  }
+
+  /**
+   * セルの効果チェーンを順に適用した結果テクスチャを返す
+   * アクティブセルのライブストロークがある場合は、それを元に効果を適用する
+   */
+  private applyCellEffects(cell: CellNode, committed: GPUTexture, liveSrc: GPUTexture | null): GPUTexture {
+    const base = liveSrc ?? committed;
+    // 効果チェーンを ping-pong で適用: cellProcTemp ↔ filterScratch
+    let src = base;
+    let dst = this.cellProcTemp;
+    for (let i = 0; i < cell.effects.length; i++) {
+      const eff = cell.effects[i];
+      if (!eff.visible) continue;
+      if (eff.filterType === 'curve' && eff.curvePoints) {
+        this.filterRenderer.setCurveLut(buildCurveLut(eff.curvePoints));
+      }
+      this.filterRenderer.apply(eff.filterType, eff.params, src, null, dst, eff.opacity);
+      src = dst;
+      dst = dst === this.cellProcTemp ? this.filterScratch : this.cellProcTemp;
+    }
+    return src;
   }
 
   render(): void {
@@ -359,134 +385,131 @@ export class RenderPipeline {
     device.queue.submit([encoder.finish()]);
   }
 
-  // --- レイヤー操作 ---
+  // --- レイヤー操作（3オブジェクト構造） ---
 
-  getLayers(): LayerInfo[] {
-    return this.layers.map(({ id, name, visible, opacity, blendMode, alphaLock, kind, filterType }) =>
-      ({ id, name, visible, opacity, blendMode, alphaLock, kind, filterType }));
+  /** レイヤーツリーを取得（UI用） */
+  getRootNodes(): LayerNode[] {
+    return this.rootNodes;
+  }
+
+  /** ルート効果チェーン（撮影スタック）を取得（UI用） */
+  getRootEffects(): EffectChainItem[] {
+    return this.rootEffects;
+  }
+
+  /** セルのcommittedテクスチャを取得（UIのプレビュー等用） */
+  getCellTexture(cellId: string): GPUTexture | null {
+    return this.cellTextures.get(cellId) ?? null;
   }
 
   setLayerAlphaLock(id: string, locked: boolean): void {
-    const l = this.layers.find(l => l.id === id);
-    if (l) l.alphaLock = locked;
+    const cell = findCell(this.rootNodes, id);
+    if (cell) cell.alphaLock = locked;
   }
 
-  // --- 効果（非破壊エフェクト）レイヤー ---
+  // --- 効果チェーン ---
 
-  private static readonly EFFECT_LABELS: Record<FilterType, string> = {
-    blur: 'ぼかし', glow: 'グロー', sharpen: 'シャープ', exposure: '露出', levels: 'レベル', curve: 'トーンカーブ',
-  };
-
-  /** 効果レイヤーを追加（アクティブの上に挿入して選択） */
-  addEffectLayer(type: FilterType): string {
-    const layer: LayerTex = {
-      id: `layer-${++layerIdCounter}`,
-      name: `効果: ${RenderPipeline.EFFECT_LABELS[type]}`,
-      visible: true,
-      opacity: 1.0,
-      blendMode: 'normal',
-      alphaLock: false,
-      kind: 'effect',
-      filterType: type,
-      source: 'below',
-      params: { ...DEFAULT_FILTER_PARAMS },
-      curvePoints: type === 'curve' ? [{ x: 0, y: 0 }, { x: 1, y: 1 }] : undefined,
-      committed: this.makeLayerTexture(), // 不変条件維持のため確保（未使用）
-    };
-    this.layers.splice(this.activeIndex + 1, 0, layer);
-    this.activeIndex += 1;
-    return layer.id;
+  /** 効果をセルの効果チェーンに追加 */
+  addEffectToCell(cellId: string, type: FilterType): string {
+    const cell = findCell(this.rootNodes, cellId);
+    if (!cell) throw new Error(`Cell ${cellId} not found`);
+    const eff = createEffect(type);
+    cell.effects.push(eff);
+    return eff.id;
   }
 
-  /** 効果レイヤーのパラメータを更新 */
+  /** 効果をルート効果チェーン（撮影スタック）に追加 */
+  addEffectToRoot(type: FilterType): string {
+    const eff = createEffect(type);
+    this.rootEffects.push(eff);
+    return eff.id;
+  }
+
+  /** 効果のパラメータを更新 */
   setEffectParams(id: string, params: Partial<FilterParams>): void {
-    const l = this.layers.find(l => l.id === id);
-    if (l && l.kind === 'effect' && l.params) l.params = { ...l.params, ...params };
+    const found = findEffect(this.rootNodes, this.rootEffects, id);
+    if (found) found.effect.params = { ...found.effect.params, ...params };
   }
 
-  /** 効果(curve)レイヤーの制御点を更新 */
+  /** 効果(curve)の制御点を更新 */
   setEffectCurve(id: string, points: CurvePoint[]): void {
-    const l = this.layers.find(l => l.id === id);
-    if (l && l.kind === 'effect') l.curvePoints = points.map(p => ({ ...p }));
+    const found = findEffect(this.rootNodes, this.rootEffects, id);
+    if (found) found.effect.curvePoints = points.map(p => ({ ...p }));
   }
 
-  /** 効果レイヤーの入力ソースを更新（'below' or ペイントレイヤーID） */
-  setEffectSource(id: string, source: string): void {
-    const l = this.layers.find(l => l.id === id);
-    if (l && l.kind === 'effect') l.source = source;
+  /** 効果の情報取得（UIのパラメータ編集用） */
+  getEffect(id: string): { filterType: FilterType; params: FilterParams; curvePoints?: CurvePoint[]; owner: { kind: 'cell'; cellId: string } | { kind: 'root' } } | null {
+    const found = findEffect(this.rootNodes, this.rootEffects, id);
+    if (!found) return null;
+    return { filterType: found.effect.filterType, params: found.effect.params, curvePoints: found.effect.curvePoints, owner: found.owner };
   }
 
-  /** 効果レイヤーの情報取得（UIのパラメータ編集用） */
-  getEffect(id: string): { filterType: FilterType; params: FilterParams; curvePoints?: CurvePoint[]; source: string } | null {
-    const l = this.layers.find(l => l.id === id);
-    if (l && l.kind === 'effect' && l.filterType && l.params) {
-      return { filterType: l.filterType, params: l.params, curvePoints: l.curvePoints, source: l.source ?? 'below' };
-    }
-    return null;
+  /** 効果を削除 */
+  removeEffect(id: string): void {
+    // ルート効果から削除
+    const rootIdx = this.rootEffects.findIndex(e => e.id === id);
+    if (rootIdx >= 0) { this.rootEffects.splice(rootIdx, 1); return; }
+    // セルの効果チェーンから削除
+    const walk = (nodes: LayerNode[]): boolean => {
+      for (const n of nodes) {
+        if (n.kind === 'cell') {
+          const idx = n.effects.findIndex(e => e.id === id);
+          if (idx >= 0) { n.effects.splice(idx, 1); return true; }
+        } else if (n.kind === 'folder') {
+          if (walk(n.children)) return true;
+        }
+      }
+      return false;
+    };
+    walk(this.rootNodes);
   }
 
-  /** アクティブレイヤーが効果かどうか */
-  isActiveEffect(): boolean {
-    return this.layers[this.activeIndex]?.kind === 'effect';
+  /** 効果の表示/非表示を切り替え */
+  setEffectVisible(id: string, visible: boolean): void {
+    const found = findEffect(this.rootNodes, this.rootEffects, id);
+    if (found) found.effect.visible = visible;
   }
 
   /**
-   * Freeze: 効果と下の全レイヤーを1枚のペイントレイヤーに統合する。
-   * [0..effect] を合成（透明下地）→ 焼き込み、その範囲を1枚に置換。上のレイヤーは保持。
+   * Freeze: セルの効果チェーン全体をセルのcommittedに焼き込む。
+   * 効果チェーンをクリアし、committed を処理結果で置き換える。
    */
-  freezeEffectWithBelow(effectId: string): void {
-    const idx = this.layers.findIndex(l => l.id === effectId);
-    if (idx < 0 || this.layers[idx].kind !== 'effect') return;
-    const result = this.compositeLayers(false, idx, true); // 透明下地で [0..idx] を合成
+  freezeCellEffects(cellId: string): void {
+    const cell = findCell(this.rootNodes, cellId);
+    if (!cell || cell.effects.length === 0) return;
+    const committed = this.cellTextures.get(cellId);
+    if (!committed) return;
+    // 効果チェーンを適用した結果を新しいテクスチャに書き出す
+    const result = this.applyCellEffects(cell, committed, null);
     const baked = this.makeLayerTexture();
     const enc = this.renderer.device.createCommandEncoder();
     enc.copyTextureToTexture({ texture: result }, { texture: baked }, [this.canvasWidth, this.canvasHeight]);
     this.renderer.device.queue.submit([enc.finish()]);
-    for (let i = 0; i <= idx; i++) this.layers[i].committed.destroy();
-    const layer: LayerTex = {
-      id: `layer-${++layerIdCounter}`, name: '統合レイヤー',
-      visible: true, opacity: 1.0, blendMode: 'normal', alphaLock: false,
-      kind: 'paint', committed: baked,
-    };
-    this.layers.splice(0, idx + 1, layer);
-    this.activeIndex = 0;
+    // committed を破棄して baked に置き換え
+    committed.destroy();
+    this.cellTextures.set(cellId, baked);
+    cell.effects = [];
   }
 
   /**
-   * Freeze: 効果を直下のペイントレイヤーに焼き込み、効果レイヤーを除去する。
-   * 直下がペイントでなければ「下を統合」にフォールバック。
+   * Freeze: ルート効果チェーン全体を全セル合成結果に焼き込む。
+   * 全セルを1枚に統合し、ルート効果を適用した結果を単一セルに置換する。
    */
-  freezeEffectToBelow(effectId: string): void {
-    const idx = this.layers.findIndex(l => l.id === effectId);
-    if (idx < 0 || this.layers[idx].kind !== 'effect') return;
-    const below = this.layers[idx - 1];
-    if (!below || below.kind !== 'paint') { this.freezeEffectWithBelow(effectId); return; }
-    const eff = this.layers[idx];
-    // 直下レイヤーの内容をコピーして入力にし、効果を適用して書き戻す
-    const srcCopy = this.makeLayerTexture();
+  freezeRootEffects(): void {
+    if (this.rootEffects.length === 0) return;
+    // 全セル合成（透明下地）+ ルート効果適用
+    const result = this.compositeLayers(false, true);
+    const baked = this.makeLayerTexture();
     const enc = this.renderer.device.createCommandEncoder();
-    enc.copyTextureToTexture({ texture: below.committed }, { texture: srcCopy }, [this.canvasWidth, this.canvasHeight]);
+    enc.copyTextureToTexture({ texture: result }, { texture: baked }, [this.canvasWidth, this.canvasHeight]);
     this.renderer.device.queue.submit([enc.finish()]);
-    if (eff.filterType === 'curve' && eff.curvePoints) this.filterRenderer.setCurveLut(buildCurveLut(eff.curvePoints));
-    this.filterRenderer.apply(eff.filterType!, eff.params!, srcCopy, null, below.committed, eff.opacity);
-    srcCopy.destroy();
-    this.layers[idx].committed.destroy();
-    this.layers.splice(idx, 1);
-    this.activeIndex = this.layers.findIndex(l => l.id === below.id);
-  }
-
-  /** 全レイヤーの積み順（id） — .pmx 保存用 */
-  getStackOrder(): string[] {
-    return this.layers.map(l => l.id);
-  }
-
-  /** 効果レイヤーの仕様一覧 — .pmx 保存用 */
-  getEffectSpecs(): PmxEffectLayer[] {
-    return this.layers.filter(l => l.kind === 'effect').map(l => ({
-      id: l.id, name: l.name, visible: l.visible, opacity: l.opacity,
-      blendMode: 'normal' as const, kind: 'effect' as const,
-      filterType: l.filterType!, params: l.params!, curvePoints: l.curvePoints, source: l.source ?? 'below',
-    }));
+    // 全セルを破棄して単一セルに置換
+    this.destroyAllCellTextures();
+    const cell = createCell('統合レイヤー');
+    this.cellTextures.set(cell.id, baked);
+    this.rootNodes = [cell];
+    this.rootEffects = [];
+    this.activeCellId = cell.id;
   }
 
   // --- 選択範囲（任意形状マスク）---
@@ -888,44 +911,119 @@ export class RenderPipeline {
   }
 
   getActiveLayerAlphaLock(): boolean {
-    return this.layers[this.activeIndex].alphaLock;
+    if (!this.activeCellId) return false;
+    const cell = findCell(this.rootNodes, this.activeCellId);
+    return cell?.alphaLock ?? false;
   }
 
   getActiveLayerId(): string {
-    return this.layers[this.activeIndex].id;
+    return this.activeCellId ?? '';
   }
 
   setActiveLayer(id: string): void {
-    const idx = this.layers.findIndex(l => l.id === id);
-    if (idx >= 0) this.activeIndex = idx;
+    // セルのみアクティブにできる
+    const cell = findCell(this.rootNodes, id);
+    if (cell) this.activeCellId = id;
   }
 
+  /** セルを追加（アクティブセルのルートレベルの上に挿入） */
   addLayer(): string {
-    const layer = this.createLayer(`レイヤー ${this.layers.length + 1}`);
-    // アクティブレイヤーの上に挿入
-    this.layers.splice(this.activeIndex + 1, 0, layer);
-    this.activeIndex += 1;
-    return layer.id;
+    const cell = this.createCellWithTexture(`レイヤー ${flattenCells(this.rootNodes).length + 1}`);
+    // アクティブセルと同じ親の子として、その上に挿入
+    const parent = this.activeCellId ? findParent(this.rootNodes, this.activeCellId) : null;
+    if (parent) {
+      parent.parent.splice(parent.index + 1, 0, cell);
+    } else {
+      this.rootNodes.push(cell);
+    }
+    this.activeCellId = cell.id;
+    return cell.id;
+  }
+
+  /** フォルダを追加 */
+  addFolder(): string {
+    const folder = createFolder(`フォルダ ${this.countFolders() + 1}`);
+    const parent = this.activeCellId ? findParent(this.rootNodes, this.activeCellId) : null;
+    if (parent) {
+      parent.parent.splice(parent.index + 1, 0, folder);
+    } else {
+      this.rootNodes.push(folder);
+    }
+    return folder.id;
+  }
+
+  private countFolders(): number {
+    const walk = (nodes: LayerNode[]): number => {
+      let count = 0;
+      for (const n of nodes) {
+        if (n.kind === 'folder') { count++; count += walk(n.children); }
+      }
+      return count;
+    };
+    return walk(this.rootNodes);
   }
 
   removeActiveLayer(): void {
-    if (this.layers.length <= 1) return; // 最低1枚は残す
-    this.layers[this.activeIndex].committed.destroy();
-    this.layers.splice(this.activeIndex, 1);
-    if (this.activeIndex >= this.layers.length) this.activeIndex = this.layers.length - 1;
+    if (!this.activeCellId) return;
+    const cells = flattenCells(this.rootNodes);
+    if (cells.length <= 1) return; // 最低1枚は残す
+    // アクティブセルのテクスチャを破棄
+    const tex = this.cellTextures.get(this.activeCellId);
+    if (tex) { tex.destroy(); this.cellTextures.delete(this.activeCellId); }
+    // ツリーから削除
+    removeNode(this.rootNodes, this.activeCellId);
+    // 新しいアクティブセルを選択
+    const remaining = flattenCells(this.rootNodes);
+    this.activeCellId = remaining.length > 0 ? remaining[remaining.length - 1].id : null;
+  }
+
+  /** 指定IDのノードを削除（セル or フォルダ） */
+  removeNode(id: string): void {
+    if (id === this.activeCellId) { this.removeActiveLayer(); return; }
+    // セルの場合、テクスチャを破棄
+    const cell = findCell(this.rootNodes, id);
+    if (cell) {
+      const tex = this.cellTextures.get(id);
+      if (tex) { tex.destroy(); this.cellTextures.delete(id); }
+    }
+    removeNode(this.rootNodes, id);
   }
 
   moveActiveLayer(dir: 'up' | 'down'): void {
-    const to = dir === 'up' ? this.activeIndex + 1 : this.activeIndex - 1;
-    if (to < 0 || to >= this.layers.length) return;
-    const [l] = this.layers.splice(this.activeIndex, 1);
-    this.layers.splice(to, 0, l);
-    this.activeIndex = to;
+    if (!this.activeCellId) return;
+    moveNode(this.rootNodes, this.activeCellId, dir);
+  }
+
+  /** 指定IDのノードを上下に移動 */
+  moveNode(id: string, dir: 'up' | 'down'): void {
+    moveNode(this.rootNodes, id, dir);
   }
 
   setLayerVisible(id: string, visible: boolean): void {
-    const l = this.layers.find(l => l.id === id);
-    if (l) l.visible = visible;
+    const node = findNode(this.rootNodes, id);
+    if (node) node.visible = visible;
+  }
+
+  setLayerOpacity(id: string, opacity: number): void {
+    const cell = findCell(this.rootNodes, id);
+    if (cell) cell.opacity = opacity;
+  }
+
+  setLayerBlendMode(id: string, mode: BlendMode): void {
+    const cell = findCell(this.rootNodes, id);
+    if (cell) cell.blendMode = mode;
+  }
+
+  /** フォルダの折りたたみ状態を切り替え */
+  setFolderCollapsed(id: string, collapsed: boolean): void {
+    const node = findNode(this.rootNodes, id);
+    if (node && node.kind === 'folder') node.collapsed = collapsed;
+  }
+
+  /** ノード名を変更 */
+  setNodeName(id: string, name: string): void {
+    const node = findNode(this.rootNodes, id);
+    if (node) node.name = name;
   }
 
   getCanvasSize(): { width: number; height: number } {
@@ -933,21 +1031,23 @@ export class RenderPipeline {
   }
 
   /**
-   * 全レイヤーのメタ情報とピクセルデータ（tight packed float16 RGBA）を読み出す
+   * 全セルのピクセルデータ（tight packed float16 RGBA）を読み出す
    * .pmx 保存用
    */
-  async readAllLayers(): Promise<{ info: LayerInfo; data: Uint16Array }[]> {
+  async readAllCells(): Promise<{ cell: CellNode; data: Uint16Array }[]> {
     const { device } = this.renderer;
     const w = this.canvasWidth, h = this.canvasHeight;
     const bytesPerRow = Math.ceil(w * 8 / 256) * 256;
     const alignedU16 = bytesPerRow / 2;
 
-    const out: { info: LayerInfo; data: Uint16Array }[] = [];
-    for (const layer of this.layers) {
-      if (layer.kind === 'effect') continue; // 効果レイヤーは現状 .pmx 非対応（次段で対応予定）
+    const cells = flattenCells(this.rootNodes);
+    const out: { cell: CellNode; data: Uint16Array }[] = [];
+    for (const cell of cells) {
+      const committed = this.cellTextures.get(cell.id);
+      if (!committed) continue;
       const staging = device.createBuffer({ size: bytesPerRow * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
       const enc = device.createCommandEncoder();
-      enc.copyTextureToBuffer({ texture: layer.committed }, { buffer: staging, bytesPerRow }, [w, h]);
+      enc.copyTextureToBuffer({ texture: committed }, { buffer: staging, bytesPerRow }, [w, h]);
       device.queue.submit([enc.finish()]);
       await staging.mapAsync(GPUMapMode.READ);
       const aligned = new Uint16Array(staging.getMappedRange());
@@ -957,61 +1057,39 @@ export class RenderPipeline {
         tight.set(aligned.subarray(y * alignedU16, y * alignedU16 + w * 4), y * w * 4);
       }
       staging.unmap(); staging.destroy();
-      out.push({
-        info: { id: layer.id, name: layer.name, visible: layer.visible, opacity: layer.opacity, blendMode: layer.blendMode, alphaLock: layer.alphaLock, kind: 'paint' },
-        data: tight,
-      });
+      out.push({ cell, data: tight });
     }
     return out;
   }
 
   /**
-   * .pmx 読込：キャンバスを作り直し、保存データから全レイヤーを復元する
+   * .pmx 読込（新形式）: レイヤーツリー + ルート効果チェーンを復元する
    */
-  loadLayers(width: number, height: number, layers: { info: LayerInfo; data: Uint16Array }[], activeId: string): void {
-    // テクスチャ群をサイズ変更（レイヤーは createTextures で1枚に初期化される）
+  loadDocument(width: number, height: number, nodes: LayerNode[], rootEffects: EffectChainItem[], activeId: string): void {
     this.resizeCanvasSize(width, height);
-    // 既存レイヤー（初期1枚）を破棄して保存データで再構築
-    for (const l of this.layers) l.committed.destroy();
-    this.layers = layers.map(({ info, data }) => {
-      const tex = this.makeLayerTexture();
-      this.writeLayerTight(tex, data);
-      // 旧 .pmx には alphaLock/kind が無いので既定で補完
-      return { ...info, alphaLock: info.alphaLock ?? false, kind: 'paint' as const, committed: tex };
-    });
-    if (this.layers.length === 0) this.layers = [this.createLayer('レイヤー 1')];
-    const idx = this.layers.findIndex(l => l.id === activeId);
-    this.activeIndex = idx >= 0 ? idx : 0;
+    // 既存テクスチャを破棄
+    this.destroyAllCellTextures();
+    // 新しいツリーを構築 + テクスチャ確保
+    this.rootNodes = nodes;
+    this.rootEffects = rootEffects;
+    // 全セルのテクスチャを作成
+    for (const cell of flattenCells(nodes)) {
+      this.cellTextures.set(cell.id, this.makeLayerTexture());
+    }
+    if (flattenCells(this.rootNodes).length === 0) {
+      const cell = this.createCellWithTexture('レイヤー 1');
+      this.rootNodes = [cell];
+    }
+    this.activeCellId = activeId || flattenCells(this.rootNodes)[0]?.id || null;
   }
 
   /**
-   * .pmx 読込（効果レイヤー対応）：ペイント＋効果を stackOrder の積み順で復元する。
+   * .pmx 読込: セルのピクセルデータをテクスチャに書き込む
+   * loadDocument 後に呼ぶ
    */
-  loadDocument(width: number, height: number, paint: PmxLayer[], effects: PmxEffectLayer[], stackOrder: string[], activeId: string): void {
-    this.resizeCanvasSize(width, height);
-    for (const l of this.layers) l.committed.destroy();
-
-    const byId = new Map<string, LayerTex>();
-    for (const { info, data } of paint) {
-      const tex = this.makeLayerTexture();
-      this.writeLayerTight(tex, data);
-      byId.set(info.id, { ...info, alphaLock: info.alphaLock ?? false, kind: 'paint', committed: tex });
-    }
-    for (const e of effects) {
-      byId.set(e.id, {
-        id: e.id, name: e.name, visible: e.visible, opacity: e.opacity,
-        blendMode: 'normal', alphaLock: false, kind: 'effect',
-        filterType: e.filterType, source: e.source ?? 'below', params: { ...e.params },
-        curvePoints: e.curvePoints?.map(p => ({ ...p })),
-        committed: this.makeLayerTexture(),
-      });
-    }
-
-    const order = stackOrder.length ? stackOrder : [...byId.keys()];
-    this.layers = order.map(id => byId.get(id)).filter((l): l is LayerTex => !!l);
-    if (this.layers.length === 0) this.layers = [this.createLayer('レイヤー 1')];
-    const idx = this.layers.findIndex(l => l.id === activeId);
-    this.activeIndex = idx >= 0 ? idx : 0;
+  writeCellData(cellId: string, data: Uint16Array): void {
+    const tex = this.cellTextures.get(cellId);
+    if (tex) this.writeLayerTight(tex, data);
   }
 
   /** tight packed float16 データをテクスチャに書き込む */
@@ -1024,16 +1102,6 @@ export class RenderPipeline {
       { bytesPerRow: w * 8, rowsPerImage: h }, // writeTexture は 256 アライン不要
       [w, h],
     );
-  }
-
-  setLayerOpacity(id: string, opacity: number): void {
-    const l = this.layers.find(l => l.id === id);
-    if (l) l.opacity = opacity;
-  }
-
-  setLayerBlendMode(id: string, mode: BlendMode): void {
-    const l = this.layers.find(l => l.id === id);
-    if (l) l.blendMode = mode;
   }
 
   // --- ブラシ・スナップショット系（アクティブレイヤー対象）---
@@ -1069,6 +1137,7 @@ export class RenderPipeline {
    */
   rebakeFromRecords(records: StrokeRecord[]): void {
     this.clearTextureContent(this.committedTexture);
+    const currentPressureOpacity = this.brushRenderer.getConfig().pressureOpacity;
     this.brushRenderer.updateConfig({ usePointColor: true });
     for (const rec of records) {
       if (rec.kind === 'fill') {
@@ -1076,11 +1145,12 @@ export class RenderPipeline {
       } else if (rec.points.length > 0) {
         // レコードに保存した alphaLock で再現（描画順は元と同じなのでマスクも一致）
         this.drawAlphaLock = rec.alphaLock ?? false;
+        this.brushRenderer.updateConfig({ pressureOpacity: rec.pressureOpacity ?? false });
         this.drawToIsolated(rec.points);
         this.compositeRenderer.bake(this.isolatedTexture, this.committedTexture, rec.erase);
       }
     }
-    this.brushRenderer.updateConfig({ usePointColor: false });
+    this.brushRenderer.updateConfig({ usePointColor: false, pressureOpacity: currentPressureOpacity });
   }
 
   updateCommittedTexture(data: Uint16Array): void {
@@ -1114,6 +1184,7 @@ export class RenderPipeline {
     this.isolatedTexture.destroy();
     this.displayA.destroy(); this.displayB.destroy(); this.activeComposite.destroy();
     this.filterScratch.destroy();
+    this.cellProcTemp.destroy();
     this.createTextures(w, h);
     this.filterRenderer.resize(w, h);
   }
@@ -1197,7 +1268,8 @@ export class RenderPipeline {
     this.isolatedTexture?.destroy();
     this.displayA?.destroy(); this.displayB?.destroy(); this.activeComposite?.destroy();
     this.filterScratch?.destroy();
-    for (const l of this.layers) l.committed.destroy();
+    this.cellProcTemp?.destroy();
+    this.destroyAllCellTextures();
   }
 }
 
