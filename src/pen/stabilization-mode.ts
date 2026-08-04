@@ -54,6 +54,14 @@ export class StabilizationController {
   }
 
   /**
+   * ライブ入力を増分処理する。Pulled String の dead zone 中は null を返す。
+   */
+  stabilize(point: PointerPoint): PointerPoint | null {
+    if (this.mode === 'pulled-string') return this.pulledString.stabilize(point);
+    return this.ema.stabilize(point);
+  }
+
+  /**
    * 補正方式を切り替える
    */
   setMode(mode: StabilizationMode): void {

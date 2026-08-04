@@ -2,6 +2,7 @@ import { app, BrowserWindow } from 'electron';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
+import { buildAppMenu } from './menu.js';
 
 // ESM環境で__dirnameを再現
 const __filename = fileURLToPath(import.meta.url);
@@ -28,6 +29,9 @@ function createWindow(): void {
 
   // 開発者ツールを開く（デバッグ時のみ）
   if (process.env.PM_DEV) mainWindow.webContents.openDevTools();
+
+  // アプリケーションメニューを構築（IPC でレンダラーへアクション送信）
+  buildAppMenu(mainWindow);
 
   // index.html をロード
   mainWindow.loadFile('index.html');

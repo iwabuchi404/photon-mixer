@@ -1156,15 +1156,20 @@ describe('ペン入力統合テスト', () => {
       assert.strictEqual(all[0].kind, 'fill');
     });
 
-    test('maxUndo(50)を超えた古いレコードはUndo対象外だが再ベイク用に残る', () => {
+    test('maxUndo(50)を超えた古いレコードはラスターチェックポイント用に返して保持しない', () => {
       const history = new StrokeHistory();
-      for (let i = 0; i < 60; i++) history.addRecord(strokeRecord(i));
+      const evicted = [];
+      for (let i = 0; i < 60; i++) {
+        const old = history.addRecord(strokeRecord(i));
+        if (old) evicted.push(old);
+      }
       assert.strictEqual(history.getRecordCount(), 50, '最大50件に制限される');
-      assert.strictEqual(history.getAllRecords().length, 60, '全描画は再ベイク用に保持される');
+      assert.strictEqual(history.getAllRecords().length, 50, '古い点列はJSヒープに保持しない');
+      assert.strictEqual(evicted.length, 10, '古い操作をGPU基準画像へ渡せる');
 
       for (let i = 0; i < 50; i++) assert.ok(history.undo());
       assert.strictEqual(history.undo(), null, 'Undoできるのは直近50件まで');
-      assert.strictEqual(history.getAllRecords().length, 10, 'Undo上限より古い描画は残る');
+      assert.strictEqual(history.getAllRecords().length, 0, 'Undo対象の点列だけを保持する');
     });
 
     test('クリアですべての操作を削除できる', () => {
@@ -1174,6 +1179,62 @@ describe('ペン入力統合テスト', () => {
 
       history.clear();
       assert.strictEqual(history.getRecordCount(), 0);
+    });
+  });
+
+  describe('LiveStrokeProcessor', async () => {
+    const { LiveStrokeProcessor } = await import('../src/pen/live-stroke.js');
+    const { Stabilizer } = await import('../src/pen/stabilization.js');
+    const { Interpolator } = await import('../src/pen/interpolation.js');
+
+    const point = (x: number, timestamp: number) => ({
+      x, y: Math.sin(x / 20) * 10, pressure: 0.5,
+      tiltX: 0, tiltY: 0, timestamp,
+    });
+
+    test('長い入力でもライブ生入力窓を上限内に保つ', () => {
+      const processor = new LiveStrokeProcessor(
+        new Stabilizer({ minAlpha: 1, maxAlpha: 1 }),
+        new Interpolator({ spacing: 1, inputSpacing: 2 }),
+        { maxRawPoints: 32, maxDurationMs: 10_000, maxDistancePx: 10_000, overlapRawPoints: 4 },
+      );
+
+      processor.begin(point(0, 0));
+      let flushedCount = 0;
+      let maxBuffered = processor.getBufferedRawCount();
+      for (let i = 1; i <= 10_000; i++) {
+        const update = processor.add(point(i, i * 4));
+        flushedCount += update.flushed.length;
+        maxBuffered = Math.max(maxBuffered, processor.getBufferedRawCount());
+      }
+      const tail = processor.finish();
+
+      assert.ok(flushedCount > 0, '長いストロークは複数 prefix に分割される');
+      assert.ok(maxBuffered <= 32, `生入力窓が上限を超えない: ${maxBuffered}`);
+      assert.ok(tail.length > 0);
+      assert.ok(Math.abs(tail[tail.length - 1].x - 10_000) < 0.01, '終端は最後の生入力へ収束する');
+    });
+
+    test('点数が少なくても時間または距離でフラッシュする', () => {
+      const byTime = new LiveStrokeProcessor(
+        new Stabilizer({ minAlpha: 1, maxAlpha: 1 }),
+        new Interpolator({ spacing: 1 }),
+        { maxRawPoints: 100, maxDurationMs: 20, maxDistancePx: 10_000, overlapRawPoints: 2 },
+      );
+      byTime.begin(point(0, 0));
+      byTime.add(point(1, 10));
+      const timed = byTime.add(point(2, 25));
+      assert.ok(timed.flushed.length > 0, '時間窓でフラッシュする');
+
+      const byDistance = new LiveStrokeProcessor(
+        new Stabilizer({ minAlpha: 1, maxAlpha: 1 }),
+        new Interpolator({ spacing: 1 }),
+        { maxRawPoints: 100, maxDurationMs: 10_000, maxDistancePx: 10, overlapRawPoints: 2 },
+      );
+      byDistance.begin(point(0, 0));
+      byDistance.add(point(6, 4));
+      const distant = byDistance.add(point(12, 8));
+      assert.ok(distant.flushed.length > 0, '距離窓でフラッシュする');
     });
   });
 

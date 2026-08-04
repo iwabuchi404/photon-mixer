@@ -10,6 +10,7 @@ export class CompositeRenderer {
   
   private bakePipeline: GPURenderPipeline | null = null;
   private eraseBakePipeline: GPURenderPipeline | null = null;
+  private maxBakePipeline: GPURenderPipeline | null = null;
   private displayPipeline: GPURenderPipeline | null = null;
   private eraseDisplayPipeline: GPURenderPipeline | null = null;
   private paperPipeline: GPURenderPipeline | null = null;
@@ -62,6 +63,10 @@ export class CompositeRenderer {
 
     this.bakePipeline = make('rgba16float', 'vs_bake', 'fs_main', overBlend);
     this.eraseBakePipeline = make('rgba16float', 'vs_bake', 'fs_main', eraseBlend);
+    this.maxBakePipeline = make('rgba16float', 'vs_bake', 'fs_main', {
+      color: { srcFactor: 'one', dstFactor: 'one', operation: 'max' },
+      alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'max' },
+    });
     this.displayPipeline = make(canvasFormat, 'vs_display', 'fs_display', overBlend);
     this.eraseDisplayPipeline = make(canvasFormat, 'vs_display', 'fs_display', eraseBlend);
     this.paperPipeline = make(canvasFormat, 'vs_display', 'fs_paper'); 
@@ -134,6 +139,27 @@ export class CompositeRenderer {
       ],
     });
     pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(4);
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+  }
+
+  /** 一筆内の分割チャンクを、濃度を重ねず channel-wise max で累積する。 */
+  mergeMax(src: GPUTexture, dst: GPUTexture): void {
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{ view: dst.createView(), loadOp: 'load', storeOp: 'store' }],
+    });
+    const bindGroup = this.device.createBindGroup({
+      layout: this.bindGroupLayout,
+      entries: [
+        { binding: 0, resource: src.createView() },
+        { binding: 1, resource: this.sampler },
+        { binding: 2, resource: { buffer: this.uniformBuffer } },
+      ],
+    });
+    pass.setPipeline(this.maxBakePipeline!);
     pass.setBindGroup(0, bindGroup);
     pass.draw(4);
     pass.end();

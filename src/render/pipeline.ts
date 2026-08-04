@@ -41,6 +41,9 @@ export class RenderPipeline {
   private brushBboxTexture: GPUTexture | null = null;
   private brushBboxSize: { w: number; h: number } = { w: 0, h: 0 };
   private isolatedTexture!: GPUTexture;
+  private strokeAccumTexture!: GPUTexture; // 分割フラッシュ済みの「一筆」を max 合成で保持
+  private liveCombinedTexture!: GPUTexture; // accumulator + 可変末尾のライブ表示用
+  private hasStrokeAccum = false;
   // レイヤー合成用
   private displayA!: GPUTexture;
   private displayB!: GPUTexture;
@@ -54,6 +57,12 @@ export class RenderPipeline {
   private activeCellId: string | null = null;
   // セルID → committed テクスチャのマップ（実行時データ）
   private cellTextures: Map<string, GPUTexture> = new Map();
+  // Undo 上限より古い操作を、点列ではなく固定サイズのラスタとして保持する。
+  private historyBaseTextures: Map<string, GPUTexture> = new Map();
+  // 新規の空レイヤーを合成パスから除外するための保守的な内容フラグ。
+  private nonEmptyCells: Set<string> = new Set();
+  // 画面内容に変化がないフレームでは、全レイヤー合成と GPU submit を省く。
+  private renderDirty = true;
 
   private currentStroke: StrokePoint[] = [];
   private eraseMode = false;
@@ -81,9 +90,7 @@ export class RenderPipeline {
   // アクティブセルの committed テクスチャ（既存の描画系メソッドが参照する）
   private get committedTexture(): GPUTexture {
     if (!this.activeCellId) throw new Error('No active cell');
-    const tex = this.cellTextures.get(this.activeCellId);
-    if (!tex) throw new Error(`Active cell ${this.activeCellId} has no texture`);
-    return tex;
+    return this.getOrCreateCellTexture(this.activeCellId);
   }
 
   async init(): Promise<void> {
@@ -105,6 +112,11 @@ export class RenderPipeline {
       window.innerWidth, window.innerHeight,
       flip,
     );
+    this.invalidate();
+  }
+
+  invalidate(): void {
+    this.renderDirty = true;
   }
 
   setEraseMode(enabled: boolean): void {
@@ -134,6 +146,10 @@ export class RenderPipeline {
       format: BUFFER_FORMAT,
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
     });
+    const strokeUsage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST;
+    this.strokeAccumTexture = this.renderer.device.createTexture({ size: [width, height], format: BUFFER_FORMAT, usage: strokeUsage });
+    this.liveCombinedTexture = this.renderer.device.createTexture({ size: [width, height], format: BUFFER_FORMAT, usage: strokeUsage });
+    this.hasStrokeAccum = false;
     const dispUsage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC;
     this.displayA = this.renderer.device.createTexture({ size: [width, height], format: BUFFER_FORMAT, usage: dispUsage });
     this.displayB = this.renderer.device.createTexture({ size: [width, height], format: BUFFER_FORMAT, usage: dispUsage });
@@ -154,7 +170,7 @@ export class RenderPipeline {
 
     // レイヤーを初期化（1枚のセル）
     this.destroyAllCellTextures();
-    this.rootNodes = [this.createCellWithTexture('レイヤー 1')];
+    this.rootNodes = [this.createEmptyCell('レイヤー 1')];
     this.rootEffects = [];
     this.activeCellId = this.rootNodes[0].id;
   }
@@ -162,13 +178,24 @@ export class RenderPipeline {
   private destroyAllCellTextures(): void {
     for (const tex of this.cellTextures.values()) tex.destroy();
     this.cellTextures.clear();
+    for (const tex of this.historyBaseTextures.values()) tex.destroy();
+    this.historyBaseTextures.clear();
+    this.nonEmptyCells.clear();
   }
 
-  /** セルを作成し committed テクスチャを割り当てる */
-  private createCellWithTexture(name: string): CellNode {
-    const cell = createCell(name);
-    this.cellTextures.set(cell.id, this.makeLayerTexture());
-    return cell;
+  /** 新規セルは空のまま作り、最初の描画時まで大きなGPUテクスチャを確保しない。 */
+  private createEmptyCell(name: string): CellNode {
+    return createCell(name);
+  }
+
+  private getOrCreateCellTexture(cellId: string): GPUTexture {
+    let texture = this.cellTextures.get(cellId);
+    if (!texture) {
+      if (!findCell(this.rootNodes, cellId)) throw new Error(`Cell ${cellId} not found`);
+      texture = this.makeLayerTexture();
+      this.cellTextures.set(cellId, texture);
+    }
+    return texture;
   }
 
   private clearTextureContent(texture: GPUTexture): void {
@@ -192,6 +219,7 @@ export class RenderPipeline {
 
   setBackgroundColor(color: { r: number; g: number; b: number } | null): void {
     this.backgroundColor = color;
+    this.invalidate();
   }
 
   /** 表示変換（ビュー露出=2^EV / トーンマップ / 表示モード）を設定 */
@@ -200,12 +228,48 @@ export class RenderPipeline {
     this.displayTonemap = tonemap;
     this.displayMode = mode;
     this.compositeRenderer.setDisplayParams(exposure, TONEMAP_IDS.indexOf(tonemap), DISPLAY_MODE_IDS.indexOf(mode));
+    this.invalidate();
   }
 
   // --- 描画（アクティブレイヤー対象）---
 
   setCurrentStroke(points: StrokePoint[]): void {
     this.currentStroke = points;
+    this.invalidate();
+  }
+
+  /** 長い一筆の開始。確定済み prefix を保持する accumulator を初期化する。 */
+  beginIncrementalStroke(alphaLock = this.getActiveLayerAlphaLock()): void {
+    this.currentStroke = [];
+    this.hasStrokeAccum = false;
+    this.drawAlphaLock = alphaLock;
+    this.clearTextureContent(this.strokeAccumTexture);
+    // 前のストロークで巨大化した4x bboxを次の一筆へ持ち越さない。
+    this.brushBboxTexture?.destroy();
+    this.brushBboxTexture = null;
+    this.brushBboxSize = { w: 0, h: 0 };
+    this.invalidate();
+  }
+
+  /** 確定した prefix を一筆内 max 合成で accumulator へ追加する。 */
+  appendIncrementalStroke(points: StrokePoint[]): void {
+    if (points.length === 0) return;
+    this.drawToIsolated(points);
+    this.compositeRenderer.mergeMax(this.isolatedTexture, this.strokeAccumTexture);
+    this.hasStrokeAccum = true;
+    this.invalidate();
+  }
+
+  /** 残りの末尾を追加し、一筆として committed へ一度だけ合成する。 */
+  finishIncrementalStroke(points: StrokePoint[], eraseMode = this.eraseMode): void {
+    if (points.length > 0) this.appendIncrementalStroke(points);
+    if (this.hasStrokeAccum) {
+      this.compositeRenderer.bake(this.strokeAccumTexture, this.committedTexture, eraseMode);
+      if (this.activeCellId) this.nonEmptyCells.add(this.activeCellId);
+    }
+    this.currentStroke = [];
+    this.hasStrokeAccum = false;
+    this.invalidate();
   }
 
   commitStroke(points: StrokePoint[]): void {
@@ -213,14 +277,17 @@ export class RenderPipeline {
       this.drawAlphaLock = this.getActiveLayerAlphaLock();
       this.drawToIsolated(points);
       this.compositeRenderer.bake(this.isolatedTexture, this.committedTexture, this.eraseMode);
+      if (this.activeCellId) this.nonEmptyCells.add(this.activeCellId);
     }
     this.currentStroke = [];
+    this.hasStrokeAccum = false;
+    this.invalidate();
   }
 
   // 次の drawToIsolated で適用するアルファロック（描画経路ごとに設定）
   private drawAlphaLock = false;
 
-  private drawToIsolated(points: StrokePoint[]): void {
+  private drawToIsolated(points: StrokePoint[], alphaLockSource: GPUTexture = this.committedTexture): void {
     const { device } = this.renderer;
     // アルファロックをブラシに反映（既存 committed.a でマスク）
     this.brushRenderer.updateConfig({ alphaLock: this.drawAlphaLock });
@@ -247,12 +314,20 @@ export class RenderPipeline {
     const aligned = alignBrushBbox4x(minX, minY, maxX, maxY, cw4, ch4, SCALE);
     minX = aligned.minX;
     minY = aligned.minY;
-    const bboxW4 = aligned.width;
-    const bboxH4 = aligned.height;
+    const requiredW4 = aligned.width;
+    const requiredH4 = aligned.height;
 
-    // bbox 4x テクスチャを（サイズが変われば再）確保
-    if (!this.brushBboxTexture || this.brushBboxSize.w !== bboxW4 || this.brushBboxSize.h !== bboxH4) {
+    // bbox 4x テクスチャはストローク中に grow-only で再利用する。
+    // 毎入力で数pxずつ寸法が変わるたびに create/destroy するのを避ける。
+    if (!this.brushBboxTexture || this.brushBboxSize.w < requiredW4 || this.brushBboxSize.h < requiredH4) {
       this.brushBboxTexture?.destroy();
+      const grow = (required: number, current: number, limit: number) => {
+        let size = Math.max(4, current || 4);
+        while (size < required) size *= 2;
+        return Math.min(size, limit);
+      };
+      const bboxW4 = grow(requiredW4, this.brushBboxSize.w, cw4);
+      const bboxH4 = grow(requiredH4, this.brushBboxSize.h, ch4);
       this.brushBboxTexture = device.createTexture({
         size: [bboxW4, bboxH4],
         format: BUFFER_FORMAT,
@@ -260,13 +335,15 @@ export class RenderPipeline {
       });
       this.brushBboxSize = { w: bboxW4, h: bboxH4 };
     }
+    const bboxW4 = this.brushBboxSize.w;
+    const bboxH4 = this.brushBboxSize.h;
 
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
       colorAttachments: [{ view: this.brushBboxTexture!.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' }],
     });
     this.brushRenderer.renderStroke(
-      pass, points, this.committedTexture, SCALE,
+      pass, points, alphaLockSource, SCALE,
       minX, minY, bboxW4, bboxH4,
     );
     pass.end();
@@ -292,11 +369,28 @@ export class RenderPipeline {
 
     // アクティブセルのソース（現在ストロークを焼き込んだ一時テクスチャ）
     let activeSrc: GPUTexture | null = null;
-    if (includeLiveStroke && this.currentStroke.length > 0 && this.activeCellId) {
+    if (includeLiveStroke && (this.currentStroke.length > 0 || this.hasStrokeAccum) && this.activeCellId) {
       const activeCell = findCell(this.rootNodes, this.activeCellId);
       if (activeCell) {
         this.drawAlphaLock = activeCell.alphaLock;
-        this.drawToIsolated(this.currentStroke);
+        let liveStrokeTexture: GPUTexture;
+        if (this.currentStroke.length > 0) {
+          this.drawToIsolated(this.currentStroke);
+          if (this.hasStrokeAccum) {
+            const liveCopy = device.createCommandEncoder();
+            liveCopy.copyTextureToTexture(
+              { texture: this.strokeAccumTexture }, { texture: this.liveCombinedTexture },
+              [this.canvasWidth, this.canvasHeight],
+            );
+            device.queue.submit([liveCopy.finish()]);
+            this.compositeRenderer.mergeMax(this.isolatedTexture, this.liveCombinedTexture);
+            liveStrokeTexture = this.liveCombinedTexture;
+          } else {
+            liveStrokeTexture = this.isolatedTexture;
+          }
+        } else {
+          liveStrokeTexture = this.strokeAccumTexture;
+        }
         // active.committed をコピーしてから isolated を over/erase で重ねる
         const copyEnc = device.createCommandEncoder();
         copyEnc.copyTextureToTexture(
@@ -304,7 +398,7 @@ export class RenderPipeline {
           [this.canvasWidth, this.canvasHeight],
         );
         device.queue.submit([copyEnc.finish()]);
-        this.compositeRenderer.bake(this.isolatedTexture, this.activeComposite, this.eraseMode);
+        this.compositeRenderer.bake(liveStrokeTexture, this.activeComposite, this.eraseMode);
         activeSrc = this.activeComposite;
       }
     }
@@ -314,11 +408,18 @@ export class RenderPipeline {
     else this.clearToBackground(this.displayA);
     let acc = this.displayA;
     let other = this.displayB;
+    let pendingBlends: { dst: GPUTexture; src: GPUTexture; target: GPUTexture; mode: BlendMode; opacity: number }[] = [];
+    const flushBlends = () => {
+      if (pendingBlends.length === 0) return;
+      this.blendRenderer.blendBatch(pendingBlends);
+      pendingBlends = [];
+    };
 
     // セルを積み順に合成（フォルダの表示状態を考慮）
     const cells = visibleCells(this.rootNodes);
     for (const cell of cells) {
       if (cell.opacity <= 0) continue;
+      if (!this.nonEmptyCells.has(cell.id) && !(cell.id === this.activeCellId && activeSrc)) continue;
       // セルの committed テクスチャを取得
       const committed = this.cellTextures.get(cell.id);
       if (!committed) continue;
@@ -326,14 +427,17 @@ export class RenderPipeline {
       // セルの効果チェーンを適用（効果がある場合）
       let src: GPUTexture = committed;
       if (cell.effects.length > 0) {
+        // 効果レンダラーは自身で submit するため、それ以前のブレンドを先に確定する。
+        flushBlends();
         src = this.applyCellEffects(cell, committed, activeSrc && cell.id === this.activeCellId ? activeSrc : null);
       } else if (cell.id === this.activeCellId && activeSrc) {
         src = activeSrc;
       }
 
-      this.blendRenderer.blend(acc, src, other, cell.blendMode, cell.opacity);
+      pendingBlends.push({ dst: acc, src, target: other, mode: cell.blendMode, opacity: cell.opacity });
       const tmp = acc; acc = other; other = tmp;
     }
+    flushBlends();
 
     // ルート効果チェーン（撮影スタック）を適用
     for (const eff of this.rootEffects) {
@@ -371,7 +475,8 @@ export class RenderPipeline {
     return src;
   }
 
-  render(): void {
+  render(): boolean {
+    if (!this.renderDirty) return false;
     const { device, context } = this.renderer;
     const result = this.compositeLayers(true);
 
@@ -383,6 +488,8 @@ export class RenderPipeline {
     this.compositeRenderer.draw(pass, result);
     pass.end();
     device.queue.submit([encoder.finish()]);
+    this.renderDirty = false;
+    return true;
   }
 
   // --- レイヤー操作（3オブジェクト構造） ---
@@ -415,6 +522,7 @@ export class RenderPipeline {
     if (!cell) throw new Error(`Cell ${cellId} not found`);
     const eff = createEffect(type);
     cell.effects.push(eff);
+    this.invalidate();
     return eff.id;
   }
 
@@ -422,19 +530,26 @@ export class RenderPipeline {
   addEffectToRoot(type: FilterType): string {
     const eff = createEffect(type);
     this.rootEffects.push(eff);
+    this.invalidate();
     return eff.id;
   }
 
   /** 効果のパラメータを更新 */
   setEffectParams(id: string, params: Partial<FilterParams>): void {
     const found = findEffect(this.rootNodes, this.rootEffects, id);
-    if (found) found.effect.params = { ...found.effect.params, ...params };
+    if (found) {
+      found.effect.params = { ...found.effect.params, ...params };
+      this.invalidate();
+    }
   }
 
   /** 効果(curve)の制御点を更新 */
   setEffectCurve(id: string, points: CurvePoint[]): void {
     const found = findEffect(this.rootNodes, this.rootEffects, id);
-    if (found) found.effect.curvePoints = points.map(p => ({ ...p }));
+    if (found) {
+      found.effect.curvePoints = points.map(p => ({ ...p }));
+      this.invalidate();
+    }
   }
 
   /** 効果の情報取得（UIのパラメータ編集用） */
@@ -448,7 +563,7 @@ export class RenderPipeline {
   removeEffect(id: string): void {
     // ルート効果から削除
     const rootIdx = this.rootEffects.findIndex(e => e.id === id);
-    if (rootIdx >= 0) { this.rootEffects.splice(rootIdx, 1); return; }
+    if (rootIdx >= 0) { this.rootEffects.splice(rootIdx, 1); this.invalidate(); return; }
     // セルの効果チェーンから削除
     const walk = (nodes: LayerNode[]): boolean => {
       for (const n of nodes) {
@@ -461,13 +576,16 @@ export class RenderPipeline {
       }
       return false;
     };
-    walk(this.rootNodes);
+    if (walk(this.rootNodes)) this.invalidate();
   }
 
   /** 効果の表示/非表示を切り替え */
   setEffectVisible(id: string, visible: boolean): void {
     const found = findEffect(this.rootNodes, this.rootEffects, id);
-    if (found) found.effect.visible = visible;
+    if (found) {
+      found.effect.visible = visible;
+      this.invalidate();
+    }
   }
 
   /**
@@ -489,6 +607,8 @@ export class RenderPipeline {
     committed.destroy();
     this.cellTextures.set(cellId, baked);
     cell.effects = [];
+    this.nonEmptyCells.add(cellId);
+    this.invalidate();
   }
 
   /**
@@ -510,6 +630,8 @@ export class RenderPipeline {
     this.rootNodes = [cell];
     this.rootEffects = [];
     this.activeCellId = cell.id;
+    this.nonEmptyCells.add(cell.id);
+    this.invalidate();
   }
 
   // --- 選択範囲（任意形状マスク）---
@@ -702,6 +824,8 @@ export class RenderPipeline {
       rx - lx, by - ty,
       this.canvasWidth, this.canvasHeight,
     );
+    if (this.activeCellId) this.nonEmptyCells.add(this.activeCellId);
+    this.invalidate();
   }
 
   /** 変形確定。Undo 用スナップショットを返す */
@@ -761,6 +885,8 @@ export class RenderPipeline {
   updateFilter(type: FilterType, params: FilterParams): void {
     if (!this.filterActive || !this.filterSrc) return;
     this.filterRenderer.apply(type, params, this.filterSrc, this.selectionMask, this.committedTexture);
+    if (this.activeCellId) this.nonEmptyCells.add(this.activeCellId);
+    this.invalidate();
   }
 
   /** 確定: プレビュー結果を committed に残したまま状態をクリア（Undo 記録は呼び出し側） */
@@ -928,7 +1054,7 @@ export class RenderPipeline {
 
   /** セルを追加（アクティブセルのルートレベルの上に挿入） */
   addLayer(): string {
-    const cell = this.createCellWithTexture(`レイヤー ${flattenCells(this.rootNodes).length + 1}`);
+    const cell = this.createEmptyCell(`レイヤー ${flattenCells(this.rootNodes).length + 1}`);
     // アクティブセルと同じ親の子として、その上に挿入
     const parent = this.activeCellId ? findParent(this.rootNodes, this.activeCellId) : null;
     if (parent) {
@@ -937,6 +1063,7 @@ export class RenderPipeline {
       this.rootNodes.push(cell);
     }
     this.activeCellId = cell.id;
+    this.invalidate();
     return cell.id;
   }
 
@@ -949,6 +1076,7 @@ export class RenderPipeline {
     } else {
       this.rootNodes.push(folder);
     }
+    this.invalidate();
     return folder.id;
   }
 
@@ -970,48 +1098,70 @@ export class RenderPipeline {
     // アクティブセルのテクスチャを破棄
     const tex = this.cellTextures.get(this.activeCellId);
     if (tex) { tex.destroy(); this.cellTextures.delete(this.activeCellId); }
+    this.clearHistoryBase(this.activeCellId);
+    this.nonEmptyCells.delete(this.activeCellId);
     // ツリーから削除
     removeNode(this.rootNodes, this.activeCellId);
     // 新しいアクティブセルを選択
     const remaining = flattenCells(this.rootNodes);
     this.activeCellId = remaining.length > 0 ? remaining[remaining.length - 1].id : null;
+    this.invalidate();
   }
 
   /** 指定IDのノードを削除（セル or フォルダ） */
   removeNode(id: string): void {
     if (id === this.activeCellId) { this.removeActiveLayer(); return; }
-    // セルの場合、テクスチャを破棄
-    const cell = findCell(this.rootNodes, id);
-    if (cell) {
-      const tex = this.cellTextures.get(id);
-      if (tex) { tex.destroy(); this.cellTextures.delete(id); }
+    // フォルダ削除時も配下セルのGPUテクスチャと履歴基準をすべて解放する。
+    const node = findNode(this.rootNodes, id);
+    const removedCells = node ? (node.kind === 'cell' ? [node] : flattenCells(node.children)) : [];
+    for (const cell of removedCells) {
+      const tex = this.cellTextures.get(cell.id);
+      if (tex) { tex.destroy(); this.cellTextures.delete(cell.id); }
+      this.clearHistoryBase(cell.id);
+      this.nonEmptyCells.delete(cell.id);
     }
     removeNode(this.rootNodes, id);
+    if (removedCells.some(cell => cell.id === this.activeCellId)) {
+      const remaining = flattenCells(this.rootNodes);
+      this.activeCellId = remaining[remaining.length - 1]?.id ?? null;
+    }
+    this.invalidate();
   }
 
   moveActiveLayer(dir: 'up' | 'down'): void {
     if (!this.activeCellId) return;
     moveNode(this.rootNodes, this.activeCellId, dir);
+    this.invalidate();
   }
 
   /** 指定IDのノードを上下に移動 */
   moveNode(id: string, dir: 'up' | 'down'): void {
     moveNode(this.rootNodes, id, dir);
+    this.invalidate();
   }
 
   setLayerVisible(id: string, visible: boolean): void {
     const node = findNode(this.rootNodes, id);
-    if (node) node.visible = visible;
+    if (node) {
+      node.visible = visible;
+      this.invalidate();
+    }
   }
 
   setLayerOpacity(id: string, opacity: number): void {
     const cell = findCell(this.rootNodes, id);
-    if (cell) cell.opacity = opacity;
+    if (cell) {
+      cell.opacity = opacity;
+      this.invalidate();
+    }
   }
 
   setLayerBlendMode(id: string, mode: BlendMode): void {
     const cell = findCell(this.rootNodes, id);
-    if (cell) cell.blendMode = mode;
+    if (cell) {
+      cell.blendMode = mode;
+      this.invalidate();
+    }
   }
 
   /** フォルダの折りたたみ状態を切り替え */
@@ -1069,18 +1219,15 @@ export class RenderPipeline {
     this.resizeCanvasSize(width, height);
     // 既存テクスチャを破棄
     this.destroyAllCellTextures();
-    // 新しいツリーを構築 + テクスチャ確保
+    // 新しいツリーを構築。各セルのテクスチャはデータ書込時に遅延確保する。
     this.rootNodes = nodes;
     this.rootEffects = rootEffects;
-    // 全セルのテクスチャを作成
-    for (const cell of flattenCells(nodes)) {
-      this.cellTextures.set(cell.id, this.makeLayerTexture());
-    }
     if (flattenCells(this.rootNodes).length === 0) {
-      const cell = this.createCellWithTexture('レイヤー 1');
+      const cell = this.createEmptyCell('レイヤー 1');
       this.rootNodes = [cell];
     }
     this.activeCellId = activeId || flattenCells(this.rootNodes)[0]?.id || null;
+    this.invalidate();
   }
 
   /**
@@ -1088,8 +1235,12 @@ export class RenderPipeline {
    * loadDocument 後に呼ぶ
    */
   writeCellData(cellId: string, data: Uint16Array): void {
-    const tex = this.cellTextures.get(cellId);
-    if (tex) this.writeLayerTight(tex, data);
+    if (findCell(this.rootNodes, cellId)) {
+      const tex = this.getOrCreateCellTexture(cellId);
+      this.writeLayerTight(tex, data);
+      this.nonEmptyCells.add(cellId);
+      this.invalidate();
+    }
   }
 
   /** tight packed float16 データをテクスチャに書き込む */
@@ -1136,7 +1287,17 @@ export class RenderPipeline {
    * 履歴レコードからアクティブレイヤーの committed を再構築（Undo/Redo 用）
    */
   rebakeFromRecords(records: StrokeRecord[]): void {
-    this.clearTextureContent(this.committedTexture);
+    const base = this.activeCellId ? this.historyBaseTextures.get(this.activeCellId) : null;
+    if (base) {
+      const enc = this.renderer.device.createCommandEncoder();
+      enc.copyTextureToTexture(
+        { texture: base }, { texture: this.committedTexture },
+        [this.canvasWidth, this.canvasHeight],
+      );
+      this.renderer.device.queue.submit([enc.finish()]);
+    } else {
+      this.clearTextureContent(this.committedTexture);
+    }
     const currentPressureOpacity = this.brushRenderer.getConfig().pressureOpacity;
     this.brushRenderer.updateConfig({ usePointColor: true });
     for (const rec of records) {
@@ -1144,22 +1305,86 @@ export class RenderPipeline {
         this.updateCommittedTexture(rec.snapshot);
       } else if (rec.points.length > 0) {
         // レコードに保存した alphaLock で再現（描画順は元と同じなのでマスクも一致）
-        this.drawAlphaLock = rec.alphaLock ?? false;
         this.brushRenderer.updateConfig({ pressureOpacity: rec.pressureOpacity ?? false });
-        this.drawToIsolated(rec.points);
-        this.compositeRenderer.bake(this.isolatedTexture, this.committedTexture, rec.erase);
+        this.beginIncrementalStroke(rec.alphaLock ?? false);
+        // 巨大な1ストロークも固定点数の局所bboxへ分けて再生する。
+        for (let i = 0; i < rec.points.length; i += 4096) {
+          this.appendIncrementalStroke(rec.points.slice(i, i + 4096));
+        }
+        this.finishIncrementalStroke([], rec.erase);
       }
     }
     this.brushRenderer.updateConfig({ usePointColor: false, pressureOpacity: currentPressureOpacity });
+    if (this.activeCellId) {
+      if (base || records.length > 0) this.nonEmptyCells.add(this.activeCellId);
+      else this.nonEmptyCells.delete(this.activeCellId);
+    }
+    this.invalidate();
+  }
+
+  /**
+   * Undo 上限から押し出された1操作を、レイヤーごとの固定サイズな基準画像へ焼き込む。
+   * 呼び出し後は StrokeRecord（特に長い points 配列）を保持する必要がない。
+   */
+  appendHistoryBaseRecord(cellId: string, record: StrokeRecord): void {
+    let target = this.historyBaseTextures.get(cellId);
+    if (!target) {
+      target = this.makeLayerTexture();
+      this.historyBaseTextures.set(cellId, target);
+    }
+
+    if (record.kind === 'fill') {
+      this.writeTextureData(target, record.snapshot, record.bytesPerRow);
+      this.nonEmptyCells.add(cellId);
+      return;
+    }
+    if (record.points.length === 0) return;
+
+    const savedConfig = this.brushRenderer.getConfig();
+    const savedStroke = this.currentStroke;
+    const savedAccum = this.hasStrokeAccum;
+    const savedAlphaLock = this.drawAlphaLock;
+    this.currentStroke = [];
+    this.hasStrokeAccum = false;
+    this.drawAlphaLock = record.alphaLock ?? false;
+    this.clearTextureContent(this.strokeAccumTexture);
+    this.brushRenderer.updateConfig({
+      usePointColor: true,
+      pressureOpacity: record.pressureOpacity ?? false,
+    });
+    for (let i = 0; i < record.points.length; i += 4096) {
+      this.drawToIsolated(record.points.slice(i, i + 4096), target);
+      this.compositeRenderer.mergeMax(this.isolatedTexture, this.strokeAccumTexture);
+    }
+    this.compositeRenderer.bake(this.strokeAccumTexture, target, record.erase);
+    this.brushRenderer.updateConfig(savedConfig);
+    this.currentStroke = savedStroke;
+    this.hasStrokeAccum = savedAccum;
+    this.drawAlphaLock = savedAlphaLock;
+    this.nonEmptyCells.add(cellId);
+  }
+
+  /** 履歴全消去時に、Undo対象外の基準画像も破棄する。 */
+  clearHistoryBase(cellId: string): void {
+    const base = this.historyBaseTextures.get(cellId);
+    if (base) base.destroy();
+    this.historyBaseTextures.delete(cellId);
   }
 
   updateCommittedTexture(data: Uint16Array): void {
+    const width = this.canvasWidth;
+    const bytesPerRow = Math.ceil(width * 8 / 256) * 256;
+    this.writeTextureData(this.committedTexture, data, bytesPerRow);
+    if (this.activeCellId) this.nonEmptyCells.add(this.activeCellId);
+    this.invalidate();
+  }
+
+  private writeTextureData(texture: GPUTexture, data: Uint16Array, bytesPerRow: number): void {
     const { device } = this.renderer;
     const width = this.canvasWidth;
     const height = this.canvasHeight;
-    const bytesPerRow = Math.ceil(width * 8 / 256) * 256;
     device.queue.writeTexture(
-      { texture: this.committedTexture },
+      { texture },
       data as unknown as BufferSource,
       { bytesPerRow, rowsPerImage: height },
       [width, height]
@@ -1169,7 +1394,13 @@ export class RenderPipeline {
   /** アクティブレイヤーをクリア */
   clear() {
     this.currentStroke = [];
+    this.hasStrokeAccum = false;
     this.clearTextureContent(this.committedTexture);
+    if (this.activeCellId) {
+      this.clearHistoryBase(this.activeCellId);
+      this.nonEmptyCells.delete(this.activeCellId);
+    }
+    this.invalidate();
   }
 
   resizeCanvasSize(w: number, h: number) {
@@ -1182,16 +1413,20 @@ export class RenderPipeline {
     this.brushBboxTexture = null;
     this.brushBboxSize = { w: 0, h: 0 };
     this.isolatedTexture.destroy();
+    this.strokeAccumTexture.destroy();
+    this.liveCombinedTexture.destroy();
     this.displayA.destroy(); this.displayB.destroy(); this.activeComposite.destroy();
     this.filterScratch.destroy();
     this.cellProcTemp.destroy();
     this.createTextures(w, h);
     this.filterRenderer.resize(w, h);
+    this.invalidate();
   }
 
   resizeScreenSize(w: number, h: number) {
     this.renderer.canvas.width = w;
     this.renderer.canvas.height = h;
+    this.invalidate();
   }
 
   /**
@@ -1266,6 +1501,8 @@ export class RenderPipeline {
     this._clearFilterState();
     this.brushBboxTexture?.destroy();
     this.isolatedTexture?.destroy();
+    this.strokeAccumTexture?.destroy();
+    this.liveCombinedTexture?.destroy();
     this.displayA?.destroy(); this.displayB?.destroy(); this.activeComposite?.destroy();
     this.filterScratch?.destroy();
     this.cellProcTemp?.destroy();

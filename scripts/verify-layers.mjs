@@ -49,22 +49,22 @@ try {
   await page.screenshot({ path: path.join(SHOT_DIR,'layer-1-normal.png') });
 
   // レイヤー2を乗算に
-  await page.evaluate(()=>{ const sels=document.querySelectorAll('#layer-list select'); sels[0].value='multiply'; sels[0].dispatchEvent(new Event('change')); });
+  await page.evaluate(()=>{ const sel=document.getElementById('strip-blend-mode'); sel.value='multiply'; sel.dispatchEvent(new Event('change')); });
   await new Promise(r=>setTimeout(r,150));
   await page.screenshot({ path: path.join(SHOT_DIR,'layer-2-multiply.png') });
 
   // レイヤー2の不透明度を50%に
-  await page.evaluate(()=>{ const ops=document.querySelectorAll('#layer-list input[type=range]'); ops[0].value='50'; ops[0].dispatchEvent(new Event('input')); });
+  await page.evaluate(()=>{ const op=document.getElementById('strip-opacity'); op.value='50'; op.dispatchEvent(new Event('input')); });
   await new Promise(r=>setTimeout(r,150));
   await page.screenshot({ path: path.join(SHOT_DIR,'layer-3-opacity.png') });
 
   // レイヤー2を非表示
-  await page.evaluate(()=>{ const eyes=[...document.querySelectorAll('#layer-list span')].filter(s=>s.textContent==='👁'); eyes[0].click(); });
+  await page.evaluate(()=>document.querySelector('#layer-list .layer-row.active .layer-eye').click());
   await new Promise(r=>setTimeout(r,150));
   await page.screenshot({ path: path.join(SHOT_DIR,'layer-4-hidden.png') });
 
   // 再表示
-  await page.evaluate(()=>{ const eyes=[...document.querySelectorAll('#layer-list span')].filter(s=>s.textContent==='—'); eyes[0].click(); });
+  await page.evaluate(()=>document.querySelector('#layer-list .layer-row.active .layer-eye').click());
   await new Promise(r=>setTimeout(r,150));
 
   // per-layer Undo: アクティブ(レイヤー2)で Undo → 青だけ消える、赤は残る

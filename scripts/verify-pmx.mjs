@@ -38,7 +38,7 @@ try {
   await setColor(page,'#ff0000'); await stroke(page,cx-150,cy-15,cx+150,cy-15,30);
   await page.evaluate(()=>document.getElementById('layer-add').click());
   await setColor(page,'#0066ff'); await stroke(page,cx-150,cy+15,cx+150,cy+15,30);
-  await page.evaluate(()=>{ const sels=document.querySelectorAll('#layer-list select'); sels[0].value='multiply'; sels[0].dispatchEvent(new Event('change')); });
+  await page.evaluate(()=>{ const sel=document.getElementById('strip-blend-mode'); sel.value='multiply'; sel.dispatchEvent(new Event('change')); });
   await new Promise(r=>setTimeout(r,150));
   await page.screenshot({ path: path.join(SHOT_DIR,'pmx-1-before.png') });
 
@@ -70,8 +70,8 @@ try {
   await page.screenshot({ path: path.join(SHOT_DIR,'pmx-3-loaded.png') });
 
   const layerCount = await page.evaluate(()=>document.querySelectorAll('#layer-list > div').length);
-  const modes = await page.evaluate(()=>[...document.querySelectorAll('#layer-list select')].map(s=>s.value));
-  console.log('読込後レイヤー数:', layerCount, ' 合成モード:', JSON.stringify(modes));
+  const activeMode = await page.evaluate(()=>document.getElementById('strip-blend-mode').value);
+  console.log('読込後レイヤー数:', layerCount, ' アクティブ合成モード:', activeMode);
   console.log('FPS:', await page.evaluate(()=>document.getElementById('fps').textContent));
   console.log('警告/エラー:', logs.length?logs:'なし');
 } finally {

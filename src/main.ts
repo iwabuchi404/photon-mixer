@@ -6,8 +6,9 @@ import { initRenderer } from './core/renderer.js';
 import { PenInputManager } from './pen/input.js';
 import { StabilizationController } from './pen/stabilization-mode.js';
 import { Interpolator } from './pen/interpolation.js';
+import { LiveStrokeProcessor, type LiveStrokeUpdate } from './pen/live-stroke.js';
 import { PostCorrector } from './pen/post-correction.js';
-import { StrokeManager, StrokeHistory } from './pen/stroke.js';
+import { StrokeManager, StrokeHistory, type StrokeRecord } from './pen/stroke.js';
 import { RenderPipeline } from './render/pipeline.js';
 import type { LayerNode, CellNode, EffectChainItem } from './render/layer-model.js';
 import { PerfMonitor } from './ui/perf-monitor.js';
@@ -30,6 +31,7 @@ import type { FilterType, FilterParams } from './render/filter.js';
 import { CurveEditor } from './ui/curve-editor.js';
 import type { LinearColor } from './color/types.js';
 import type { StrokePoint } from './pen/stroke.js';
+import type { PointerPoint } from './pen/input.js';
 import type { BrushConfig } from './render/brush.js';
 import type { BrushMixMode } from './render/brush.js';
 import { linearToSrgb } from './color/linear.js';
@@ -97,6 +99,13 @@ interface AppState {
   pressureOpacity: boolean; // 筆圧で不透明度を反映
 }
 
+interface ProgressiveStrokeState {
+  baseColor: LinearColor;
+  smudge: LinearColor;
+  prevX: number | null;
+  prevY: number | null;
+}
+
 /** パラメータ → 対応するDOMコントロールのID（値の保存/復元に使う） */
 const PARAM_CONTROLS: Record<ParamKey, { id: string; num?: string; val?: string }> = {
   size:         { id: 'brush-size', num: 'brush-size-num' },
@@ -124,6 +133,7 @@ class PhotonMixerApp {
   private interpolator: Interpolator;
   private postCorrector: PostCorrector;
   private strokeManager: StrokeManager;
+  private liveStrokeProcessor: LiveStrokeProcessor;
   // レイヤーごとの Undo 履歴（Undo はアクティブレイヤーに作用）
   private layerHistories = new Map<string, StrokeHistory>();
   private renderPipeline: RenderPipeline | null = null;
@@ -153,7 +163,9 @@ class PhotonMixerApp {
     pressureOpacity: false,
   };
 
-  private rawPoints: import('./pen/input.js').PointerPoint[] = [];
+  /** 分割フラッシュ済みの点列。Undo は従来どおり一筆単位で保持する。 */
+  private liveStrokePoints: StrokePoint[] = [];
+  private progressiveStrokeState: ProgressiveStrokeState | null = null;
   private prevTool: Tool | null = null;
 
   // テクスチャブラシの元画像（プリセット保存で再利用するため保持）
@@ -174,6 +186,7 @@ class PhotonMixerApp {
     this.interpolator = new Interpolator({ spacing: 1, speedThreshold: 2000 });
     this.postCorrector = new PostCorrector(this.interpolator);
     this.strokeManager = new StrokeManager({ baseSize: 2, maxSize: 20, curve: 'linear' });
+    this.liveStrokeProcessor = new LiveStrokeProcessor(this.stabilizer, this.interpolator);
     this.viewport = new Viewport();
     this.perfMonitor = new PerfMonitor();
   }
@@ -208,6 +221,11 @@ class PhotonMixerApp {
     this.penInput.onPenInput((event) => this.handlePenInput(event));
 
     window.addEventListener('resize', () => this.handleResize());
+    // アイドル時は描画を止めるため、OSの再表示・復帰時だけ明示的に再描画する。
+    window.addEventListener('focus', () => this.renderPipeline?.invalidate());
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) this.renderPipeline?.invalidate();
+    });
 
     this.setupControls();
     this.setupInteractions();
@@ -245,7 +263,200 @@ class PhotonMixerApp {
       console.log('autosave restore skipped:', (e as Error)?.message ?? e);
     }
 
+    // Electron アプリメニューからのアクションを受信
+    this.setupMenuActions();
+
     console.log('PhotonMixer initialized (waiting for canvas creation)');
+  }
+
+  /**
+   * Electron メニュー → IPC → レンダラー のアクションディスパッチャ。
+   * 既存メソッドへ振り分ける。ブラウザ単体動作時は未接続で何もしない。
+   */
+  private setupMenuActions(): void {
+    const api = (window as any).electronAPI as
+      | { onMenuAction?: (cb: (msg: { action: string; payload?: string }) => void) => (() => void) | undefined }
+      | undefined;
+    if (!api?.onMenuAction) return; // ブラウザ単体時など未公開なら無視
+    api.onMenuAction((msg) => this.handleMenuAction(msg));
+  }
+
+  private handleMenuAction(msg: { action: string; payload?: string }): void {
+    switch (msg.action) {
+      // ---- ファイル ----
+      case 'file:new':
+        this.showNewCanvasModal();
+        break;
+      case 'file:open':
+        (document.getElementById('pmx-file-input') as HTMLInputElement | null)?.click();
+        break;
+      case 'file:save-pmx':
+        this.savePmxFile();
+        break;
+      case 'file:export-png':
+        document.getElementById('export-png-btn')?.dispatchEvent(new Event('click'));
+        break;
+
+      // ---- 編集 ----
+      case 'edit:undo':
+        if (this.activeHistory().undo()) this.renderPipeline?.rebakeFromRecords(this.activeHistory().getAllRecords());
+        break;
+      case 'edit:redo':
+        if (this.activeHistory().redo()) this.renderPipeline?.rebakeFromRecords(this.activeHistory().getAllRecords());
+        break;
+      case 'edit:clear-canvas':
+        this.renderPipeline?.clear();
+        this.activeHistory().clear();
+        break;
+
+      // ---- 選択 ----
+      case 'select:all':
+        this.selectAll();
+        break;
+      case 'select:invert':
+        this.invertSelectionUI();
+        break;
+      case 'select:deselect':
+        this.clearSelectionUI();
+        break;
+
+      // ---- レイヤー ----
+      case 'layer:add':
+        this.renderPipeline?.addLayer();
+        this.rebuildLayerPanel();
+        this.refreshEffectEdit();
+        break;
+      case 'layer:add-folder':
+        this.renderPipeline?.addFolder();
+        this.rebuildLayerPanel();
+        break;
+      case 'layer:delete': {
+        const id = this.renderPipeline?.getActiveLayerId();
+        this.renderPipeline?.removeActiveLayer();
+        if (id) this.layerHistories.delete(id);
+        this.rebuildLayerPanel();
+        this.refreshEffectEdit();
+        break;
+      }
+      case 'layer:move-up':
+        this.renderPipeline?.moveActiveLayer('up');
+        this.rebuildLayerPanel();
+        break;
+      case 'layer:move-down':
+        this.renderPipeline?.moveActiveLayer('down');
+        this.rebuildLayerPanel();
+        break;
+
+      // ---- エフェクト ----
+      case 'effect:add':
+        if (msg.payload) this.addEffect(msg.payload as FilterType);
+        break;
+      case 'effect:freeze':
+        this.freezeEffect();
+        break;
+
+      // ---- 表示 ----
+      case 'view:zoom-in':
+        this.zoomBy(1.25);
+        break;
+      case 'view:zoom-out':
+        this.zoomBy(1 / 1.25);
+        break;
+      case 'view:zoom-reset':
+        this.zoomTo(1.0);
+        break;
+      case 'view:reset-rotation':
+        this.viewport.resetRotation();
+        this.applyViewport();
+        break;
+      case 'view:toggle-flip':
+        this.viewport.toggleFlip();
+        this.applyViewport();
+        break;
+      case 'view:toggle-ui':
+        this.toggleUI();
+        break;
+      case 'view:ev-up':
+        this.adjustExposureEV(+0.5);
+        break;
+      case 'view:ev-down':
+        this.adjustExposureEV(-0.5);
+        break;
+      case 'view:ev-reset':
+        this.adjustExposureEV(null, 0);
+        break;
+      case 'view:tonemap':
+        if (msg.payload) this.setTonemap(msg.payload as TonemapId);
+        break;
+      case 'view:mode':
+        if (msg.payload) this.setDisplayMode(msg.payload as DisplayModeId);
+        break;
+
+      // ---- ツール ----
+      case 'tool:set':
+        if (msg.payload) this.setTool(msg.payload as Tool);
+        break;
+
+      // ---- ヘルプ ----
+      case 'help:about':
+        alert('PhotonMixer v0.1.1\nWebGPUネイティブ・浮動小数点リニアカラーのデジタルイラストソフトウェア\n\nMIT License');
+        break;
+    }
+  }
+
+  /** 新規キャンバス作成モーダルを再表示する */
+  private showNewCanvasModal(): void {
+    const modal = document.getElementById('new-canvas-modal');
+    if (modal) modal.style.display = 'block';
+  }
+
+  /** ズームを現在位置を中心に倍率変更（メニュー/ショートカット用） */
+  private zoomBy(factor: number): void {
+    this.viewport.zoom(factor, window.innerWidth / 2, window.innerHeight / 2);
+    this.applyViewport();
+    this.updateZoomDisplay();
+  }
+
+  /** ズーム倍率を直接指定（画面中心） */
+  private zoomTo(scale: number): void {
+    const t = this.viewport.getTransform();
+    // 画面中心を維持してスケール変更
+    const cx = window.innerWidth / 2;
+    const cy = window.innerHeight / 2;
+    const ratio = scale / t.scale;
+    this.viewport.zoom(ratio, cx, cy);
+    this.applyViewport();
+    this.updateZoomDisplay();
+  }
+
+  /** 露出EV を増減、または絶対値リセット（delta=null で value を設定） */
+  private adjustExposureEV(delta: number | null, value?: number): void {
+    const exp = document.getElementById('view-exposure') as HTMLInputElement | null;
+    if (!exp) return;
+    if (delta === null) {
+      exp.value = String(value ?? 0);
+    } else {
+      exp.value = String(parseFloat(exp.value) + delta);
+    }
+    exp.dispatchEvent(new Event('input'));
+  }
+
+  /** トーンマップを切り替え（UIの select と同期） */
+  private setTonemap(id: TonemapId): void {
+    const sel = document.getElementById('view-tonemap') as HTMLSelectElement | null;
+    if (sel) {
+      sel.value = id;
+      sel.dispatchEvent(new Event('change'));
+    }
+  }
+
+  /** 表示モードを切り替え（UIの select と同期） */
+  private setDisplayMode(id: DisplayModeId): void {
+    const sel = document.getElementById('view-mode') as HTMLSelectElement | null;
+    if (sel) {
+      sel.value = id;
+      sel.dispatchEvent(new Event('change'));
+    }
   }
 
   /**
@@ -295,6 +506,14 @@ class PhotonMixerApp {
     let h = this.layerHistories.get(id);
     if (!h) { h = new StrokeHistory(); this.layerHistories.set(id, h); }
     return h;
+  }
+
+  /** 履歴追加と、Undo上限を超えた操作のGPUラスターチェックポイント化を一体で行う。 */
+  private addHistoryRecord(record: StrokeRecord): void {
+    if (!this.renderPipeline) return;
+    const cellId = this.renderPipeline.getActiveLayerId();
+    const evicted = this.activeHistory().addRecord(record);
+    if (evicted && cellId) this.renderPipeline.appendHistoryBaseRecord(cellId, evicted);
   }
 
   /**
@@ -710,7 +929,9 @@ class PhotonMixerApp {
         }
 
         this.state.isDrawing = true;
-        this.rawPoints = [transformedPoint];
+        this.liveStrokePoints = [];
+        const initialUpdate = this.liveStrokeProcessor.begin(transformedPoint);
+        this.renderPipeline?.beginIncrementalStroke();
 
         // 消しゴムモードならパイプライン切り替え
         this.renderPipeline?.setEraseMode(this.state.currentTool === 'eraser');
@@ -718,10 +939,20 @@ class PhotonMixerApp {
         if (this.usesSmudge()) {
           // 点ごとの色を使うモードに切り替えてスナップショットを非同期取得
           this.renderPipeline?.updateBrushConfig({ usePointColor: true });
+          this.progressiveStrokeState = {
+            baseColor: { ...this.state.currentColor },
+            smudge: { ...this.state.currentColor },
+            prevX: null,
+            prevY: null,
+          };
           this.committedSnapshot = null;
           this.renderPipeline?.requestCommittedSnapshot().then(snap => {
             this.committedSnapshot = snap;
           });
+          this.handleProgressiveUpdate(initialUpdate);
+        } else {
+          this.progressiveStrokeState = null;
+          this.handleStampUpdate(initialUpdate);
         }
         break;
       }
@@ -788,12 +1019,11 @@ class PhotonMixerApp {
           this.renderPipeline?.setCurrentStroke(this.buildLineStroke(transformedPoint.x, transformedPoint.y));
           return;
         }
-        this.rawPoints.push(transformedPoint);
-
+        const update = this.liveStrokeProcessor.add(transformedPoint);
         if (this.usesSmudge()) {
-          this.handleProgressiveMove();
+          this.handleProgressiveUpdate(update);
         } else {
-          this.handleStampMove();
+          this.handleStampUpdate(update);
         }
 
         const inputId = this.perfMonitor.recordInput();
@@ -817,7 +1047,7 @@ class PhotonMixerApp {
           if (!this.isMoveActive) return;
           const moved = this.renderPipeline?.commitMove();
           if (moved) {
-            this.activeHistory().addRecord({ kind: 'fill', snapshot: moved.snapshot, bytesPerRow: moved.bytesPerRow });
+            this.addHistoryRecord({ kind: 'fill', snapshot: moved.snapshot, bytesPerRow: moved.bytesPerRow });
           }
           this.isMoveActive = false;
           this.moveOrigin = null;
@@ -857,7 +1087,7 @@ class PhotonMixerApp {
           if (line.length > 0) {
             this.bakeColorIntoPoints(line);
             this.renderPipeline?.commitStroke(line);
-            this.activeHistory().addRecord({
+            this.addHistoryRecord({
               kind: 'stroke', points: line, erase: false,
               alphaLock: this.renderPipeline?.getActiveLayerAlphaLock() ?? false,
               pressureOpacity: this.state.pressureOpacity,
@@ -871,22 +1101,31 @@ class PhotonMixerApp {
 
         // pointerup位置も確定ストロークへ含める。moveの最終サンプルと離れている場合、
         // ここを落とすと強い補正ほど線がペン位置の手前で終わってしまう。
-        const lastRaw = this.rawPoints[this.rawPoints.length - 1];
+        const lastRaw = this.liveStrokeProcessor.getLastRaw();
         if (!lastRaw || Math.hypot(
           transformedPoint.x - lastRaw.x,
           transformedPoint.y - lastRaw.y,
         ) > 0.01) {
-          this.rawPoints.push(transformedPoint);
+          const update = this.liveStrokeProcessor.add(transformedPoint);
+          if (this.usesSmudge()) this.handleProgressiveUpdate(update);
+          else this.handleStampUpdate(update);
         }
 
         const erase = this.state.currentTool === 'eraser';
+        const finishTransform = this.postCorrector.getConfig().enabled
+          ? (points: PointerPoint[]) => this.postCorrector.correct(points)
+          : undefined;
+        const remaining = this.liveStrokeProcessor.finish(finishTransform);
         if (this.usesSmudge()) {
-          // 色付きの全点を over blend で committed へ確定（別ストロークと正しく合成）
-          const colored = this.buildColoredStroke(true);
-          if (colored.length > 0) {
-            this.renderPipeline?.commitStroke(colored);
-            this.activeHistory().addRecord({
-              kind: 'stroke', points: colored, erase,
+          const colored = this.strokeManager.finalizeStroke(remaining);
+          if (this.progressiveStrokeState) {
+            this.colorizeProgressivePoints(colored, this.progressiveStrokeState);
+          }
+          this.liveStrokePoints.push(...colored);
+          this.renderPipeline?.finishIncrementalStroke(colored, erase);
+          if (this.liveStrokePoints.length > 0) {
+            this.addHistoryRecord({
+              kind: 'stroke', points: this.liveStrokePoints, erase,
               alphaLock: this.renderPipeline?.getActiveLayerAlphaLock() ?? false,
               pressureOpacity: this.state.pressureOpacity,
             });
@@ -894,19 +1133,14 @@ class PhotonMixerApp {
           // 点ごとの色モードを解除
           this.renderPipeline?.updateBrushConfig({ usePointColor: false });
         } else {
-          const stabilized = this.stabilizer.stabilizeBatch(this.rawPoints, true);
-          // 後補正OFF時は生の補正点、ON時はRDP+Catmull-Rom済みの点列を返す。
-          // ON時に再度interpolateすると曲線が二重に丸まるため、ここでは一度だけ適用する。
-          const interpolated = this.postCorrector.getConfig().enabled
-            ? this.postCorrector.correct(stabilized)
-            : this.interpolator.interpolate(stabilized);
-          const finalStroke = this.strokeManager.finalizeStroke(interpolated);
-          if (finalStroke.length > 0) {
+          const finalTail = this.strokeManager.finalizeStroke(remaining);
+          this.bakeColorIntoPoints(finalTail);
+          this.liveStrokePoints.push(...finalTail);
+          this.renderPipeline?.finishIncrementalStroke(finalTail, erase);
+          if (this.liveStrokePoints.length > 0) {
             // rebake 時に色を忠実に再現するため、各点に現在のブラシ色を焼き込む
-            this.bakeColorIntoPoints(finalStroke);
-            this.renderPipeline?.commitStroke(finalStroke);
-            this.activeHistory().addRecord({
-              kind: 'stroke', points: finalStroke, erase,
+            this.addHistoryRecord({
+              kind: 'stroke', points: this.liveStrokePoints, erase,
               alphaLock: this.renderPipeline?.getActiveLayerAlphaLock() ?? false,
               pressureOpacity: this.state.pressureOpacity,
             });
@@ -914,8 +1148,9 @@ class PhotonMixerApp {
         }
 
         this.committedSnapshot = null;
+        this.progressiveStrokeState = null;
         this.state.isDrawing = false;
-        this.rawPoints = [];
+        this.liveStrokePoints = [];
         break;
       }
     }
@@ -1322,7 +1557,7 @@ class PhotonMixerApp {
     if (!this.txActive) return;
     const result = this.renderPipeline?.commitTransform();
     if (result) {
-      this.activeHistory().addRecord({ kind: 'fill', snapshot: result.snapshot, bytesPerRow: result.bytesPerRow });
+      this.addHistoryRecord({ kind: 'fill', snapshot: result.snapshot, bytesPerRow: result.bytesPerRow });
     }
     this.txActive = false;
     this.txBounds = null;
@@ -1713,7 +1948,7 @@ class PhotonMixerApp {
 
     this.renderPipeline.updateCommittedTexture(data);
     // 塗りつぶし直後のスナップショットを履歴に積む（rebake で上書き再現＝Undo 可能）
-    this.activeHistory().addRecord({ kind: 'fill', snapshot: data, bytesPerRow: snap.bytesPerRow });
+    this.addHistoryRecord({ kind: 'fill', snapshot: data, bytesPerRow: snap.bytesPerRow });
   }
 
   /** ピクセルを straight color（アンプリマルチプライド）で取得 */
@@ -1740,36 +1975,32 @@ class PhotonMixerApp {
       && Math.abs(c.a - ref.a) <= tol;
   }
 
-  /**
-   * 引きずり混色の move 処理
-   * ストローク全体を色付きで再構築してライブプレビュー（isolated に毎フレーム描画）
-   */
-  private handleProgressiveMove(): void {
-    const colored = this.buildColoredStroke();
-    this.renderPipeline?.setCurrentStroke(colored);
-    this.perfMonitor.setPoints(colored.length);
+  /** 確定 prefix と可変末尾を、引きずり混色の状態を保ったまま処理する。 */
+  private handleProgressiveUpdate(update: LiveStrokeUpdate): void {
+    if (!this.progressiveStrokeState) return;
+
+    if (update.flushed.length > 0) {
+      const flushed = this.strokeManager.finalizeStroke(update.flushed);
+      this.colorizeProgressivePoints(flushed, this.progressiveStrokeState);
+      this.liveStrokePoints.push(...flushed);
+      this.appendIncrementalGpuChunks(flushed);
+    }
+
+    const tail = this.strokeManager.finalizeStroke(update.tail);
+    const previewState = this.cloneProgressiveState(this.progressiveStrokeState);
+    this.colorizeProgressivePoints(tail, previewState);
+    this.renderPipeline?.setCurrentStroke(tail);
+    this.perfMonitor.setPoints(this.liveStrokePoints.length + tail.length);
   }
 
   /**
-   * ストローク全体を補間し、各点に「引きずり混色」の色を焼き込んで返す
-   *
-   * smudge と deposit を分離したモデル:
-   *   smudge  : 動きながら既存色を拾っていく running color（筆に付いた絵の具）
-   *   deposit : 実際に置く色 = mix(ブラシ色, smudge, wet)
-   *             → ブラシ色を常に (1-wet) で再注入するので選択色が消えない
-   *
-   * 各点で:
-   *   1. smudge を移動距離に応じて既存色へドリフト（空白上ではブラシ色へ戻る）
-   *   2. deposit = ブラシ色と smudge を wet で補間
-   * 点ごとに色を持たせるため継ぎ目も色の階段も生じない
+   * smudge と deposit を分離した色計算を、渡された継続状態から増分適用する。
+   * preview では状態の複製、prefix 確定時は本体を渡す。
    */
-  private buildColoredStroke(finishAtLastInput = false): StrokePoint[] {
-    const stabilized = this.stabilizer.stabilizeBatch(this.rawPoints, finishAtLastInput);
-    const interpolated = this.interpolator.interpolate(stabilized);
-    const stroke = this.strokeManager.finalizeStroke(interpolated);
-    if (stroke.length === 0) return stroke;
+  private colorizeProgressivePoints(stroke: StrokePoint[], state: ProgressiveStrokeState): void {
+    if (stroke.length === 0) return;
 
-    const orig = this.state.currentColor;
+    const orig = state.baseColor;
     // ぼかし筆: ブラシ色を注入せず既存色だけを引き伸ばす（deposit=smudge）
     const blur = this.state.currentTool === 'blur';
     const wet = blur ? 1.0 : this.state.wetRatio;
@@ -1780,19 +2011,19 @@ class PhotonMixerApp {
     const SMUDGE_LEN = 25;
     const origOklab = linearToOklab(orig);
 
-    let smudge: LinearColor = { ...orig };
-    let prevX = stroke[0].x;
-    let prevY = stroke[0].y;
-
     for (const p of stroke) {
-      const dx = p.x - prevX, dy = p.y - prevY;
+      if (state.prevX === null || state.prevY === null) {
+        state.prevX = p.x;
+        state.prevY = p.y;
+      }
+      const dx = p.x - state.prevX, dy = p.y - state.prevY;
       const dist = Math.sqrt(dx * dx + dy * dy);
-      prevX = p.x; prevY = p.y;
+      state.prevX = p.x; state.prevY = p.y;
       const rate = 1 - Math.exp(-dist / SMUDGE_LEN);
 
       // ① smudge をドリフト
       // ブラシ混色は空白でブラシ色へ戻すが、ぼかしは空白では現状の smudge を保持
-      let targetOklab = blur ? linearToOklab(smudge) : origOklab;
+      let targetOklab = blur ? linearToOklab(state.smudge) : origOklab;
       let driftT = rate;
       if (snap) {
         const cc = sampleSnapshot(snap.data, p.x, p.y, canvasW, canvasH, snap.bytesPerRow);
@@ -1803,17 +2034,24 @@ class PhotonMixerApp {
         }
       }
       if (driftT > 0) {
-        const s = oklabToLinear(mixOklab(linearToOklab(smudge), targetOklab, driftT));
-        smudge = { r: s.r, g: s.g, b: s.b, a: orig.a };
+        const s = oklabToLinear(mixOklab(linearToOklab(state.smudge), targetOklab, driftT));
+        state.smudge = { r: s.r, g: s.g, b: s.b, a: orig.a };
       }
 
       // ② deposit = ブラシ色と smudge を wet で補間（ぼかしは wet=1 → smudge そのもの）
-      const dep = oklabToLinear(mixOklab(origOklab, linearToOklab(smudge), wet));
+      const dep = oklabToLinear(mixOklab(origOklab, linearToOklab(state.smudge), wet));
       // 筆圧によるα変化はシェーダーで一度だけ適用する。
       p.color = { r: dep.r, g: dep.g, b: dep.b, a: orig.a };
     }
+  }
 
-    return stroke;
+  private cloneProgressiveState(state: ProgressiveStrokeState): ProgressiveStrokeState {
+    return {
+      baseColor: { ...state.baseColor },
+      smudge: { ...state.smudge },
+      prevX: state.prevX,
+      prevY: state.prevY,
+    };
   }
 
   /**
@@ -1844,15 +2082,26 @@ class PhotonMixerApp {
     return this.strokeManager.finalizeStroke(raw);
   }
 
-  /**
-   * スタンプモードの move 処理（従来通り全点をライブプレビュー）
-   */
-  private handleStampMove(): void {
-    const stabilized  = this.stabilizer.stabilizeBatch(this.rawPoints);
-    const interpolated = this.interpolator.interpolate(stabilized);
-    const liveStroke  = this.strokeManager.finalizeStroke(interpolated);
-    this.renderPipeline?.setCurrentStroke(liveStroke);
-    this.perfMonitor.setPoints(liveStroke.length);
+  /** スタンプモードの確定 prefix をフラッシュし、短い末尾だけをライブ表示する。 */
+  private handleStampUpdate(update: LiveStrokeUpdate): void {
+    if (update.flushed.length > 0) {
+      const flushed = this.strokeManager.finalizeStroke(update.flushed);
+      this.bakeColorIntoPoints(flushed);
+      this.liveStrokePoints.push(...flushed);
+      this.appendIncrementalGpuChunks(flushed);
+    }
+
+    const tail = this.strokeManager.finalizeStroke(update.tail);
+    this.renderPipeline?.setCurrentStroke(tail);
+    this.perfMonitor.setPoints(this.liveStrokePoints.length + tail.length);
+  }
+
+  /** GPUの固定点数バッファを越えない局所チャンクとして一筆 accumulator へ追加する。 */
+  private appendIncrementalGpuChunks(points: StrokePoint[]): void {
+    const CHUNK_POINTS = 4096;
+    for (let i = 0; i < points.length; i += CHUNK_POINTS) {
+      this.renderPipeline?.appendIncrementalStroke(points.slice(i, i + CHUNK_POINTS));
+    }
   }
 
   /**
