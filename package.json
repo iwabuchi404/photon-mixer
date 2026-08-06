@@ -7,12 +7,13 @@
   "type": "module",
   "main": "dist/electron/main.js",
   "scripts": {
-    "build": "tsc && powershell -Command \"Copy-Item -Path shaders -Destination dist -Recurse -Force; Copy-Item -Path electron/preload.cjs -Destination dist/electron -Force\"",
-    "dev": "tsc && powershell -Command \"Copy-Item -Path shaders -Destination dist -Recurse -Force; Copy-Item -Path electron/preload.cjs -Destination dist/electron -Force\" && cross-env PM_DEV=1 electron .",
+    "build": "tsc && node scripts/copy-assets.mjs",
+    "dev": "tsc && node scripts/copy-assets.mjs && cross-env PM_DEV=1 electron .",
     "watch": "tsc --watch",
     "test": "node --import tsx --test tests/*.test.ts",
     "test:watch": "node --import tsx --test --watch tests/*.test.ts",
-    "dist:win": "npm run build && electron-builder --win portable"
+    "dist:win": "npm run build && electron-builder --win portable",
+    "dist:mac": "npm run build && electron-builder --mac"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
@@ -48,6 +49,22 @@
         "portable"
       ],
       "artifactName": "${productName}-${version}-portable.exe"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "universal"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-${version}-universal.dmg",
+      "category": "public.app-category.graphics-design",
+      "identity": null,
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "darkModeSupport": true
     }
   }
 }

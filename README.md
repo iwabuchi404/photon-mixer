@@ -9,7 +9,7 @@ WebGPUネイティブ・浮動小数点リニアカラーのデジタルイラ�
 アナログ画材の再現ではなく、光を混ぜるという発想で色を扱います。
 内部の色は光の量として保持し、ブラシの混色は知覚均等な色空間（Oklab）で補間します。
 
-**ステータス**: v0.1.0（初期リリース） / Windows のみ / 開発中
+**ステータス**: v0.1.0（初期リリース） / Windows・macOS / 開発中
 
 - プロジェクトページ: https://frog404.work/projects/photon-mixer/
 - 技術記事: <!-- TODO: Zenn記事のURL -->
@@ -35,18 +35,22 @@ WebGPUネイティブ・浮動小数点リニアカラーのデジタルイラ�
 
 - **HDR出力は未対応** — 内部で1.0超の値は保持しているが、HDRディスプレイへ出力する経路はまだ実装していない
 - **高解像度キャンバスに未対応** — 各軸4倍のバッファをキャンバス全体で確保しているため、メモリ消費がキャンバスサイズに対して急増する。また `maxTextureDimension2D` の下限が8192の環境では、論理キャンバスの一辺が2048に制限される
-- **Windows のみ** — Electron 製だが、現在ビルドを提供しているのは Windows 版のみ
 - **ブラシの種類とUIは途上**
 
 ## 動作環境
 
-- **OS**: Windows 10/11 (64-bit)
+- **OS**: Windows 10/11 (64-bit) / macOS 11 以降（Apple Silicon・Intel）
 - **GPU**: WebGPU対応のGPUドライバが必要
 - **画面**: フルHD以上推奨
 
 ## ダウンロード
 
-[Releases](https://github.com/iwabuchi404/photon-mixer/releases) ページから `PhotonMixer-x.x.x-portable.exe` をダウンロードして実行してください。インストール不要です。
+[Releases](https://github.com/iwabuchi404/photon-mixer/releases) ページから各OS用のファイルをダウンロードしてください。
+
+- Windows: `PhotonMixer-x.x.x-portable.exe`（インストール不要）
+- macOS: `PhotonMixer-x.x.x-universal.dmg`（Apple Silicon・Intel 両対応）
+
+> macOS 版はコード署名・公証（notarization）を行っていません。初回起動時に Finder で右クリック →「開く」から許可するか、`xattr -cr /Applications/PhotonMixer.app` で Gatekeeper の制限を解除してください。
 
 ## ショートカットキー
 
@@ -77,8 +81,11 @@ npm test
 # ビルド
 npm run build
 
-# ポータブルEXE生成
+# ポータブルEXE生成（Windows）
 npm run dist:win
+
+# DMG生成（macOS・Universal）
+npm run dist:mac
 ```
 
 ## 技術スタック
