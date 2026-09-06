@@ -21,11 +21,29 @@ export interface PulledStringConfig {
   radius: number;
   /** ペンアップ時にブラシ位置から最終ペン位置まで線を引く */
   finishLine: boolean;
+  /**
+   * 速度適応: 速いほど実効半径を短くする（effR = radius / (1 + v/adaptiveSpeed)）。
+   * ゆっくり書くときは steady、速く動かすときは軽い。false で古典動作。
+   */
+  adaptive: boolean;
+  /** 実効半径が radius/2 になる筆速（px/sec） */
+  adaptiveSpeed: number;
+  /**
+   * 反転緩み: ペンがブラシへ戻る方向（V·S < 0）に動いたら紐を slackFactor 倍に緩める。
+   * 角の切り替えしでブラシが置いていかれる重さを軽減する。false で古典動作。
+   */
+  reverseSlack: boolean;
+  /** 緩み係数（0..1）。小さいほど角で軽い */
+  slackFactor: number;
 }
 
 const DEFAULT_CONFIG: PulledStringConfig = {
   radius: 8,
   finishLine: true,
+  adaptive: true,
+  adaptiveSpeed: 800,
+  reverseSlack: true,
+  slackFactor: 0.35,
 };
 
 /**
@@ -41,6 +59,10 @@ export class PulledStringStabilizer {
   private config: PulledStringConfig;
   private brushPos: PointerPoint | null = null;
   private penPos: PointerPoint | null = null;
+  /** 平滑化した筆速（px/sec）。速度適応用 */
+  private smoothSpeed = 0;
+  private hasSpeed = false;
+  private lastPen: { x: number; y: number; t: number } | null = null;
 
   constructor(config: Partial<PulledStringConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -56,6 +78,7 @@ export class PulledStringStabilizer {
     if (!this.brushPos) {
       // 始点はブラシ位置 = ペン位置
       this.brushPos = { ...point };
+      this.lastPen = { x: point.x, y: point.y, t: point.timestamp };
       return { ...point };
     }
 
@@ -63,14 +86,42 @@ export class PulledStringStabilizer {
     const dy = point.y - this.brushPos.y;
     const dist = Math.hypot(dx, dy);
 
-    if (dist <= this.config.radius) {
+    // 筆速を更新（指数平滑。初回は即時反映）
+    const prevPen = this.lastPen;
+    if (prevPen) {
+      const mdx = point.x - prevPen.x, mdy = point.y - prevPen.y;
+      const mlen = Math.hypot(mdx, mdy);
+      const dt = point.timestamp - prevPen.t;
+      if (dt > 0 && mlen > 1e-9) {
+        const inst = (mlen / dt) * 1000;
+        this.smoothSpeed = this.hasSpeed ? this.smoothSpeed + (inst - this.smoothSpeed) * 0.4 : inst;
+        this.hasSpeed = true;
+      }
+    }
+    this.lastPen = { x: point.x, y: point.y, t: point.timestamp };
+
+    // 実効半径: 速度適応で短縮し、引き返し時はさらに緩める
+    let effRadius = this.config.radius;
+    if (this.config.adaptive) {
+      effRadius = this.config.radius / (1 + this.smoothSpeed / Math.max(1, this.config.adaptiveSpeed));
+    }
+    if (this.config.reverseSlack && dist > 1e-9 && prevPen) {
+      const mdx = point.x - prevPen.x, mdy = point.y - prevPen.y;
+      const mlen = Math.hypot(mdx, mdy);
+      // V·S < 0 ＝ペンがブラシへ戻る方向＝紐が緩む
+      if (mlen > 1e-9 && (mdx * dx + mdy * dy) / (mlen * dist) < 0) {
+        effRadius *= this.config.slackFactor;
+      }
+    }
+
+    if (dist <= effRadius) {
       // 紐が緩い → ブラシは動かない
       return null;
     }
 
     // 紐が張った → ブラシをペン先方向に引っ張る
-    // ブラシは常に紐の長さ分だけペン先より遅れる
-    const t = (dist - this.config.radius) / dist;
+    // ブラシは常に実効半径分だけペン先より遅れる
+    const t = (dist - effRadius) / dist;
     this.brushPos = {
       x: this.brushPos.x + dx * t,
       y: this.brushPos.y + dy * t,
@@ -153,6 +204,9 @@ export class PulledStringStabilizer {
   reset(): void {
     this.brushPos = null;
     this.penPos = null;
+    this.smoothSpeed = 0;
+    this.hasSpeed = false;
+    this.lastPen = null;
   }
 
   /**

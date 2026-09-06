@@ -97,6 +97,7 @@ interface AppState {
   bucketTolerance: number; // 0-1（塗りつぶし／自動選択の色差許容）
   selectMode: 'rect' | 'lasso' | 'wand'; // 選択ツールのモード
   pressureOpacity: boolean; // 筆圧で不透明度を反映
+  spacingRatio: number; // スタンプ間隔（直径比）。テクスチャブラシ用
 }
 
 interface ProgressiveStrokeState {
@@ -117,6 +118,7 @@ const PARAM_CONTROLS: Record<ParamKey, { id: string; num?: string; val?: string 
   mixMode:      { id: 'mix-mode' },
   textureScale: { id: 'texture-scale', val: 'texture-scale-val' },
   tolerance:    { id: 'bucket-tolerance', val: 'bucket-tolerance-val' },
+  spacing:      { id: 'brush-spacing', val: 'brush-spacing-val' },
 };
 
 /** パラメータを持たないツール向けの操作ヒント */
@@ -153,14 +155,18 @@ class PhotonMixerApp {
     isDrawing: false,
     currentColor: { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
     wetRatio: 0,
-    mixMode: 'stamp',
-    currentTool: 'brush',
+    // 既定は引きずり（PARAM_DEFS / レンダラー既定 / UI表示と統一）。
+    // 'stamp' のままにすると起動直後は GPU・CPU どちらの混色も働かず、
+    // にじみスライダーを動かしても何も変わらない。
+    mixMode: 'progressive',
+    currentTool: 'ribbon',
     isPanning: false,
     useTexture: false,
     textureScale: 1.0,
     bucketTolerance: 0,
     selectMode: 'rect',
     pressureOpacity: false,
+    spacingRatio: 0.15,
   };
 
   /** 分割フラッシュ済みの点列。Undo は従来どおり一筆単位で保持する。 */
@@ -177,7 +183,7 @@ class PhotonMixerApp {
 
   constructor() {
     this.stabilizer = new StabilizationController({
-      mode: 'ema',
+      mode: 'pulled-string',
       emaConfig: { threshold: 1000, minAlpha: 0.3 },
       pulledStringConfig: { radius: 8, finishLine: true },
     });
@@ -216,6 +222,10 @@ class PhotonMixerApp {
 
     this.renderPipeline = new RenderPipeline(this.renderer);
     await this.renderPipeline.init();
+    // 初期ツールはリボン筆（メインブラシ）
+    this.renderPipeline.setRibbonMode(true);
+    // 混色方式の初期値をエンジンへ明示的に反映（UI表示・state・GPU の三者統一）
+    this.renderPipeline.updateBrushConfig({ mixMode: this.state.mixMode });
 
     this.penInput = new PenInputManager(canvas);
     this.penInput.onPenInput((event) => this.handlePenInput(event));
@@ -1128,6 +1138,7 @@ class PhotonMixerApp {
               kind: 'stroke', points: this.liveStrokePoints, erase,
               alphaLock: this.renderPipeline?.getActiveLayerAlphaLock() ?? false,
               pressureOpacity: this.state.pressureOpacity,
+              brushKind: this.state.currentTool === 'ribbon' ? 'ribbon' : 'stamp',
             });
           }
           // 点ごとの色モードを解除
@@ -1143,6 +1154,7 @@ class PhotonMixerApp {
               kind: 'stroke', points: this.liveStrokePoints, erase,
               alphaLock: this.renderPipeline?.getActiveLayerAlphaLock() ?? false,
               pressureOpacity: this.state.pressureOpacity,
+              brushKind: this.state.currentTool === 'ribbon' ? 'ribbon' : 'stamp',
             });
           }
         }
@@ -1222,7 +1234,8 @@ class PhotonMixerApp {
       }
       if (e.key === 'Shift') this.shiftDown = true;
       switch (e.key) {
-        case 'b': this.setTool('brush'); break;
+        case 'b': this.setTool('ribbon'); break;
+        case 'n': this.setTool('brush'); break;
         case 'e': this.setTool('eraser'); break;
         case 'i': this.setTool('spoit'); break;
         case 'g': this.setTool('bucket'); break;
@@ -1309,7 +1322,7 @@ class PhotonMixerApp {
     const el = document.getElementById('brush-cursor');
     if (!el) return;
     // パン中やスポイト/バケツ時は非表示（描画系ツールのみ表示）
-    const drawing = this.state.currentTool === 'brush' || this.state.currentTool === 'eraser';
+    const drawing = this.state.currentTool === 'ribbon' || this.state.currentTool === 'brush' || this.state.currentTool === 'eraser';
     if (!visible || this.state.isPanning || !drawing) {
       el.style.display = 'none';
       return;
@@ -1325,7 +1338,7 @@ class PhotonMixerApp {
 
   // ツールごとのネイティブカーソル（移動などの編集ツールでも形状で判別できるように）
   private static readonly TOOL_CURSORS: Record<Tool, string> = {
-    brush: 'crosshair', eraser: 'crosshair', blur: 'crosshair', line: 'crosshair',
+    ribbon: 'crosshair', brush: 'crosshair', eraser: 'crosshair', blur: 'crosshair', line: 'crosshair',
     spoit: 'crosshair', bucket: 'crosshair', select: 'crosshair',
     move: 'move', transform: 'move',
   };
@@ -1602,6 +1615,8 @@ class PhotonMixerApp {
     this.saveToolSettings(prev);
 
     this.state.currentTool = tool;
+    // 筆種をパイプラインへ反映（リボン筆かスタンプか）
+    this.renderPipeline?.setRibbonMode(tool === 'ribbon');
     this.applyToolCursor();
     this.toolBar?.setActive(tool);
     // ヘッダー・表示パラメータを更新し、ツールの保存値を復元してエンジンへ反映
@@ -2123,13 +2138,17 @@ class PhotonMixerApp {
       strokeManager: this.strokeManager,
       stabilizer: this.stabilizer,
       postCorrector: this.postCorrector,
+      interpolator: this.interpolator,
       getPipeline: () => this.renderPipeline,
+      getIsRibbonTool: () => this.state.currentTool === 'ribbon',
       state: this.state,
     });
     // ツール個別状態（定義の既定値で初期化）
     this.toolSettings = new ToolSettingsStore(TOOLS, PARAM_DEFS);
     // 初期ツールのヘッダー・表示パラメータを反映
     this.refreshToolOptions(this.state.currentTool);
+    // 初期ツール（リボン筆）は間隔概念なし＝密に補間
+    this.interpolator.updateConfig({ spacing: 1 });
 
     // 左の縦ツールバー（定義から自動生成）。クリックは onSelect 経由で setTool へ。
     this.toolBar = document.getElementById('tool-bar') as ToolBar | null;
@@ -2287,11 +2306,12 @@ class PhotonMixerApp {
     stabSlider?.addEventListener('input', () => applyStabilize(parseInt(stabSlider.value)));
     applyStabilize(parseInt(stabSlider.value)); // 初期値を反映
 
-    // 手ブレ補正方式（EMA / Pulled String）
+    // 手ブレ補正方式（EMA / Pulled String。既定は紐引き）
     const stabModeSel = document.getElementById('brush-stabilize-mode') as HTMLSelectElement;
     stabModeSel?.addEventListener('change', () => {
       this.engineCtx.setStabilizeMode(stabModeSel.value as 'ema' | 'pulled-string');
     });
+    if (stabModeSel) this.engineCtx.setStabilizeMode(stabModeSel.value as 'ema' | 'pulled-string');
 
     // 後補正（事後補正）のオン/オフ + 強度
     const postCorrectCheck = document.getElementById('brush-post-correct') as HTMLInputElement;

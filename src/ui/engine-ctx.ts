@@ -11,6 +11,7 @@
 import type { StrokeManager, PressureSizeConfig } from '../pen/stroke.js';
 import type { StabilizationController, StabilizationMode } from '../pen/stabilization-mode.js';
 import type { PostCorrector } from '../pen/post-correction.js';
+import type { Interpolator } from '../pen/interpolation.js';
 import type { RenderPipeline } from '../render/pipeline.js';
 import type { BrushMixMode } from '../render/brush.js';
 import type { LinearColor } from '../color/types.js';
@@ -26,13 +27,17 @@ export interface SharedState {
   bucketTolerance: number;
   useTexture: boolean;
   pressureOpacity: boolean;
+  /** スタンプ間隔（直径比 0..1）。テクスチャブラシ用 */
+  spacingRatio: number;
 }
 
 export interface EngineDeps {
   strokeManager: StrokeManager;
   stabilizer: StabilizationController;
   postCorrector: PostCorrector;
+  interpolator: Interpolator;
   getPipeline: () => RenderPipeline | null;
+  getIsRibbonTool: () => boolean;
   state: SharedState;
 }
 
@@ -62,15 +67,28 @@ export interface EngineCtx {
   setTextureScale(x: number): void;
   /** 塗り/自動選択の許容値 0..1 */
   setTolerance(t01: number): void;
+  /** スタンプ間隔（直径比 0..1）。テクスチャブラシ用。リボン筆では無視 */
+  setSpacing(r01: number): void;
 }
 
 export function createEngineCtx(deps: EngineDeps): EngineCtx {
-  const { strokeManager, stabilizer, postCorrector, getPipeline, state } = deps;
+  const { strokeManager, stabilizer, postCorrector, interpolator, getPipeline, getIsRibbonTool, state } = deps;
+  // 補間点間隔を現在のツール・筆径・間隔比から決める。
+  // リボン筆は間隔概念を持たないため常に密（1px）。テクスチャブラシは直径比。
+  const refreshSpacing = () => {
+    if (getIsRibbonTool()) {
+      interpolator.updateConfig({ spacing: 1 });
+    } else {
+      const maxSize = strokeManager.getPressureConfig().maxSize;
+      interpolator.updateConfig({ spacing: Math.max(1, Math.round(maxSize * state.spacingRatio)) });
+    }
+  };
   return {
     setSize(px) {
       const maxSize = Math.max(1, Math.min(100, Math.round(px)));
       const baseSize = Math.max(1, Math.round(maxSize * 0.1));
       strokeManager.updatePressureConfig({ maxSize, baseSize });
+      refreshSpacing();
     },
     setOpacity(a01) {
       state.currentColor.a = a01;
@@ -116,6 +134,10 @@ export function createEngineCtx(deps: EngineDeps): EngineCtx {
     },
     setTolerance(t01) {
       state.bucketTolerance = t01;
+    },
+    setSpacing(r01) {
+      state.spacingRatio = Math.max(0.05, Math.min(0.5, r01));
+      refreshSpacing();
     },
   };
 }

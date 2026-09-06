@@ -406,7 +406,7 @@
     <pm-tool-bar id="tool-bar"></pm-tool-bar>
     <section class="panel" id="tool-panel" style="flex:1; overflow-y:auto;">
       <div class="tool-header">
-        <span class="tool-header-icon" id="tool-header-icon">🖌️</span>
+        <span class="tool-header-icon" id="tool-header-icon">🖊️</span>
         <span class="tool-header-name" id="tool-header-name">ブラシ</span>
         <span class="tool-header-badge" title="設定はツールごとに個別保持されます">個別設定</span>
       </div>
@@ -453,8 +453,8 @@
       <div class="ctrl-row" data-param="stabilize">
         <span class="ctrl-label">補正方式</span>
         <select id="brush-stabilize-mode" class="ctrl-select">
+          <option value="pulled-string" selected>紐引き</option>
           <option value="ema">EMA</option>
-          <option value="pulled-string">紐引き</option>
         </select>
       </div>
       <div class="ctrl-row" data-param="stabilize">
@@ -493,6 +493,11 @@
         <span class="ctrl-label">スケール</span>
         <input type="range" id="texture-scale" min="1" max="20" value="1">
         <span id="texture-scale-val" class="ctrl-val">1</span><span class="ctrl-unit">x</span>
+      </div>
+      <div class="ctrl-row" data-param="spacing">
+        <span class="ctrl-label">間隔</span>
+        <input type="range" id="brush-spacing" min="5" max="50" value="15">
+        <span id="brush-spacing-val" class="ctrl-val">15</span><span class="ctrl-unit">%</span>
       </div>
       <div class="ctrl-row" data-param="tolerance">
         <span class="ctrl-label">許容値</span>

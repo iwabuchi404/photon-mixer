@@ -47,6 +47,13 @@ export class LiveStrokeProcessor {
   private lastStabilized: PointerPoint | null = null;
   private tailDistance = 0;
   private active = false;
+  /**
+   * これまでに排出した補間点列（単調増加・不変）。
+   * フラッシュで生入力窓を切り詰めても再計算で書き換えない。
+   * 再計算の微差（0.1〜0.9px の逆行スパイク）が二重描画のギザつきになるため。
+   */
+  private emitted: PointerPoint[] = [];
+  private emittedFlushedCount = 0;
 
   constructor(
     stabilizer: IncrementalStabilizer,
@@ -65,7 +72,8 @@ export class LiveStrokeProcessor {
     const stabilized = this.stabilizer.stabilize(point) ?? point;
     this.lastStabilized = { ...stabilized };
     this.rawTail = [{ ...stabilized }];
-    return { flushed: [], tail: this.interpolateTail() };
+    this.emitNew(this.interpolateTail());
+    return { flushed: [], tail: this.displayTail() };
   }
 
   add(point: PointerPoint): LiveStrokeUpdate {
@@ -82,24 +90,60 @@ export class LiveStrokeProcessor {
       this.rawTail.push({ ...stabilized });
     }
 
-    const processed = this.interpolateTail();
+    this.emitNew(this.interpolateTail());
     if (!this.shouldFlush() || this.rawTail.length <= this.config.overlapRawPoints) {
-      return { flushed: [], tail: processed };
+      return { flushed: [], tail: this.displayTail() };
     }
 
     const keepCount = Math.max(2, this.config.overlapRawPoints);
     const keepIndex = Math.max(1, this.rawTail.length - keepCount);
     const boundaryTime = this.rawTail[keepIndex].timestamp;
-    let boundaryIndex = processed.findIndex(p => p.timestamp >= boundaryTime);
-    if (boundaryIndex < 0) boundaryIndex = Math.max(0, processed.length - 1);
+    // 排出済み点列から境界を探す。値はプレビュー表示と同一オブジェクト由来のため、
+    // 確定 prefix と表示 tail のつなぎ目に差分が生じない。
+    let boundaryIndex = -1;
+    for (let i = this.emitted.length - 1; i >= this.emittedFlushedCount; i--) {
+      if (this.emitted[i].timestamp <= boundaryTime) { boundaryIndex = i; break; }
+    }
+    if (boundaryIndex < this.emittedFlushedCount) {
+      return { flushed: [], tail: this.displayTail() };
+    }
 
-    // 境界点は prefix と tail の両方へ含める。GPU 側は一筆内 max 合成なので
-    // 重複しても濃くならず、補間窓の境界に隙間を作らない。
-    const flushed = processed.slice(0, boundaryIndex + 1);
+    const flushed = this.emitted.slice(this.emittedFlushedCount, boundaryIndex + 1);
+    this.emittedFlushedCount = boundaryIndex + 1;
     this.rawTail = this.rawTail.slice(keepIndex);
     this.recalculateTailDistance();
 
-    return { flushed, tail: this.interpolateTail() };
+    return { flushed, tail: this.displayTail() };
+  }
+
+  /**
+   * 補間窓の再計算結果から未排出分だけを追加する。
+   * 排出済み領域の再計算値（窓切り詰めによる微差）は捨てる。
+   */
+  private emitNew(processed: PointerPoint[]): void {
+    for (const p of processed) {
+      const last = this.emitted[this.emitted.length - 1];
+      // 排出済み時刻より古い再計算値は捨てる。新規時刻は排出、
+      // 同一時刻タイは novelty 判定（タイマー粒度潰れ対策）
+      if (!last || p.timestamp > last.timestamp ||
+        (p.timestamp === last.timestamp && this.movedSince(p, last))) {
+        this.emitted.push({ ...p });
+      }
+    }
+  }
+
+  /** 同一時刻タイ（タイマー粒度潰れ）時のみ novelty 判定する */
+  private movedSince(p: PointerPoint, last: PointerPoint): boolean {
+    return Math.abs(p.x - last.x) > 1e-9 ||
+      Math.abs(p.y - last.y) > 1e-9 ||
+      Math.abs(p.pressure - last.pressure) > 1e-9 ||
+      Math.abs(p.tiltX - last.tiltX) > 1e-9 ||
+      Math.abs(p.tiltY - last.tiltY) > 1e-9;
+  }
+
+  /** 未確定の排出点列。同一参照を返すため再描画が冪等になる */
+  private displayTail(): PointerPoint[] {
+    return this.emitted.slice(this.emittedFlushedCount);
   }
 
   /**
@@ -136,6 +180,8 @@ export class LiveStrokeProcessor {
     this.lastStabilized = null;
     this.tailDistance = 0;
     this.active = false;
+    this.emitted = [];
+    this.emittedFlushedCount = 0;
   }
 
   private interpolateTail(): PointerPoint[] {

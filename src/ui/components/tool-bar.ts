@@ -12,7 +12,7 @@ import { CATEGORIES, TOOLS, type Tool } from '../tool-config.js';
 
 export class ToolBar extends LitElement {
   /** 現在のアクティブツール（素のフィールド＝非リアクティブ。setActive で再描画） */
-  active: Tool = 'brush';
+  active: Tool = 'ribbon';
   /** ツール選択時のコールバック（main 側で setTool を呼ぶ） */
   onSelect?: (id: Tool) => void;
 

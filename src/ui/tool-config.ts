@@ -10,7 +10,7 @@ import type { EngineCtx, PressureCurve } from './engine-ctx.js';
 import type { BrushMixMode } from '../render/brush.js';
 
 export type Tool =
-  | 'brush' | 'eraser' | 'blur' | 'line'
+  | 'ribbon' | 'brush' | 'eraser' | 'blur' | 'line'
   | 'spoit' | 'bucket'
   | 'select' | 'move' | 'transform';
 
@@ -19,7 +19,7 @@ export type Category = 'draw' | 'fill' | 'select';
 export type ParamKey =
   | 'size' | 'opacity' | 'wet' | 'stabilize'
   | 'textureScale' | 'tolerance' | 'mixMode' | 'curve'
-  | 'pressureOpacity';
+  | 'pressureOpacity' | 'spacing';
 
 /** コントロール種別ごとの定義（判別可能ユニオン） */
 export type ParamDef =
@@ -72,10 +72,12 @@ export const PARAM_DEFS: Record<ParamKey, ParamDef> = {
     options: [['smooth', '標準'], ['linear', 'リニア'], ['ease-in', '入り遅'], ['ease-out', '入り早']],
     apply: (v, e) => e.setPressureCurve(v as PressureCurve),
   },
+  spacing:      { key: 'spacing',      kind: 'range', label: '間隔', min: 5, max: 50, unit: '%',  default: 15,  apply: (v, e) => e.setSpacing(v / 100) },
 };
 
 export const TOOLS: ToolDef[] = [
-  { id: 'brush',     label: 'ブラシ',   icon: '🖌️', category: 'draw',   shortcut: 'b', params: ['size', 'opacity', 'pressureOpacity', 'wet', 'mixMode', 'stabilize', 'curve', 'textureScale'] },
+  { id: 'ribbon',    label: 'ブラシ',           icon: '🖊️', category: 'draw',   shortcut: 'b', params: ['size', 'opacity', 'pressureOpacity', 'wet', 'mixMode', 'stabilize', 'curve'] },
+  { id: 'brush',     label: 'テクスチャブラシ', icon: '🖌️', category: 'draw',   shortcut: 'n', params: ['size', 'opacity', 'pressureOpacity', 'wet', 'mixMode', 'stabilize', 'curve', 'textureScale', 'spacing'] },
   { id: 'eraser',    label: '消しゴム', icon: '🧹', category: 'draw',   shortcut: 'e', params: ['size', 'opacity', 'pressureOpacity', 'stabilize', 'curve'] },
   { id: 'blur',      label: 'ぼかし',   icon: '💧', category: 'draw',   shortcut: 'u', params: ['size', 'stabilize'] },
   { id: 'line',      label: '直線',     icon: '📏', category: 'draw',   shortcut: 'v', params: ['size', 'opacity'] },

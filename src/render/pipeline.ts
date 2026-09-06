@@ -10,6 +10,7 @@ import type { Renderer } from '../core/renderer.js';
 import type { StrokePoint, StrokeRecord } from '../pen/stroke.js';
 import { alignBrushBbox4x } from './brush-bbox.js';
 import { BrushRenderer, type BrushConfig } from './brush.js';
+import { RibbonRenderer } from './ribbon.js';
 import { CompositeRenderer } from './composite.js';
 import { DownsampleRenderer } from './downsample.js';
 import { BlendRenderer, type BlendMode } from './blend-renderer.js';
@@ -32,6 +33,9 @@ export type { LayerNode, FolderNode, CellNode, EffectChainItem } from './layer-m
 export class RenderPipeline {
   private renderer: Renderer;
   private brushRenderer: BrushRenderer;
+  private ribbonRenderer: RibbonRenderer;
+  /** true=リボン筆（メインブラシ）で描く。false=スタンプ（テクスチャブラシ等） */
+  private ribbonMode = false;
   private compositeRenderer: CompositeRenderer;
   private downsampleRenderer: DownsampleRenderer;
   private blendRenderer: BlendRenderer;
@@ -80,6 +84,7 @@ export class RenderPipeline {
   constructor(renderer: Renderer) {
     this.renderer = renderer;
     this.brushRenderer = new BrushRenderer(renderer.device);
+    this.ribbonRenderer = new RibbonRenderer(renderer.device);
     this.compositeRenderer = new CompositeRenderer(renderer.device);
     this.downsampleRenderer = new DownsampleRenderer(renderer.device);
     this.blendRenderer = new BlendRenderer(renderer.device);
@@ -93,9 +98,15 @@ export class RenderPipeline {
     return this.getOrCreateCellTexture(this.activeCellId);
   }
 
+  /** リボン筆モードの切替（ツール切替時に呼ぶ） */
+  setRibbonMode(enabled: boolean): void {
+    this.ribbonMode = enabled;
+  }
+
   async init(): Promise<void> {
     const { canvas, format } = this.renderer;
     await this.brushRenderer.init(canvas.width * 4, canvas.height * 4, BUFFER_FORMAT);
+    await this.ribbonRenderer.init(canvas.width, canvas.height, BUFFER_FORMAT);
     await this.compositeRenderer.init(format);
     await this.downsampleRenderer.init();
     await this.blendRenderer.init(BUFFER_FORMAT);
@@ -251,11 +262,19 @@ export class RenderPipeline {
     this.invalidate();
   }
 
-  /** 確定した prefix を一筆内 max 合成で accumulator へ追加する。 */
+  /**
+   * 確定した prefix を一筆内 accumulator へ追加する。
+   * スタンプ・リボンとも max 合成（一筆内の重なりで濃くしない）。
+   */
   appendIncrementalStroke(points: StrokePoint[]): void {
     if (points.length === 0) return;
-    this.drawToIsolated(points);
-    this.compositeRenderer.mergeMax(this.isolatedTexture, this.strokeAccumTexture);
+    if (this.ribbonMode) {
+      this.drawRibbonToIsolated(points);
+      this.compositeRenderer.mergeMax(this.isolatedTexture, this.strokeAccumTexture);
+    } else {
+      this.drawToIsolated(points);
+      this.compositeRenderer.mergeMax(this.isolatedTexture, this.strokeAccumTexture);
+    }
     this.hasStrokeAccum = true;
     this.invalidate();
   }
@@ -275,7 +294,8 @@ export class RenderPipeline {
   commitStroke(points: StrokePoint[]): void {
     if (points.length > 0) {
       this.drawAlphaLock = this.getActiveLayerAlphaLock();
-      this.drawToIsolated(points);
+      if (this.ribbonMode) this.drawRibbonToIsolated(points);
+      else this.drawToIsolated(points);
       this.compositeRenderer.bake(this.isolatedTexture, this.committedTexture, this.eraseMode);
       if (this.activeCellId) this.nonEmptyCells.add(this.activeCellId);
     }
@@ -360,6 +380,28 @@ export class RenderPipeline {
   }
 
   /**
+   * リボン筆の描画。4x bbox + downsample を通さず、isolated へ max で直接描く。
+   * 輪郭AAはシェーダー側の SDF + fwidth で行う。
+   * 1点のみ（クリックのドット）は面積ゼロのためスタンプにフォールバックする。
+   */
+  private drawRibbonToIsolated(points: StrokePoint[], alphaLockSource: GPUTexture = this.committedTexture): void {
+    if (points.length < 2) {
+      this.drawToIsolated(points, alphaLockSource);
+      return;
+    }
+    const { device } = this.renderer;
+    this.ribbonRenderer.updateConfig({ alphaLock: this.drawAlphaLock });
+
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{ view: this.isolatedTexture.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' }],
+    });
+    this.ribbonRenderer.renderStroke(pass, points, alphaLockSource);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+  }
+
+  /**
    * 全レイヤーを下から合成して結果テクスチャを返す
    * 3オブジェクト構造: セルを積み順に合成 → ルート効果チェーンを適用
    * @param includeLiveStroke true ならアクティブセルに現在ストロークを重ねる
@@ -375,7 +417,8 @@ export class RenderPipeline {
         this.drawAlphaLock = activeCell.alphaLock;
         let liveStrokeTexture: GPUTexture;
         if (this.currentStroke.length > 0) {
-          this.drawToIsolated(this.currentStroke);
+          if (this.ribbonMode) this.drawRibbonToIsolated(this.currentStroke);
+          else this.drawToIsolated(this.currentStroke);
           if (this.hasStrokeAccum) {
             const liveCopy = device.createCommandEncoder();
             liveCopy.copyTextureToTexture(
@@ -673,6 +716,7 @@ export class RenderPipeline {
       aligned, { bytesPerRow: bpr, rowsPerImage: h }, [w, h],
     );
     this.brushRenderer.setSelectionTexture(this.selectionMask);
+    this.ribbonRenderer.setSelectionTexture(this.selectionMask);
     this.selectionMaskData = data;
     this.selectionBounds = bounds;
   }
@@ -725,6 +769,7 @@ export class RenderPipeline {
   clearSelection(): void {
     if (this.selectionMask) { this.selectionMask.destroy(); this.selectionMask = null; }
     this.brushRenderer.setSelectionTexture(null);
+    this.ribbonRenderer.setSelectionTexture(null);
     this.selectionMaskData = null;
     this.selectionBounds = null;
   }
@@ -1257,7 +1302,18 @@ export class RenderPipeline {
 
   // --- ブラシ・スナップショット系（アクティブレイヤー対象）---
 
-  updateBrushConfig(config: Partial<BrushConfig>): void { this.brushRenderer.updateConfig(config); }
+  updateBrushConfig(config: Partial<BrushConfig>): void {
+    this.brushRenderer.updateConfig(config);
+    // リボン筆が使うサブセットをミラーする（色・点色・透明保護・筆圧濃度・混色）
+    const ribbonSubset: Partial<import('./ribbon.js').RibbonConfig> = {};
+    if (config.color !== undefined) ribbonSubset.color = { ...config.color };
+    if (config.usePointColor !== undefined) ribbonSubset.usePointColor = config.usePointColor;
+    if (config.alphaLock !== undefined) ribbonSubset.alphaLock = config.alphaLock;
+    if (config.pressureOpacity !== undefined) ribbonSubset.pressureOpacity = config.pressureOpacity;
+    if (config.wetRatio !== undefined) ribbonSubset.wetRatio = config.wetRatio;
+    if (config.mixMode !== undefined) ribbonSubset.mixMode = config.mixMode;
+    if (Object.keys(ribbonSubset).length > 0) this.ribbonRenderer.updateConfig(ribbonSubset);
+  }
 
   async requestCommittedSnapshot() {
     return this.readbackTexture(this.committedTexture);
@@ -1299,13 +1355,18 @@ export class RenderPipeline {
       this.clearTextureContent(this.committedTexture);
     }
     const currentPressureOpacity = this.brushRenderer.getConfig().pressureOpacity;
+    const savedRibbonMode = this.ribbonMode;
     this.brushRenderer.updateConfig({ usePointColor: true });
+    this.ribbonRenderer.updateConfig({ usePointColor: true });
     for (const rec of records) {
       if (rec.kind === 'fill') {
         this.updateCommittedTexture(rec.snapshot);
       } else if (rec.points.length > 0) {
+        // レコードの筆種で再現（混在時は都度切替）
+        this.ribbonMode = (rec.brushKind ?? 'stamp') === 'ribbon';
         // レコードに保存した alphaLock で再現（描画順は元と同じなのでマスクも一致）
         this.brushRenderer.updateConfig({ pressureOpacity: rec.pressureOpacity ?? false });
+        this.ribbonRenderer.updateConfig({ pressureOpacity: rec.pressureOpacity ?? false });
         this.beginIncrementalStroke(rec.alphaLock ?? false);
         // 巨大な1ストロークも固定点数の局所bboxへ分けて再生する。
         for (let i = 0; i < rec.points.length; i += 4096) {
@@ -1315,6 +1376,8 @@ export class RenderPipeline {
       }
     }
     this.brushRenderer.updateConfig({ usePointColor: false, pressureOpacity: currentPressureOpacity });
+    this.ribbonRenderer.updateConfig({ usePointColor: false, pressureOpacity: currentPressureOpacity });
+    this.ribbonMode = savedRibbonMode;
     if (this.activeCellId) {
       if (base || records.length > 0) this.nonEmptyCells.add(this.activeCellId);
       else this.nonEmptyCells.delete(this.activeCellId);
@@ -1344,6 +1407,8 @@ export class RenderPipeline {
     const savedStroke = this.currentStroke;
     const savedAccum = this.hasStrokeAccum;
     const savedAlphaLock = this.drawAlphaLock;
+    const savedRibbonMode = this.ribbonMode;
+    if (record.kind === 'stroke') this.ribbonMode = (record.brushKind ?? 'stamp') === 'ribbon';
     this.currentStroke = [];
     this.hasStrokeAccum = false;
     this.drawAlphaLock = record.alphaLock ?? false;
@@ -1353,11 +1418,16 @@ export class RenderPipeline {
       pressureOpacity: record.pressureOpacity ?? false,
     });
     for (let i = 0; i < record.points.length; i += 4096) {
-      this.drawToIsolated(record.points.slice(i, i + 4096), target);
+      if (this.ribbonMode) {
+        this.drawRibbonToIsolated(record.points.slice(i, i + 4096), target);
+      } else {
+        this.drawToIsolated(record.points.slice(i, i + 4096), target);
+      }
       this.compositeRenderer.mergeMax(this.isolatedTexture, this.strokeAccumTexture);
     }
     this.compositeRenderer.bake(this.strokeAccumTexture, target, record.erase);
     this.brushRenderer.updateConfig(savedConfig);
+    this.ribbonMode = savedRibbonMode;
     this.currentStroke = savedStroke;
     this.hasStrokeAccum = savedAccum;
     this.drawAlphaLock = savedAlphaLock;
@@ -1409,6 +1479,7 @@ export class RenderPipeline {
     if (this.moveActive) this.cancelMove();
     if (this.filterActive) this.cancelFilter();
     this.brushRenderer.resize(w * 4, h * 4);
+    this.ribbonRenderer.resize(w, h);
     this.brushBboxTexture?.destroy();
     this.brushBboxTexture = null;
     this.brushBboxSize = { w: 0, h: 0 };
@@ -1495,6 +1566,7 @@ export class RenderPipeline {
 
   dispose() {
     this.brushRenderer.dispose();
+    this.ribbonRenderer.dispose();
     this.transformRenderer.dispose();
     this.filterRenderer.dispose();
     this._clearTransformState();

@@ -32,6 +32,8 @@ export class Stabilizer {
   private lastRawPoint: PointerPoint | null = null;
   /** EMAの直前出力。 */
   private lastOutputPoint: PointerPoint | null = null;
+  /** 平滑化済み筆圧の直前値。 */
+  private lastPressure: number | null = null;
   private lastVelocity: number = 0;
   private static readonly NOMINAL_INTERVAL_MS = 1000 / 120;
 
@@ -47,6 +49,7 @@ export class Stabilizer {
     if (!this.lastRawPoint || !this.lastOutputPoint) {
       this.lastRawPoint = point;
       this.lastOutputPoint = point;
+      this.lastPressure = point.pressure;
       return point;
     }
 
@@ -61,10 +64,15 @@ export class Stabilizer {
     const alpha = this.timeAdjustedAlpha(baseAlpha, dt);
 
     // EMAフィルター適用
+    // 筆圧も位置と同じαで均す。高速時は素通し、低速時は定常化する。
+    // 生筆圧のままにするとセンサーノイズ＋量子化が太さの階段になり、
+    // ゆっくり描くほどカクついて見える。
     const stabilized: PointerPoint = {
       x: this.ema(this.lastOutputPoint.x, point.x, alpha),
       y: this.ema(this.lastOutputPoint.y, point.y, alpha),
-      pressure: point.pressure, // 筆圧は補正しない
+      pressure: this.lastPressure === null
+        ? point.pressure
+        : this.ema(this.lastPressure, point.pressure, alpha),
       tiltX: point.tiltX,
       tiltY: point.tiltY,
       timestamp: point.timestamp,
@@ -72,6 +80,7 @@ export class Stabilizer {
 
     this.lastRawPoint = point;
     this.lastOutputPoint = stabilized;
+    this.lastPressure = stabilized.pressure;
     return stabilized;
   }
 
@@ -147,6 +156,7 @@ export class Stabilizer {
   reset(): void {
     this.lastRawPoint = null;
     this.lastOutputPoint = null;
+    this.lastPressure = null;
     this.lastVelocity = 0;
   }
 

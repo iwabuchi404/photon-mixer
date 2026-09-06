@@ -347,12 +347,30 @@ describe('ペン入力統合テスト', () => {
       assert.ok(result.x > 250, '高速時は補正が弱く、入力点に近い');
     });
 
-    test('筆圧は補正しない', () => {
+    test('筆圧一定ならそのまま通す', () => {
+      const stabilizer = new Stabilizer();
+
+      stabilizer.stabilize({ x: 100, y: 100, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 0 });
+
+      const result = stabilizer.stabilize({
+        x: 110,
+        y: 110,
+        pressure: 0.5,
+        tiltX: 0,
+        tiltY: 0,
+        timestamp: 100
+      });
+
+      assert.strictEqual(result.pressure, 0.5, '一定筆圧は変わらない');
+    });
+
+    test('筆圧は位置と同じαで平滑化する', () => {
       const stabilizer = new Stabilizer();
 
       stabilizer.stabilize({ x: 100, y: 100, pressure: 0.3, tiltX: 0, tiltY: 0, timestamp: 0 });
 
-      const result = stabilizer.stabilize({
+      // 低速移動: 筆圧の急変が均される（0.3 と 0.8 の間）
+      const slow = stabilizer.stabilize({
         x: 110,
         y: 110,
         pressure: 0.8,
@@ -360,8 +378,24 @@ describe('ペン入力統合テスト', () => {
         tiltY: 0,
         timestamp: 100
       });
+      assert.ok(slow.pressure > 0.3 && slow.pressure < 0.8, `低速時は均されるはず: ${slow.pressure}`);
+    });
 
-      assert.strictEqual(result.pressure, 0.8, '筆圧はそのまま');
+    test('高速時は筆圧も素通しに近い', () => {
+      const stabilizer = new Stabilizer();
+
+      stabilizer.stabilize({ x: 100, y: 100, pressure: 0.3, tiltX: 0, tiltY: 0, timestamp: 0 });
+
+      // 高速移動（2000px/sec）: α=1 で入力そのまま
+      const fast = stabilizer.stabilize({
+        x: 300,
+        y: 300,
+        pressure: 0.8,
+        tiltX: 0,
+        tiltY: 0,
+        timestamp: 100
+      });
+      assert.strictEqual(fast.pressure, 0.8, '高速時は筆圧も素通し');
     });
 
     test('バッチ処理で複数の点を補正できる', () => {
@@ -482,8 +516,8 @@ describe('ペン入力統合テスト', () => {
       assert.strictEqual(result[0].y, 0);
     });
 
-    test('紐が張ったらブラシが引かれる', () => {
-      const ps = new PulledStringStabilizer({ radius: 10, finishLine: false });
+    test('紐が張ったらブラシが引かれる（古典動作）', () => {
+      const ps = new PulledStringStabilizer({ radius: 10, finishLine: false, adaptive: false, reverseSlack: false });
       const result = ps.stabilizeBatch([
         mkPoint(0, 0, 0), mkPoint(20, 0, 10),
       ]);
@@ -492,14 +526,43 @@ describe('ペン入力統合テスト', () => {
       assert.strictEqual(result[1].y, 0);
     });
 
-    test('ブラシは常に紐の長さ分だけペン先より遅れる', () => {
-      const ps = new PulledStringStabilizer({ radius: 10, finishLine: false });
+    test('ブラシは常に紐の長さ分だけペン先より遅れる（古典動作）', () => {
+      const ps = new PulledStringStabilizer({ radius: 10, finishLine: false, adaptive: false, reverseSlack: false });
       const result = ps.stabilizeBatch([
         mkPoint(0, 0, 0), mkPoint(20, 0, 10), mkPoint(40, 0, 20),
       ]);
       const last = result.at(-1)!;
       assert.ok(Math.abs(last.x - 30) < 1e-6, `expected ~30, got ${last.x}`);
       assert.strictEqual(last.y, 0);
+    });
+
+    test('速度適応: 高速では実効半径が短くなる', () => {
+      const ps = new PulledStringStabilizer({ radius: 10, finishLine: false });
+      const result = ps.stabilizeBatch([
+        mkPoint(0, 0, 0), mkPoint(20, 0, 10), // 2000px/s
+      ]);
+      const last = result.at(-1)!;
+      // effR = 10/(1+2000/800) ≈ 2.86 → x ≈ 17.14（古典なら 10）
+      assert.ok(last.x > 15, `高速時は軽くなるはず: ${last.x}`);
+    });
+
+    test('速度適応: 低速ではほぼ全半径が効く', () => {
+      const ps = new PulledStringStabilizer({ radius: 10, finishLine: false });
+      const result = ps.stabilizeBatch([
+        mkPoint(0, 0, 0), mkPoint(20, 0, 1000), // 20px/s
+      ]);
+      const last = result.at(-1)!;
+      assert.ok(Math.abs(last.x - 10) < 1.0, `低速時は古典に近いはず: ${last.x}`);
+    });
+
+    test('反転緩み: 引き返し時はブラシが置いていかれない', () => {
+      const ps = new PulledStringStabilizer({ radius: 10, finishLine: false });
+      const result = ps.stabilizeBatch([
+        mkPoint(0, 0, 0), mkPoint(30, 0, 1000), mkPoint(25, 0, 2000),
+      ]);
+      // 古典なら3点目は dead zone で出力なし。緩みで追従点が出る
+      assert.strictEqual(result.length, 3);
+      assert.ok(result[2].x > 20.5 && result[2].x < 25, `引き返しで追従するはず: ${result[2].x}`);
     });
 
     test('finishLine で最終位置まで到達する', () => {
@@ -511,8 +574,8 @@ describe('ペン入力統合テスト', () => {
       assert.ok(Math.abs(last.x - 20) < 1e-6, `expected ~20, got ${last.x}`);
     });
 
-    test('finishLine が長い1区間を作らず再サンプリングされる', () => {
-      const ps = new PulledStringStabilizer({ radius: 10, finishLine: true });
+    test('finishLine が長い1区間を作らず再サンプリングされる（古典動作）', () => {
+      const ps = new PulledStringStabilizer({ radius: 10, finishLine: true, adaptive: false, reverseSlack: false });
       const result = ps.stabilizeBatch([
         mkPoint(0, 0, 0), mkPoint(100, 0, 10),
       ], true);
@@ -528,8 +591,8 @@ describe('ペン入力統合テスト', () => {
       assert.ok(gaps.every(g => g < 10), `gaps should be < 10, got ${gaps}`);
     });
 
-    test('finishLine=false で追従しない', () => {
-      const ps = new PulledStringStabilizer({ radius: 10, finishLine: false });
+    test('finishLine=false で追従しない（古典動作）', () => {
+      const ps = new PulledStringStabilizer({ radius: 10, finishLine: false, adaptive: false, reverseSlack: false });
       const result = ps.stabilizeBatch([
         mkPoint(0, 0, 0), mkPoint(100, 0, 10),
       ], true);
@@ -585,9 +648,9 @@ describe('ペン入力統合テスト', () => {
     const { StabilizationController } = await import('../src/pen/stabilization-mode.js');
     const mkPoint = (x: number, y: number): any => ({ x, y, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 0 });
 
-    test('デフォルトは EMA モード', () => {
+    test('デフォルトは紐引きモード', () => {
       const ctrl = new StabilizationController();
-      assert.strictEqual(ctrl.getMode(), 'ema');
+      assert.strictEqual(ctrl.getMode(), 'pulled-string');
     });
 
     test('mode 切り替えで内部インスタンスが切り替わる', () => {
@@ -597,7 +660,7 @@ describe('ペン入力統合テスト', () => {
     });
 
     test('EMA モードで stabilizeBatch が EMA と同じ結果', () => {
-      const ctrl = new StabilizationController({ emaConfig: { threshold: 1000, minAlpha: 0.1 } });
+      const ctrl = new StabilizationController({ mode: 'ema', emaConfig: { threshold: 1000, minAlpha: 0.1 } });
       const points = [mkPoint(0, 0), mkPoint(50, 50), mkPoint(100, 50)];
       const result = ctrl.stabilizeBatch(points);
       assert.strictEqual(result.length, points.length);

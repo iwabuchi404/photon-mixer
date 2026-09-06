@@ -159,7 +159,8 @@ export function buildAppMenu(mainWindow: BrowserWindow): void {
     {
       label: 'ツール(&T)',
       submenu: [
-        { label: 'ブラシ', click: () => send({ action: 'tool:set', payload: 'brush' }) },
+        { label: 'ブラシ', click: () => send({ action: 'tool:set', payload: 'ribbon' }) },
+        { label: 'テクスチャブラシ', click: () => send({ action: 'tool:set', payload: 'brush' }) },
         { label: '消しゴム', click: () => send({ action: 'tool:set', payload: 'eraser' }) },
         { label: 'ぼかし', click: () => send({ action: 'tool:set', payload: 'blur' }) },
         { label: '直線', click: () => send({ action: 'tool:set', payload: 'line' }) },

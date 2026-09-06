@@ -33,7 +33,7 @@ export interface StabilizationSettings {
 export class StabilizationController {
   private ema: Stabilizer;
   private pulledString: PulledStringStabilizer;
-  private mode: StabilizationMode = 'ema';
+  private mode: StabilizationMode = 'pulled-string';
 
   constructor(settings: Partial<StabilizationSettings> = {}) {
     this.ema = new Stabilizer(settings.emaConfig);
