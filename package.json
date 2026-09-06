@@ -1,6 +1,6 @@
 {
   "name": "photon-mixer",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Digital-native illustration software with float32 linear color and GPU-native architecture",
   "author": "iwabuchi404",
   "license": "MIT",
