@@ -83,17 +83,19 @@ export class FilterRenderer {
     this.tmpB = this.device.createTexture({ size: [width, height], format: FORMAT, usage });
   }
 
-  /** 1パス実行（target に描画） */
+  /** 1パス実行（target に描画）。scissor 指定時は矩形内だけ書く（読みは全域） */
   private pass(
     entry: string, target: GPUTexture,
     t0: GPUTexture, t1: GPUTexture | null, t2: GPUTexture | null,
     uni: number[],
+    scissor?: { x: number; y: number; w: number; h: number },
   ): void {
     this.device.queue.writeBuffer(this.uniformBuffer, 0, new Float32Array(uni));
     const enc = this.device.createCommandEncoder();
     const rp = enc.beginRenderPass({
-      colorAttachments: [{ view: target.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' }],
+      colorAttachments: [{ view: target.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: scissor ? 'load' : 'clear', storeOp: 'store' }],
     });
+    if (scissor) rp.setScissorRect(scissor.x, scissor.y, scissor.w, scissor.h);
     const bind = this.device.createBindGroup({
       layout: this.layout!,
       entries: [
@@ -141,40 +143,44 @@ export class FilterRenderer {
   /**
    * フィルターを適用。src（原本）から計算し、選択マスクで合成して dst に書く。
    * src と dst は別テクスチャであること。
+   * scissor 指定時は矩形内だけ書く（ぼかし等の読みは全域＝正しいはみ出し）。
    */
-  apply(type: FilterType, params: FilterParams, src: GPUTexture, mask: GPUTexture | null, dst: GPUTexture, strength = 1): void {
+  apply(
+    type: FilterType, params: FilterParams, src: GPUTexture, mask: GPUTexture | null, dst: GPUTexture, strength = 1,
+    scissor?: { x: number; y: number; w: number; h: number },
+  ): void {
     const r = params.radius;
     const useMask = mask ? 1 : 0;
 
     let filtered: GPUTexture;
     if (type === 'blur') {
-      this.pass('blur', this.tmpA, src, null, null, this.uni({ dirX: 1, radius: r }));
-      this.pass('blur', this.tmpB, this.tmpA, null, null, this.uni({ dirY: 1, radius: r }));
+      this.pass('blur', this.tmpA, src, null, null, this.uni({ dirX: 1, radius: r }), scissor);
+      this.pass('blur', this.tmpB, this.tmpA, null, null, this.uni({ dirY: 1, radius: r }), scissor);
       filtered = this.tmpB;
     } else if (type === 'glow') {
-      this.pass('threshold', this.tmpA, src, null, null, this.uni({ threshold: params.threshold }));
-      this.pass('blur', this.tmpB, this.tmpA, null, null, this.uni({ dirX: 1, radius: r }));
-      this.pass('blur', this.tmpA, this.tmpB, null, null, this.uni({ dirY: 1, radius: r }));
-      this.pass('addGlow', this.tmpB, src, this.tmpA, null, this.uni({ intensity: params.intensity }));
+      this.pass('threshold', this.tmpA, src, null, null, this.uni({ threshold: params.threshold }), scissor);
+      this.pass('blur', this.tmpB, this.tmpA, null, null, this.uni({ dirX: 1, radius: r }), scissor);
+      this.pass('blur', this.tmpA, this.tmpB, null, null, this.uni({ dirY: 1, radius: r }), scissor);
+      this.pass('addGlow', this.tmpB, src, this.tmpA, null, this.uni({ intensity: params.intensity }), scissor);
       filtered = this.tmpB;
     } else if (type === 'sharpen') {
-      this.pass('blur', this.tmpA, src, null, null, this.uni({ dirX: 1, radius: r }));
-      this.pass('blur', this.tmpB, this.tmpA, null, null, this.uni({ dirY: 1, radius: r }));
-      this.pass('sharpen', this.tmpA, src, this.tmpB, null, this.uni({ intensity: params.intensity }));
+      this.pass('blur', this.tmpA, src, null, null, this.uni({ dirX: 1, radius: r }), scissor);
+      this.pass('blur', this.tmpB, this.tmpA, null, null, this.uni({ dirY: 1, radius: r }), scissor);
+      this.pass('sharpen', this.tmpA, src, this.tmpB, null, this.uni({ intensity: params.intensity }), scissor);
       filtered = this.tmpA;
     } else if (type === 'exposure') {
-      this.pass('exposure', this.tmpA, src, null, null, this.uni({ ev: params.ev }));
+      this.pass('exposure', this.tmpA, src, null, null, this.uni({ ev: params.ev }), scissor);
       filtered = this.tmpA;
     } else if (type === 'levels') {
-      this.pass('levels', this.tmpA, src, null, null, this.uni({ levels: params }));
+      this.pass('levels', this.tmpA, src, null, null, this.uni({ levels: params }), scissor);
       filtered = this.tmpA;
     } else {
       // curve（LUT は setCurveLut 済み前提。未設定なら dummy で恒等にならないため src そのまま）
-      this.pass('curve', this.tmpA, src, this.curveLut ?? this.dummy, null, this.uni({}));
+      this.pass('curve', this.tmpA, src, this.curveLut ?? this.dummy, null, this.uni({}), scissor);
       filtered = this.tmpA;
     }
     // 選択マスクと効果不透明度で original と合成して dst へ
-    this.pass('maskComposite', dst, filtered, src, mask, this.uni({ useMask, strength }));
+    this.pass('maskComposite', dst, filtered, src, mask, this.uni({ useMask, strength }), scissor);
   }
 
   dispose(): void {

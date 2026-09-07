@@ -6,8 +6,8 @@
 struct BlendUniforms {
   mode: u32,       // 0=normal,1=multiply,2=screen,3=overlay,4=add
   opacity: f32,    // 0-1
-  _pad0: u32,
-  _pad1: u32,
+  tile_ox: f32,    // T2タイル合成用: ソースタイル原点(px)。fs_main では未使用
+  tile_oy: f32,
 }
 
 @group(0) @binding(0) var dst_tex: texture_2d<f32>;
@@ -85,6 +85,42 @@ fn blend_fn(mode: u32, cb: vec3f, cs: vec3f) -> vec3f {
     case 4u: { return cs + cb; }                       // add (linear dodge) — HDRに蓄積（表示時にトーンマップ）
     default: { return cs; }                            // normal (Oklab path は fs_main で処理)
   }
+}
+
+@fragment
+fn fs_main_tile(in: VOut) -> @location(0) vec4f {
+  // T2: src は 512²タイル、dst は fullscreen。fragCoord からタイル内 UV を復元する
+  let src_uv = (in.position.xy - vec2f(params.tile_ox, params.tile_oy)) / 512.0;
+  let s = textureSample(src_tex, samp, src_uv); // premultiplied
+  let d = textureSample(dst_tex, samp, in.uv);
+
+  // ---- 以下 fs_main と同一 ----
+  let sa = s.a * params.opacity;
+  if (sa <= 0.0001 && d.a <= 0.0001) {
+    return vec4f(0.0);
+  }
+
+  let da = d.a;
+  // straight colors
+  let Cs = select(vec3f(0.0), s.rgb / s.a, s.a > 0.0001);
+  let Cb = select(vec3f(0.0), d.rgb / da, da > 0.0001);
+
+  let out_a = sa + da * (1.0 - sa);
+
+  var out_rgb: vec3f;
+  if (params.mode == 0u) {
+    let t = select(0.0, sa / out_a, out_a > 0.0001);
+    let lab_b = linear_to_oklab(Cb);
+    let lab_s = linear_to_oklab(Cs);
+    let lab_mix = lab_b + (lab_s - lab_b) * t;
+    out_rgb = oklab_to_linear(lab_mix) * out_a;
+  } else {
+    let B = blend_fn(params.mode, Cb, Cs);
+    let mixed = (1.0 - da) * Cs + da * B;
+    out_rgb = sa * mixed + d.rgb * (1.0 - sa);
+  }
+
+  return vec4f(out_rgb, out_a);
 }
 
 @fragment

@@ -37,6 +37,7 @@ export interface EngineDeps {
   postCorrector: PostCorrector;
   interpolator: Interpolator;
   getPipeline: () => RenderPipeline | null;
+  /** リボン筆系ツール（ブラシ・消しゴム）か。間隔概念なし＝密に補間する */
   getIsRibbonTool: () => boolean;
   state: SharedState;
 }

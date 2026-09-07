@@ -17,6 +17,7 @@ import { srgbToLinear, linearColorToSrgb } from './color/linear.js';
 import { linearToOklab, oklabToLinear, mixOklab } from './color/oklab.js';
 import { BrushPresetManager } from './brush-preset.js';
 import { savePmx, loadPmx } from './pmx.js';
+import { TILE_SIZE } from './render/tile-store.js';
 import { saveAutosave, loadAutosave } from './autosave.js';
 import { ColorPicker } from './ui/color-picker.js';
 import { buildMaskContour } from './selection/mask.js';
@@ -224,6 +225,8 @@ class PhotonMixerApp {
     await this.renderPipeline.init();
     // 初期ツールはリボン筆（メインブラシ）
     this.renderPipeline.setRibbonMode(true);
+    // 診断フック: タイル統計（verify 用。製品動作に影響なし）
+    (window as any).__tileStats = () => this.renderPipeline?.tileStats() ?? null;
     // 混色方式の初期値をエンジンへ明示的に反映（UI表示・state・GPU の三者統一）
     this.renderPipeline.updateBrushConfig({ mixMode: this.state.mixMode });
 
@@ -480,13 +483,14 @@ class PhotonMixerApp {
       if (!this.renderPipeline) return;
       try {
         const { width, height } = this.renderPipeline.getCanvasSize();
-        const cellData = await this.renderPipeline.readAllCells();
+        const cellData = await this.renderPipeline.readCellTiles();
         const blob = savePmx(
           width, height,
           this.renderPipeline.getRootNodes(),
           this.renderPipeline.getRootEffects(),
-          cellData.map(({ cell, data }) => ({ cellId: cell.id, data })),
+          cellData.map(({ cell, tiles }) => ({ cellId: cell.id, tiles })),
           this.renderPipeline.getActiveLayerId(),
+          TILE_SIZE,
           { documentSettings: { view: this.currentViewSettings(), swatches: this.colorPicker?.getSwatches() ?? [] } },
         );
         await saveAutosave(blob);
@@ -733,14 +737,15 @@ class PhotonMixerApp {
     if (!this.renderPipeline) return;
     try {
       const { width, height } = this.renderPipeline.getCanvasSize();
-      const cellData = await this.renderPipeline.readAllCells();
+      const cellData = await this.renderPipeline.readCellTiles();
       const activeId = this.renderPipeline.getActiveLayerId();
       const blob = savePmx(
         width, height,
         this.renderPipeline.getRootNodes(),
         this.renderPipeline.getRootEffects(),
-        cellData.map(({ cell, data }) => ({ cellId: cell.id, data })),
+        cellData.map(({ cell, tiles }) => ({ cellId: cell.id, tiles })),
         activeId,
+        TILE_SIZE,
         { documentSettings: { view: this.currentViewSettings(), swatches: this.colorPicker?.getSwatches() ?? [] } },
       );
       const url = URL.createObjectURL(blob);
@@ -763,9 +768,9 @@ class PhotonMixerApp {
     try {
       const { width, height, activeCellId, rootNodes, rootEffects, cellData, documentSettings } = await loadPmx(file);
       this.renderPipeline.loadDocument(width, height, rootNodes, rootEffects, activeCellId);
-      // セルのピクセルデータをテクスチャに書き込む
-      for (const { cellId, data } of cellData) {
-        this.renderPipeline.writeCellData(cellId, data);
+      // セルのタイルデータを書き込む（v3）
+      for (const { cellId, tiles } of cellData) {
+        this.renderPipeline.writeCellTiles(cellId, tiles);
       }
       // View 設定・スウォッチを復元
       if (documentSettings) {
@@ -825,6 +830,11 @@ class PhotonMixerApp {
 
   private isProgressiveMixing(): boolean {
     return this.state.mixMode === 'progressive' && this.state.wetRatio > 0;
+  }
+
+  /** リボン筆で描くツール（ブラシ本体＋消しゴム）。消しは形状だけリボンで、削りは bake 時に行う */
+  private isRibbonTool(tool: Tool): boolean {
+    return tool === 'ribbon' || tool === 'eraser';
   }
 
   /** 引きずり混色 or ぼかし筆（どちらも smudge ベースの点ごとの色処理を使う） */
@@ -1138,7 +1148,7 @@ class PhotonMixerApp {
               kind: 'stroke', points: this.liveStrokePoints, erase,
               alphaLock: this.renderPipeline?.getActiveLayerAlphaLock() ?? false,
               pressureOpacity: this.state.pressureOpacity,
-              brushKind: this.state.currentTool === 'ribbon' ? 'ribbon' : 'stamp',
+              brushKind: this.isRibbonTool(this.state.currentTool) ? 'ribbon' : 'stamp',
             });
           }
           // 点ごとの色モードを解除
@@ -1154,7 +1164,7 @@ class PhotonMixerApp {
               kind: 'stroke', points: this.liveStrokePoints, erase,
               alphaLock: this.renderPipeline?.getActiveLayerAlphaLock() ?? false,
               pressureOpacity: this.state.pressureOpacity,
-              brushKind: this.state.currentTool === 'ribbon' ? 'ribbon' : 'stamp',
+              brushKind: this.isRibbonTool(this.state.currentTool) ? 'ribbon' : 'stamp',
             });
           }
         }
@@ -1616,7 +1626,7 @@ class PhotonMixerApp {
 
     this.state.currentTool = tool;
     // 筆種をパイプラインへ反映（リボン筆かスタンプか）
-    this.renderPipeline?.setRibbonMode(tool === 'ribbon');
+    this.renderPipeline?.setRibbonMode(this.isRibbonTool(tool));
     this.applyToolCursor();
     this.toolBar?.setActive(tool);
     // ヘッダー・表示パラメータを更新し、ツールの保存値を復元してエンジンへ反映
@@ -1961,7 +1971,7 @@ class PhotonMixerApp {
       }
     }
 
-    this.renderPipeline.updateCommittedTexture(data);
+    this.renderPipeline.adoptPaintResult(data, snap.bytesPerRow);
     // 塗りつぶし直後のスナップショットを履歴に積む（rebake で上書き再現＝Undo 可能）
     this.addHistoryRecord({ kind: 'fill', snapshot: data, bytesPerRow: snap.bytesPerRow });
   }
@@ -2140,7 +2150,7 @@ class PhotonMixerApp {
       postCorrector: this.postCorrector,
       interpolator: this.interpolator,
       getPipeline: () => this.renderPipeline,
-      getIsRibbonTool: () => this.state.currentTool === 'ribbon',
+      getIsRibbonTool: () => this.isRibbonTool(this.state.currentTool),
       state: this.state,
     });
     // ツール個別状態（定義の既定値で初期化）

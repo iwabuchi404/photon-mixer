@@ -44,6 +44,32 @@ fn vs_bake(@builtin(vertex_index) vid: u32) -> VertexOutput {
   return out;
 }
 
+// タイル書き込み用: ソースの部分矩形（uv単位オフセット＋サイズ）を
+// タイルテクスチャ全体へ転写する。bake_rect は TileBakeRenderer が設定。
+struct BakeRect {
+  src_offset: vec2f,
+  src_size: vec2f,
+}
+@group(0) @binding(2)
+var<uniform> bake_rect: BakeRect;
+
+@vertex
+fn vs_bake_rect(@builtin(vertex_index) vid: u32) -> VertexOutput {
+  var pos = array<vec2f, 4>(
+    vec2f(-1.0, -1.0), vec2f( 1.0, -1.0),
+    vec2f(-1.0, 1.0), vec2f( 1.0, 1.0)
+  );
+  // vs_bake と同一の base 配列（部分矩形の線形 remap と可換）。
+  var base_uv = array<vec2f, 4>(
+    vec2f(0.0, 1.0), vec2f(1.0, 1.0),
+    vec2f(0.0, 0.0), vec2f(1.0, 0.0)
+  );
+  var out: VertexOutput;
+  out.position = vec4f(pos[vid], 0.0, 1.0);
+  out.uv = bake_rect.src_offset + base_uv[vid] * bake_rect.src_size;
+  return out;
+}
+
 // 画面表示用頂点シェーダー（ズーム・パン・回転を適用）
 @vertex
 fn vs_display(@builtin(vertex_index) vid: u32) -> VertexOutput {

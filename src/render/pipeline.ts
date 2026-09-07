@@ -13,7 +13,9 @@ import { BrushRenderer, type BrushConfig } from './brush.js';
 import { RibbonRenderer } from './ribbon.js';
 import { CompositeRenderer } from './composite.js';
 import { DownsampleRenderer } from './downsample.js';
-import { BlendRenderer, type BlendMode } from './blend-renderer.js';
+import { BlendRenderer, type BlendMode, type TileBlendOp } from './blend-renderer.js';
+import { TileBakeRenderer, type TileBakeMode } from './tile-bake.js';
+import { TileStore, TILE_SIZE } from './tile-store.js';
 import { TransformRenderer } from './transform.js';
 import { FilterRenderer, type FilterType, type FilterParams } from './filter.js';
 import { buildCurveLut, type CurvePoint } from '../color/curve.js';
@@ -26,6 +28,8 @@ import {
 import { linearToDisplaySrgb, TONEMAP_IDS, DISPLAY_MODE_IDS, type TonemapId, type DisplayModeId } from '../color/display.js';
 
 const BUFFER_FORMAT: GPUTextureFormat = 'rgba16float';
+/** 変形・フィルター書き戻し時のタイル余裕（1タイル分）。過剰保持は上限40で有界 */
+const TILE_MARGIN = 512;
 
 // レイヤーモデルの型を再エクスポート（旧API互換用）
 export type { LayerNode, FolderNode, CellNode, EffectChainItem } from './layer-model.js';
@@ -48,9 +52,18 @@ export class RenderPipeline {
   private strokeAccumTexture!: GPUTexture; // 分割フラッシュ済みの「一筆」を max 合成で保持
   private liveCombinedTexture!: GPUTexture; // accumulator + 可変末尾のライブ表示用
   private hasStrokeAccum = false;
-  // レイヤー合成用
-  private displayA!: GPUTexture;
-  private displayB!: GPUTexture;
+  /** 一筆 accumulator の内容 bbox（タイル書き戻し範囲用）。begin でリセット */
+  private strokeAccumBBox: { minX: number; minY: number; maxX: number; maxY: number } | null = null;
+  // T2: 2段キャッシュ。baseCache=層スタック結果、displayCache=撮影適用後。
+  // compA/compB=再計算用 ping-pong scratch。blankTile=空タイル用下地（背景色）。
+  private baseCache!: GPUTexture;
+  private displayCache!: GPUTexture;
+  private compA!: GPUTexture;
+  private compB!: GPUTexture;
+  private blankTile!: GPUTexture;
+  // ダーティタイル集合（base/display別）。空集合＝キャッシュ有効
+  private dirtyBase = new Set<number>();
+  private dirtyDisplay = new Set<number>();
   private activeComposite!: GPUTexture; // アクティブレイヤー committed + 現在ストローク
   private filterScratch!: GPUTexture;   // 効果（レイヤー入力）の処理結果一時バッファ
   private cellProcTemp!: GPUTexture;    // セル効果チェーン処理用（ping-pong）
@@ -59,10 +72,15 @@ export class RenderPipeline {
   private rootNodes: LayerNode[] = [];
   private rootEffects: EffectChainItem[] = [];
   private activeCellId: string | null = null;
-  // セルID → committed テクスチャのマップ（実行時データ）
-  private cellTextures: Map<string, GPUTexture> = new Map();
-  // Undo 上限より古い操作を、点列ではなく固定サイズのラスタとして保持する。
-  private historyBaseTextures: Map<string, GPUTexture> = new Map();
+  // T1: コミット済みセル内容の疎タイルストア。履歴基準は `h:<cellId>` owner で同居
+  private tileStore!: TileStore;
+  private tileBaker!: TileBakeRenderer;
+  // タイル合成・サンプリング・readback 用の fullscreen scratch（共有。composedTag で正当性管理）
+  private composeScratch!: GPUTexture;
+  private composedTag: { owner: string; version: number } | null = null;
+  // modal プレビュー（移動・変形）用の fullscreen 保持テクスチャ
+  private previewTexture!: GPUTexture;
+  private previewOverride: { cellId: string; texture: GPUTexture } | null = null;
   // 新規の空レイヤーを合成パスから除外するための保守的な内容フラグ。
   private nonEmptyCells: Set<string> = new Set();
   // 画面内容に変化がないフレームでは、全レイヤー合成と GPU submit を省く。
@@ -88,14 +106,14 @@ export class RenderPipeline {
     this.compositeRenderer = new CompositeRenderer(renderer.device);
     this.downsampleRenderer = new DownsampleRenderer(renderer.device);
     this.blendRenderer = new BlendRenderer(renderer.device);
+    this.tileBaker = new TileBakeRenderer(renderer.device);
     this.transformRenderer = new TransformRenderer(renderer.device);
     this.filterRenderer = new FilterRenderer(renderer.device);
   }
 
-  // アクティブセルの committed テクスチャ（既存の描画系メソッドが参照する）
-  private get committedTexture(): GPUTexture {
-    if (!this.activeCellId) throw new Error('No active cell');
-    return this.getOrCreateCellTexture(this.activeCellId);
+  /** 履歴基準の owner 名 */
+  private static historyOwner(cellId: string): string {
+    return `h:${cellId}`;
   }
 
   /** リボン筆モードの切替（ツール切替時に呼ぶ） */
@@ -107,6 +125,7 @@ export class RenderPipeline {
     const { canvas, format } = this.renderer;
     await this.brushRenderer.init(canvas.width * 4, canvas.height * 4, BUFFER_FORMAT);
     await this.ribbonRenderer.init(canvas.width, canvas.height, BUFFER_FORMAT);
+    await this.tileBaker.init();
     await this.compositeRenderer.init(format);
     await this.downsampleRenderer.init();
     await this.blendRenderer.init(BUFFER_FORMAT);
@@ -136,16 +155,6 @@ export class RenderPipeline {
 
   // --- テクスチャ生成 ---
 
-  private makeLayerTexture(): GPUTexture {
-    const tex = this.renderer.device.createTexture({
-      size: [this.canvasWidth, this.canvasHeight],
-      format: BUFFER_FORMAT,
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST,
-    });
-    this.clearTextureContent(tex);
-    return tex;
-  }
-
   private createTextures(width: number, height: number): void {
     this.canvasWidth = width;
     this.canvasHeight = height;
@@ -161,9 +170,17 @@ export class RenderPipeline {
     this.strokeAccumTexture = this.renderer.device.createTexture({ size: [width, height], format: BUFFER_FORMAT, usage: strokeUsage });
     this.liveCombinedTexture = this.renderer.device.createTexture({ size: [width, height], format: BUFFER_FORMAT, usage: strokeUsage });
     this.hasStrokeAccum = false;
-    const dispUsage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC;
-    this.displayA = this.renderer.device.createTexture({ size: [width, height], format: BUFFER_FORMAT, usage: dispUsage });
-    this.displayB = this.renderer.device.createTexture({ size: [width, height], format: BUFFER_FORMAT, usage: dispUsage });
+    const cacheUsage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST;
+    this.baseCache = this.renderer.device.createTexture({ size: [width, height], format: BUFFER_FORMAT, usage: cacheUsage });
+    this.displayCache = this.renderer.device.createTexture({ size: [width, height], format: BUFFER_FORMAT, usage: cacheUsage });
+    const compUsage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST;
+    this.compA = this.renderer.device.createTexture({ size: [width, height], format: BUFFER_FORMAT, usage: compUsage });
+    this.compB = this.renderer.device.createTexture({ size: [width, height], format: BUFFER_FORMAT, usage: compUsage });
+    this.blankTile = this.renderer.device.createTexture({
+      size: [TILE_SIZE, TILE_SIZE], format: BUFFER_FORMAT,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST,
+    });
+    this.updateBlankTile();
     this.activeComposite = this.renderer.device.createTexture({
       size: [width, height], format: BUFFER_FORMAT,
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
@@ -178,35 +195,197 @@ export class RenderPipeline {
       size: [width, height], format: BUFFER_FORMAT,
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
+    // T1: タイル合成・サンプリング・readback 用の共有 scratch
+    const scratchUsage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST;
+    this.composeScratch = this.renderer.device.createTexture({
+      size: [width, height], format: BUFFER_FORMAT, usage: scratchUsage,
+    });
+    // T1: modal プレビュー（移動・変形）保持用
+    this.previewTexture = this.renderer.device.createTexture({
+      size: [width, height], format: BUFFER_FORMAT, usage: scratchUsage,
+    });
+    this.composedTag = null;
+    this.previewOverride = null;
+    // T1: タイルストア（旧インスタンスがあれば破棄）
+    // デバッグフック: window.__tileBudgetMB で予算を上書きできる（verify 用）
+    this.tileStore?.clearAll();
+    const budgetMB = Number((window as any).__tileBudgetMB ?? 1536);
+    this.tileStore = new TileStore(this.renderer.device, width, height, {
+      gpuBudgetBytes: Math.max(1, Math.floor(budgetMB)) * 1024 * 1024,
+    });
 
     // レイヤーを初期化（1枚のセル）
     this.destroyAllCellTextures();
     this.rootNodes = [this.createEmptyCell('レイヤー 1')];
     this.rootEffects = [];
     this.activeCellId = this.rootNodes[0].id;
+    this.repinActive(null);
+    // グリッドが変わるため旧 dirty は破棄して全タイル再計算
+    this.dirtyBase.clear();
+    this.dirtyDisplay.clear();
+    this.markAllTilesDirty();
   }
 
   private destroyAllCellTextures(): void {
-    for (const tex of this.cellTextures.values()) tex.destroy();
-    this.cellTextures.clear();
-    for (const tex of this.historyBaseTextures.values()) tex.destroy();
-    this.historyBaseTextures.clear();
+    this.tileStore?.clearAll();
     this.nonEmptyCells.clear();
+    this.composedTag = null;
+    this.previewOverride = null;
   }
 
-  /** 新規セルは空のまま作り、最初の描画時まで大きなGPUテクスチャを確保しない。 */
+  /** 新規セルは空のまま作り、最初の描画時までタイルを確保しない。 */
   private createEmptyCell(name: string): CellNode {
     return createCell(name);
   }
 
-  private getOrCreateCellTexture(cellId: string): GPUTexture {
-    let texture = this.cellTextures.get(cellId);
-    if (!texture) {
-      if (!findCell(this.rootNodes, cellId)) throw new Error(`Cell ${cellId} not found`);
-      texture = this.makeLayerTexture();
-      this.cellTextures.set(cellId, texture);
+  /** セル内容変更後に呼ぶ。占有と composed キャッシュタグの整合を保つ */
+  private syncNonEmpty(cellId: string): void {
+    if (this.tileStore.getOccupancy(cellId).size > 0) this.nonEmptyCells.add(cellId);
+    else this.nonEmptyCells.delete(cellId);
+  }
+
+  // ── T2 ダーティ追跡 ──
+
+  /** 全タイルを両キャッシュで汚す（初期化・リサイズ・背景変更用） */
+  private markAllTilesDirty(): void {
+    const n = this.tileStore.tilesX * this.tileStore.tilesY;
+    for (let i = 0; i < n; i++) { this.dirtyBase.add(i); this.dirtyDisplay.add(i); }
+  }
+
+  /** 指定タイルを両キャッシュで汚す */
+  private markTilesDirty(indices: Iterable<number>): void {
+    for (const t of indices) { this.dirtyBase.add(t); this.dirtyDisplay.add(t); }
+  }
+
+  /** セルの占有タイルを両キャッシュで汚す */
+  private markCellDirty(cellId: string): void {
+    this.markTilesDirty(this.tileStore.getOccupancy(cellId));
+  }
+
+  /** 全セルの占有和を両キャッシュで汚す（並べ替え等の広域操作用。上限40タイル） */
+  private markAllOccupiedDirty(): void {
+    for (const cell of flattenCells(this.rootNodes)) this.markCellDirty(cell.id);
+  }
+
+  /** display のみ汚す（効果パラメータ用） */
+  private markDisplayDirty(indices: Iterable<number>): void {
+    for (const t of indices) this.dirtyDisplay.add(t);
+  }
+
+  /** 全セルの占有和を display のみ汚す（撮影スタック操作用） */
+  private markAllOccupiedDisplayDirty(): void {
+    for (const cell of flattenCells(this.rootNodes)) {
+      this.markDisplayDirty(this.tileStore.getOccupancy(cell.id));
     }
-    return texture;
+  }
+
+  /** 指定タイルがいずれかのセルに占有されているか */
+  private isTileOccupied(index: number): boolean {
+    for (const cell of flattenCells(this.rootNodes)) {
+      if (this.tileStore.getOccupancy(cell.id).has(index)) return true;
+    }
+    return false;
+  }
+
+  /** blankTile を背景色で更新（背景変更時に呼ぶ） */
+  private updateBlankTile(): void {
+    const bg = this.backgroundColor;
+    const color = bg ? { r: bg.r, g: bg.g, b: bg.b, a: 1 } : { r: 0, g: 0, b: 0, a: 0 };
+    // 1px 書き込みでは全域に広がらないため、小さなレンダーパスでクリアする
+    const enc = this.renderer.device.createCommandEncoder();
+    enc.beginRenderPass({
+      colorAttachments: [{ view: this.blankTile.createView(), clearValue: color, loadOp: 'clear', storeOp: 'store' }],
+    }).end();
+    this.renderer.device.queue.submit([enc.finish()]);
+  }
+
+  /** アクティブセルのピン留めを付け替える（ストローク中の退避防止） */
+  private repinActive(prevId: string | null): void {
+    if (prevId && prevId !== this.activeCellId) this.tileStore.pinOwner(prevId, false);
+    if (this.activeCellId) this.tileStore.pinOwner(this.activeCellId, true);
+  }
+
+  /** 予算維持を后台で回す（fire-and-forget）。描画系は同期的正しさを保つ */
+  private maintainTiles(): void {
+    void this.tileStore.maintain().then((ok) => {
+      if (!ok) console.warn('[tiles] over budget: all tiles pinned');
+    });
+  }
+
+  /** タイル統計（診断・verify 用） */
+  tileStats(): { tileCount: number; gpuBytes: number; spillBytes: number; budgetBytes: number; cells: number; evictions: number } {
+    return this.tileStore.stats();
+  }
+
+  /**
+   * owner（セル or 履歴）の内容を composeScratch へ合成する。
+   * タグが有効なら何もしない。サンプリング・readback・ブレンド入力用。
+   */
+  private ensureComposed(owner: string): GPUTexture {
+    const tag = this.composedTag;
+    if (!tag || tag.owner !== owner || tag.version !== this.tileStore.version(owner)) {
+      this.clearTextureContent(this.composeScratch);
+      this.tileStore.composeCell(owner, this.composeScratch);
+      this.composedTag = { owner, version: this.tileStore.version(owner) };
+    }
+    return this.composeScratch;
+  }
+
+  /** アクティブセルの合成ビュー（stamp-mix/alphaLock サンプリング用） */
+  private activeComposedView(): GPUTexture {
+    if (!this.activeCellId) throw new Error('No active cell');
+    return this.ensureComposed(this.activeCellId);
+  }
+
+  /** ストローク点列の bbox（size=半径を含む） */
+  private static strokePointsBounds(points: StrokePoint[]): { minX: number; minY: number; maxX: number; maxY: number } | null {
+    if (points.length === 0) return null;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const p of points) {
+      minX = Math.min(minX, p.x - p.size);
+      minY = Math.min(minY, p.y - p.size);
+      maxX = Math.max(maxX, p.x + p.size);
+      maxY = Math.max(maxY, p.y + p.size);
+    }
+    return { minX, minY, maxX, maxY };
+  }
+
+  /** bbox をタイル index 列挙（±2px のAAマージン付き） */
+  private tilesForBounds(b: { minX: number; minY: number; maxX: number; maxY: number } | null): number[] {
+    if (!b) return [];
+    return this.tileStore.rectToTiles(b.minX - 2, b.minY - 2, b.maxX + 2, b.maxY + 2);
+  }
+
+  /** strokeAccumBBox へ点列 bbox を吸収する */
+  private absorbAccumBounds(points: StrokePoint[]): void {
+    const bb = RenderPipeline.strokePointsBounds(points);
+    if (!bb) return;
+    const cur = this.strokeAccumBBox;
+    this.strokeAccumBBox = cur ? {
+      minX: Math.min(cur.minX, bb.minX), minY: Math.min(cur.minY, bb.minY),
+      maxX: Math.max(cur.maxX, bb.maxX), maxY: Math.max(cur.maxY, bb.maxY),
+    } : { ...bb };
+  }
+
+  /**
+   * fullscreen ソースを owner の指定タイルへ焼く（T1 の committed 書き込み経路）。
+   * mode: over=通常/凍結、erase=消しゴム、max=一筆内蓄積。
+   */
+  private bakeFullscreenToTiles(
+    owner: string, src: GPUTexture, mode: TileBakeMode, indices: number[],
+  ): void {
+    for (const index of indices) {
+      const tx = TileStore.txOf(index, this.tileStore.tilesX);
+      const ty = TileStore.tyOf(index, this.tileStore.tilesX);
+      const r = this.tileStore.tileRect(tx, ty);
+      if (r.w <= 0 || r.h <= 0) continue;
+      const tex = this.tileStore.getTile(owner, tx, ty);
+      this.tileBaker.bakeRect(src, tex, mode, r.x, r.y, r.w, r.h, this.canvasWidth, this.canvasHeight);
+    }
+    // 履歴 owner（h:）は表示対象外なので nonEmpty 管理しない
+    if (owner.startsWith('h:')) return;
+    this.syncNonEmpty(owner);
+    this.markTilesDirty(indices);
   }
 
   private clearTextureContent(texture: GPUTexture): void {
@@ -230,6 +409,8 @@ export class RenderPipeline {
 
   setBackgroundColor(color: { r: number; g: number; b: number } | null): void {
     this.backgroundColor = color;
+    this.updateBlankTile();
+    this.markAllTilesDirty();
     this.invalidate();
   }
 
@@ -253,6 +434,7 @@ export class RenderPipeline {
   beginIncrementalStroke(alphaLock = this.getActiveLayerAlphaLock()): void {
     this.currentStroke = [];
     this.hasStrokeAccum = false;
+    this.strokeAccumBBox = null;
     this.drawAlphaLock = alphaLock;
     this.clearTextureContent(this.strokeAccumTexture);
     // 前のストロークで巨大化した4x bboxを次の一筆へ持ち越さない。
@@ -268,6 +450,8 @@ export class RenderPipeline {
    */
   appendIncrementalStroke(points: StrokePoint[]): void {
     if (points.length === 0) return;
+    // accumulator の内容 bbox を追跡（タイル書き戻し範囲用）
+    this.absorbAccumBounds(points);
     if (this.ribbonMode) {
       this.drawRibbonToIsolated(points);
       this.compositeRenderer.mergeMax(this.isolatedTexture, this.strokeAccumTexture);
@@ -281,34 +465,46 @@ export class RenderPipeline {
 
   /** 残りの末尾を追加し、一筆として committed へ一度だけ合成する。 */
   finishIncrementalStroke(points: StrokePoint[], eraseMode = this.eraseMode): void {
+    this.finishIncrementalStrokeToOwner(points, eraseMode, this.activeCellId);
+  }
+
+  /** finishIncrementalStroke の owner 指定版（履歴再生用） */
+  finishIncrementalStrokeToOwner(points: StrokePoint[], eraseMode: boolean, owner: string | null): void {
     if (points.length > 0) this.appendIncrementalStroke(points);
-    if (this.hasStrokeAccum) {
-      this.compositeRenderer.bake(this.strokeAccumTexture, this.committedTexture, eraseMode);
-      if (this.activeCellId) this.nonEmptyCells.add(this.activeCellId);
+    if (this.hasStrokeAccum && owner) {
+      this.bakeFullscreenToTiles(owner, this.strokeAccumTexture, eraseMode ? 'erase' : 'over', this.tilesForBounds(this.strokeAccumBBox));
     }
     this.currentStroke = [];
     this.hasStrokeAccum = false;
+    this.strokeAccumBBox = null;
+    this.maintainTiles();
     this.invalidate();
   }
 
   commitStroke(points: StrokePoint[]): void {
-    if (points.length > 0) {
+    if (points.length > 0 && this.activeCellId) {
       this.drawAlphaLock = this.getActiveLayerAlphaLock();
       if (this.ribbonMode) this.drawRibbonToIsolated(points);
       else this.drawToIsolated(points);
-      this.compositeRenderer.bake(this.isolatedTexture, this.committedTexture, this.eraseMode);
-      if (this.activeCellId) this.nonEmptyCells.add(this.activeCellId);
+      this.bakeFullscreenToTiles(
+        this.activeCellId, this.isolatedTexture, this.eraseMode ? 'erase' : 'over',
+        this.tilesForBounds(RenderPipeline.strokePointsBounds(points)),
+      );
     }
     this.currentStroke = [];
     this.hasStrokeAccum = false;
+    this.strokeAccumBBox = null;
+    this.maintainTiles();
     this.invalidate();
   }
 
   // 次の drawToIsolated で適用するアルファロック（描画経路ごとに設定）
   private drawAlphaLock = false;
 
-  private drawToIsolated(points: StrokePoint[], alphaLockSource: GPUTexture = this.committedTexture): void {
+  private drawToIsolated(points: StrokePoint[], alphaLockSource?: GPUTexture): void {
     const { device } = this.renderer;
+    // 既定の参照先はアクティブセルの合成ビュー（T1: タイル合成）
+    const samplingSource = alphaLockSource ?? this.activeComposedView();
     // アルファロックをブラシに反映（既存 committed.a でマスク）
     this.brushRenderer.updateConfig({ alphaLock: this.drawAlphaLock });
 
@@ -363,7 +559,7 @@ export class RenderPipeline {
       colorAttachments: [{ view: this.brushBboxTexture!.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' }],
     });
     this.brushRenderer.renderStroke(
-      pass, points, alphaLockSource, SCALE,
+      pass, points, samplingSource, SCALE,
       minX, minY, bboxW4, bboxH4,
     );
     pass.end();
@@ -384,11 +580,12 @@ export class RenderPipeline {
    * 輪郭AAはシェーダー側の SDF + fwidth で行う。
    * 1点のみ（クリックのドット）は面積ゼロのためスタンプにフォールバックする。
    */
-  private drawRibbonToIsolated(points: StrokePoint[], alphaLockSource: GPUTexture = this.committedTexture): void {
+  private drawRibbonToIsolated(points: StrokePoint[], alphaLockSource?: GPUTexture): void {
     if (points.length < 2) {
       this.drawToIsolated(points, alphaLockSource);
       return;
     }
+    const samplingSource = alphaLockSource ?? this.activeComposedView();
     const { device } = this.renderer;
     this.ribbonRenderer.updateConfig({ alphaLock: this.drawAlphaLock });
 
@@ -396,104 +593,228 @@ export class RenderPipeline {
     const pass = encoder.beginRenderPass({
       colorAttachments: [{ view: this.isolatedTexture.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' }],
     });
-    this.ribbonRenderer.renderStroke(pass, points, alphaLockSource);
+    this.ribbonRenderer.renderStroke(pass, points, samplingSource);
     pass.end();
     device.queue.submit([encoder.finish()]);
   }
 
   /**
-   * 全レイヤーを下から合成して結果テクスチャを返す
-   * 3オブジェクト構造: セルを積み順に合成 → ルート効果チェーンを適用
-   * @param includeLiveStroke true ならアクティブセルに現在ストロークを重ねる
+   * T2: ライブストロークの一時テクスチャを構築する（activeComposite へ）。
+   * base への erase もここで解決するため、display 側の重ねは常に over でよい。
+   * ストロークなし → null。
    */
-  private compositeLayers(includeLiveStroke: boolean, transparentBg = false): GPUTexture {
+  private buildLiveFullscreen(): GPUTexture | null {
     const { device } = this.renderer;
-
-    // アクティブセルのソース（現在ストロークを焼き込んだ一時テクスチャ）
-    let activeSrc: GPUTexture | null = null;
-    if (includeLiveStroke && (this.currentStroke.length > 0 || this.hasStrokeAccum) && this.activeCellId) {
-      const activeCell = findCell(this.rootNodes, this.activeCellId);
-      if (activeCell) {
-        this.drawAlphaLock = activeCell.alphaLock;
-        let liveStrokeTexture: GPUTexture;
-        if (this.currentStroke.length > 0) {
-          if (this.ribbonMode) this.drawRibbonToIsolated(this.currentStroke);
-          else this.drawToIsolated(this.currentStroke);
-          if (this.hasStrokeAccum) {
-            const liveCopy = device.createCommandEncoder();
-            liveCopy.copyTextureToTexture(
-              { texture: this.strokeAccumTexture }, { texture: this.liveCombinedTexture },
-              [this.canvasWidth, this.canvasHeight],
-            );
-            device.queue.submit([liveCopy.finish()]);
-            this.compositeRenderer.mergeMax(this.isolatedTexture, this.liveCombinedTexture);
-            liveStrokeTexture = this.liveCombinedTexture;
-          } else {
-            liveStrokeTexture = this.isolatedTexture;
-          }
-        } else {
-          liveStrokeTexture = this.strokeAccumTexture;
-        }
-        // active.committed をコピーしてから isolated を over/erase で重ねる
-        const copyEnc = device.createCommandEncoder();
-        copyEnc.copyTextureToTexture(
-          { texture: this.committedTexture }, { texture: this.activeComposite },
+    if ((this.currentStroke.length === 0 && !this.hasStrokeAccum) || !this.activeCellId) return null;
+    const activeCell = findCell(this.rootNodes, this.activeCellId);
+    if (!activeCell) return null;
+    this.drawAlphaLock = activeCell.alphaLock;
+    let liveStrokeTexture: GPUTexture;
+    if (this.currentStroke.length > 0) {
+      if (this.ribbonMode) this.drawRibbonToIsolated(this.currentStroke);
+      else this.drawToIsolated(this.currentStroke);
+      if (this.hasStrokeAccum) {
+        const liveCopy = device.createCommandEncoder();
+        liveCopy.copyTextureToTexture(
+          { texture: this.strokeAccumTexture }, { texture: this.liveCombinedTexture },
           [this.canvasWidth, this.canvasHeight],
         );
-        device.queue.submit([copyEnc.finish()]);
-        this.compositeRenderer.bake(liveStrokeTexture, this.activeComposite, this.eraseMode);
-        activeSrc = this.activeComposite;
+        device.queue.submit([liveCopy.finish()]);
+        this.compositeRenderer.mergeMax(this.isolatedTexture, this.liveCombinedTexture);
+        liveStrokeTexture = this.liveCombinedTexture;
+      } else {
+        liveStrokeTexture = this.isolatedTexture;
       }
+    } else {
+      liveStrokeTexture = this.strokeAccumTexture;
     }
+    // active のタイル合成をコピーしてから isolated を over/erase で重ねる
+    const activeView = this.activeComposedView();
+    const copyEnc = device.createCommandEncoder();
+    copyEnc.copyTextureToTexture(
+      { texture: activeView }, { texture: this.activeComposite },
+      [this.canvasWidth, this.canvasHeight],
+    );
+    device.queue.submit([copyEnc.finish()]);
+    this.compositeRenderer.bake(liveStrokeTexture, this.activeComposite, this.eraseMode);
+    return this.activeComposite;
+  }
 
-    // ping-pong 合成。acc を背景色（or 透明）にクリアして下から重ねる
-    if (transparentBg) this.clearTextureContent(this.displayA);
-    else this.clearToBackground(this.displayA);
-    let acc = this.displayA;
-    let other = this.displayB;
-    let pendingBlends: { dst: GPUTexture; src: GPUTexture; target: GPUTexture; mode: BlendMode; opacity: number }[] = [];
-    const flushBlends = () => {
-      if (pendingBlends.length === 0) return;
-      this.blendRenderer.blendBatch(pendingBlends);
-      pendingBlends = [];
-    };
+  /** ライブストロークの bbox タイル（display dirty 用） */
+  private liveTiles(): number[] {
+    const tail = RenderPipeline.strokePointsBounds(
+      this.currentStroke.length > 0 ? this.currentStroke : [],
+    );
+    const acc = this.strokeAccumBBox;
+    const union = tail && acc ? {
+      minX: Math.min(tail.minX, acc.minX), minY: Math.min(tail.minY, acc.minY),
+      maxX: Math.max(tail.maxX, acc.maxX), maxY: Math.max(tail.maxY, acc.maxY),
+    } : (tail ?? acc);
+    return this.tilesForBounds(union);
+  }
 
-    // セルを積み順に合成（フォルダの表示状態を考慮）
+  /**
+   * T2: 層スタックのブレンド op 列を構築する（scissor タイル単位・1submit）。
+   * override 指定時はそのセルのソースを fullscreen テクスチャに差し替える。
+   * 戻り値は op 列とタイル毎の最終バッファ。
+   */
+  private buildStackOps(
+    tiles: Set<number>,
+    override?: { cellId: string; tex: GPUTexture; tiles: Set<number> },
+  ): { ops: TileBlendOp[]; endsIn: Map<number, GPUTexture>; empty: Set<number> } {
+    const ops: TileBlendOp[] = [];
+    const endsIn = new Map<number, GPUTexture>();
+    const empty = new Set<number>();
     const cells = visibleCells(this.rootNodes);
-    for (const cell of cells) {
-      if (cell.opacity <= 0) continue;
-      if (!this.nonEmptyCells.has(cell.id) && !(cell.id === this.activeCellId && activeSrc)) continue;
-      // セルの committed テクスチャを取得
-      const committed = this.cellTextures.get(cell.id);
-      if (!committed) continue;
-
-      // セルの効果チェーンを適用（効果がある場合）
-      let src: GPUTexture = committed;
-      if (cell.effects.length > 0) {
-        // 効果レンダラーは自身で submit するため、それ以前のブレンドを先に確定する。
-        flushBlends();
-        src = this.applyCellEffects(cell, committed, activeSrc && cell.id === this.activeCellId ? activeSrc : null);
-      } else if (cell.id === this.activeCellId && activeSrc) {
-        src = activeSrc;
+    for (const t of tiles) {
+      const r = this.tileStore.tileRect(
+        TileStore.txOf(t, this.tileStore.tilesX), TileStore.tyOf(t, this.tileStore.tilesX),
+      );
+      const scissor = { x: r.x, y: r.y, w: r.w, h: r.h };
+      let dst = this.compA, other = this.compB;
+      let count = 0;
+      for (const cell of cells) {
+        if (cell.opacity <= 0) continue;
+        // override（ライブ・modal プレビュー）は指定タイルだけ fullscreen 差替
+        if (override && cell.id === override.cellId && override.tiles.has(t)) {
+          ops.push({
+            dst, target: other, mode: cell.blendMode, opacity: cell.opacity,
+            tileOx: 0, tileOy: 0, scissor, srcFull: override.tex,
+          });
+          const tmp = dst; dst = other; other = tmp;
+          count++;
+          continue;
+        }
+        if (!this.tileStore.getOccupancy(cell.id).has(t)) continue;
+        const tex = this.tileStore.ensureResidentTile(cell.id, t);
+        if (!tex) continue;
+        ops.push({
+          dst, srcTile: tex, target: other, mode: cell.blendMode, opacity: cell.opacity,
+          tileOx: r.x, tileOy: r.y, scissor,
+        });
+        const tmp = dst; dst = other; other = tmp;
+        count++;
       }
-
-      pendingBlends.push({ dst: acc, src, target: other, mode: cell.blendMode, opacity: cell.opacity });
-      const tmp = acc; acc = other; other = tmp;
+      if (count === 0) { empty.add(t); continue; }
+      endsIn.set(t, count % 2 === 1 ? this.compB : this.compA);
     }
-    flushBlends();
+    return { ops, endsIn, empty };
+  }
 
-    // ルート効果チェーン（撮影スタック）を適用
-    for (const eff of this.rootEffects) {
-      if (!eff.visible || eff.opacity <= 0) continue;
+  /** T2: ダーティタイルの層スタックを baseCache へ再計算する */
+  private recomputeBaseTiles(tiles: Set<number>): void {
+    if (tiles.size === 0) return;
+    const n = this.tileStore.tilesX * this.tileStore.tilesY;
+    for (const t of tiles) {
+      if (t < 0 || t >= n || !Number.isInteger(t)) {
+        console.warn(`[tiles] invalid base tile ${t} (grid ${this.tileStore.tilesX}x${this.tileStore.tilesY} canvas ${this.canvasWidth}x${this.canvasHeight})`);
+        tiles.delete(t);
+      }
+    }
+    if (tiles.size === 0) return;
+    const { device } = this.renderer;
+    this.clearToBackground(this.compA);
+    const { ops, endsIn, empty } = this.buildStackOps(tiles);
+    this.blendRenderer.blendTiles(ops);
+    // 結果を baseCache へ。空タイルは下地コピー
+    const enc = device.createCommandEncoder();
+    for (const t of tiles) {
+      const r = this.tileStore.tileRect(
+        TileStore.txOf(t, this.tileStore.tilesX), TileStore.tyOf(t, this.tileStore.tilesX),
+      );
+      if (empty.has(t)) {
+        enc.copyTextureToTexture(
+          { texture: this.blankTile, origin: { x: 0, y: 0 } },
+          { texture: this.baseCache, origin: { x: r.x, y: r.y } },
+          [r.w, r.h],
+        );
+      } else {
+        const src = endsIn.get(t)!;
+        enc.copyTextureToTexture(
+          { texture: src, origin: { x: r.x, y: r.y } },
+          { texture: this.baseCache, origin: { x: r.x, y: r.y } },
+          [r.w, r.h],
+        );
+      }
+    }
+    device.queue.submit([enc.finish()]);
+  }
+
+  /** T2: ダーティタイルの撮影を displayCache へ再計算する（override 対応） */
+  private recomputeDisplayTiles(
+    tiles: Set<number>,
+    override?: { cellId: string; tex: GPUTexture; tiles: Set<number> },
+  ): void {
+    if (tiles.size === 0) return;
+    const n = this.tileStore.tilesX * this.tileStore.tilesY;
+    for (const t of tiles) {
+      if (t < 0 || t >= n || !Number.isInteger(t)) {
+        console.warn(`[tiles] invalid display tile ${t} (grid ${this.tileStore.tilesX}x${this.tileStore.tilesY})`);
+        tiles.delete(t);
+      }
+    }
+    if (tiles.size === 0) return;
+    const { device } = this.renderer;
+    const chain = this.rootEffects.filter(e => e.visible && e.opacity > 0);
+    // 層スタック（override があれば差替）→ compA/B
+    const { ops, endsIn } = this.buildStackOps(tiles, override);
+    this.blendRenderer.blendTiles(ops);
+    const enc = device.createCommandEncoder();
+    for (const t of tiles) {
+      const r = this.tileStore.tileRect(
+        TileStore.txOf(t, this.tileStore.tilesX), TileStore.tyOf(t, this.tileStore.tilesX),
+      );
+      const scissor = { x: r.x, y: r.y, w: r.w, h: r.h };
+      // override タイルは endsIn がなければ空（override テクスチャ自体が透明）
+      const stacked = endsIn.get(t);
+      if (!stacked) {
+        if (chain.length === 0) {
+          enc.copyTextureToTexture(
+            { texture: this.blankTile, origin: { x: 0, y: 0 } },
+            { texture: this.displayCache, origin: { x: r.x, y: r.y } },
+            [r.w, r.h],
+          );
+          continue;
+        }
+        // chain 入力は下地。compA の当該矩形へ用意する
+        enc.copyTextureToTexture(
+          { texture: this.blankTile, origin: { x: 0, y: 0 } },
+          { texture: this.compA, origin: { x: r.x, y: r.y } },
+          [r.w, r.h],
+        );
+        this.runChainToDisplay(this.compA, scissor, chain);
+        continue;
+      }
+      if (chain.length === 0) {
+        enc.copyTextureToTexture(
+          { texture: stacked, origin: { x: r.x, y: r.y } },
+          { texture: this.displayCache, origin: { x: r.x, y: r.y } },
+          [r.w, r.h],
+        );
+      } else {
+        this.runChainToDisplay(stacked, scissor, chain);
+      }
+    }
+    device.queue.submit([enc.finish()]);
+  }
+
+  /** 撮影チェーンを baseCache 由来で displayCache の scissor へ流す */
+  private runChainToDisplay(
+    src: GPUTexture,
+    scissor: { x: number; y: number; w: number; h: number },
+    chain: EffectChainItem[],
+  ): void {
+    let read: GPUTexture = src;
+    let write = read === this.compA ? this.compB : this.compA;
+    chain.forEach((eff, i) => {
       if (eff.filterType === 'curve' && eff.curvePoints) {
         this.filterRenderer.setCurveLut(buildCurveLut(eff.curvePoints));
       }
-      // acc に効果を適用して other へ
-      this.filterRenderer.apply(eff.filterType, eff.params, acc, null, other, eff.opacity);
-      const tmp = acc; acc = other; other = tmp;
-    }
-
-    return acc;
+      const dst = i === chain.length - 1 ? this.displayCache : write;
+      this.filterRenderer.apply(eff.filterType, eff.params, read, null, dst, eff.opacity, scissor);
+      read = dst === this.displayCache ? dst : write;
+      if (dst !== this.displayCache) write = write === this.compA ? this.compB : this.compA;
+    });
   }
 
   /**
@@ -518,17 +839,56 @@ export class RenderPipeline {
     return src;
   }
 
-  render(): boolean {
-    if (!this.renderDirty) return false;
-    const { device, context } = this.renderer;
-    const result = this.compositeLayers(true);
+  /** base/display キャッシュをきれいにする（live なし）。snapshot/export/freeze 用 */
+  private ensureCachesClean(): void {
+    if (this.dirtyBase.size > 0) {
+      this.recomputeBaseTiles(this.dirtyBase);
+      this.dirtyBase.clear();
+    }
+    if (this.dirtyDisplay.size > 0) {
+      this.recomputeDisplayTiles(this.dirtyDisplay);
+      this.dirtyDisplay.clear();
+    }
+  }
 
+  render(): boolean {
+    // base 再計算
+    if (this.dirtyBase.size > 0) {
+      this.recomputeBaseTiles(this.dirtyBase);
+      this.dirtyBase.clear();
+    }
+    // ライブ/プレビューの override 解決
+    let override: { cellId: string; tex: GPUTexture; tiles: Set<number> } | undefined;
+    if (this.previewOverride && this.activeCellId) {
+      // modal 中: 全占有を毎フレーム再計算
+      const all = new Set<number>();
+      for (const cell of flattenCells(this.rootNodes)) {
+        for (const t of this.tileStore.getOccupancy(cell.id)) all.add(t);
+      }
+      for (const t of all) this.dirtyDisplay.add(t);
+      override = { cellId: this.previewOverride.cellId, tex: this.previewOverride.texture, tiles: all };
+    } else {
+      const liveTex = this.buildLiveFullscreen();
+      if (liveTex && this.activeCellId) {
+        const lt = new Set(this.liveTiles());
+        for (const t of lt) this.dirtyDisplay.add(t);
+        override = { cellId: this.activeCellId, tex: liveTex, tiles: lt };
+      }
+    }
+    let redrew = false;
+    if (this.dirtyDisplay.size > 0) {
+      this.recomputeDisplayTiles(this.dirtyDisplay, override);
+      this.dirtyDisplay.clear();
+      redrew = true;
+    }
+    if (!this.renderDirty && !redrew) return false;
+    const { device, context } = this.renderer;
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
       colorAttachments: [{ view: context.getCurrentTexture().createView(), clearValue: { r: 0.05, g: 0.05, b: 0.05, a: 1.0 }, loadOp: 'clear', storeOp: 'store' }],
     });
     this.compositeRenderer.drawPaper(pass);
-    this.compositeRenderer.draw(pass, result);
+    this.compositeRenderer.draw(pass, this.displayCache);
     pass.end();
     device.queue.submit([encoder.finish()]);
     this.renderDirty = false;
@@ -547,9 +907,13 @@ export class RenderPipeline {
     return this.rootEffects;
   }
 
-  /** セルのcommittedテクスチャを取得（UIのプレビュー等用） */
+  /**
+   * セルの合成ビューを取得（UIのプレビュー等用）。
+   * 共有 scratch を返すため、次の compose で内容が変わる。すぐ使うこと。
+   */
   getCellTexture(cellId: string): GPUTexture | null {
-    return this.cellTextures.get(cellId) ?? null;
+    if (this.tileStore.getOccupancy(cellId).size === 0) return null;
+    return this.ensureComposed(cellId);
   }
 
   setLayerAlphaLock(id: string, locked: boolean): void {
@@ -559,12 +923,22 @@ export class RenderPipeline {
 
   // --- 効果チェーン ---
 
+  /** 効果構造変化時の display 汚し（はみ出しを見込んで広めに取る） */
+  private markEffectStructureDirty(owner: { kind: 'cell'; cellId: string } | { kind: 'root' }): void {
+    if (owner.kind === 'root') {
+      this.markAllOccupiedDisplayDirty();
+    } else {
+      this.markDisplayDirty(this.dilatedTiles(owner.cellId, 128));
+    }
+  }
+
   /** 効果をセルの効果チェーンに追加 */
   addEffectToCell(cellId: string, type: FilterType): string {
     const cell = findCell(this.rootNodes, cellId);
     if (!cell) throw new Error(`Cell ${cellId} not found`);
     const eff = createEffect(type);
     cell.effects.push(eff);
+    this.markEffectStructureDirty({ kind: 'cell', cellId });
     this.invalidate();
     return eff.id;
   }
@@ -573,6 +947,7 @@ export class RenderPipeline {
   addEffectToRoot(type: FilterType): string {
     const eff = createEffect(type);
     this.rootEffects.push(eff);
+    this.markEffectStructureDirty({ kind: 'root' });
     this.invalidate();
     return eff.id;
   }
@@ -582,6 +957,13 @@ export class RenderPipeline {
     const found = findEffect(this.rootNodes, this.rootEffects, id);
     if (found) {
       found.effect.params = { ...found.effect.params, ...params };
+      if (found.owner.kind === 'root') {
+        this.markAllOccupiedDisplayDirty();
+      } else {
+        const cell = findCell(this.rootNodes, found.owner.cellId);
+        const spread = cell ? this.effectSpreadPx(cell) : 0;
+        this.markDisplayDirty(this.dilatedTiles(found.owner.cellId, spread));
+      }
       this.invalidate();
     }
   }
@@ -591,6 +973,11 @@ export class RenderPipeline {
     const found = findEffect(this.rootNodes, this.rootEffects, id);
     if (found) {
       found.effect.curvePoints = points.map(p => ({ ...p }));
+      if (found.owner.kind === 'root') {
+        this.markAllOccupiedDisplayDirty();
+      } else {
+        this.markDisplayDirty(this.dilatedTiles(found.owner.cellId, 0));
+      }
       this.invalidate();
     }
   }
@@ -606,13 +993,22 @@ export class RenderPipeline {
   removeEffect(id: string): void {
     // ルート効果から削除
     const rootIdx = this.rootEffects.findIndex(e => e.id === id);
-    if (rootIdx >= 0) { this.rootEffects.splice(rootIdx, 1); this.invalidate(); return; }
+    if (rootIdx >= 0) {
+      this.rootEffects.splice(rootIdx, 1);
+      this.markEffectStructureDirty({ kind: 'root' });
+      this.invalidate();
+      return;
+    }
     // セルの効果チェーンから削除
     const walk = (nodes: LayerNode[]): boolean => {
       for (const n of nodes) {
         if (n.kind === 'cell') {
           const idx = n.effects.findIndex(e => e.id === id);
-          if (idx >= 0) { n.effects.splice(idx, 1); return true; }
+          if (idx >= 0) {
+            n.effects.splice(idx, 1);
+            this.markEffectStructureDirty({ kind: 'cell', cellId: n.id });
+            return true;
+          }
         } else if (n.kind === 'folder') {
           if (walk(n.children)) return true;
         }
@@ -627,8 +1023,37 @@ export class RenderPipeline {
     const found = findEffect(this.rootNodes, this.rootEffects, id);
     if (found) {
       found.effect.visible = visible;
+      this.markEffectStructureDirty(found.owner);
       this.invalidate();
     }
+  }
+
+  /** セル効果のはみ出し半径（blur/glow）。Freeze 書き戻し範囲の拡張用 */
+  private effectSpreadPx(cell: CellNode): number {
+    let spread = 0;
+    for (const eff of cell.effects) {
+      if (!eff.visible) continue;
+      if (eff.filterType === 'blur' || eff.filterType === 'glow' || eff.filterType === 'sharpen') {
+        spread = Math.max(spread, eff.params.radius ?? 0);
+      }
+    }
+    return spread;
+  }
+
+  /** 占有タイル集合を半径分だけ拡張したタイル集合 */
+  private dilatedTiles(cellId: string, radiusPx: number): number[] {
+    const occ = this.tileStore.getOccupancy(cellId);
+    if (occ.size === 0 || radiusPx <= 0) return [...occ];
+    const out = new Set<number>(occ);
+    for (const index of occ) {
+      const tx = TileStore.txOf(index, this.tileStore.tilesX);
+      const ty = TileStore.tyOf(index, this.tileStore.tilesX);
+      const r = this.tileStore.tileRect(tx, ty);
+      for (const t of this.tileStore.rectToTiles(r.x - radiusPx, r.y - radiusPx, r.x + r.w + radiusPx, r.y + r.h + radiusPx)) {
+        out.add(t);
+      }
+    }
+    return [...out];
   }
 
   /**
@@ -638,19 +1063,19 @@ export class RenderPipeline {
   freezeCellEffects(cellId: string): void {
     const cell = findCell(this.rootNodes, cellId);
     if (!cell || cell.effects.length === 0) return;
-    const committed = this.cellTextures.get(cellId);
-    if (!committed) return;
-    // 効果チェーンを適用した結果を新しいテクスチャに書き出す
-    const result = this.applyCellEffects(cell, committed, null);
-    const baked = this.makeLayerTexture();
-    const enc = this.renderer.device.createCommandEncoder();
-    enc.copyTextureToTexture({ texture: result }, { texture: baked }, [this.canvasWidth, this.canvasHeight]);
-    this.renderer.device.queue.submit([enc.finish()]);
-    // committed を破棄して baked に置き換え
-    committed.destroy();
-    this.cellTextures.set(cellId, baked);
+    if (this.tileStore.getOccupancy(cellId).size === 0) { cell.effects = []; return; }
+    // 効果チェーンを適用した結果をタイルへ書き戻す（ぼかし系のはみ出し分を拡張）
+    const committedView = this.ensureComposed(cellId);
+    const result = this.applyCellEffects(cell, committedView, null);
+    const targets = new Set<number>([
+      ...this.tileStore.getOccupancy(cellId),
+      ...this.dilatedTiles(cellId, this.effectSpreadPx(cell)),
+    ]);
+    this.tileStore.releaseCell(cellId);
+    this.tileStore.scatterTexture(result, cellId, [...targets], this.tileBaker);
     cell.effects = [];
-    this.nonEmptyCells.add(cellId);
+    this.syncNonEmpty(cellId);
+    this.markTilesDirty(targets);
     this.invalidate();
   }
 
@@ -660,20 +1085,28 @@ export class RenderPipeline {
    */
   freezeRootEffects(): void {
     if (this.rootEffects.length === 0) return;
-    // 全セル合成（透明下地）+ ルート効果適用
-    const result = this.compositeLayers(false, true);
-    const baked = this.makeLayerTexture();
-    const enc = this.renderer.device.createCommandEncoder();
-    enc.copyTextureToTexture({ texture: result }, { texture: baked }, [this.canvasWidth, this.canvasHeight]);
-    this.renderer.device.queue.submit([enc.finish()]);
-    // 全セルを破棄して単一セルに置換
+    // T2: display キャッシュ（背景込み・現行表示と一致）を単一セルへ統合する。
+    // 旧実装は透明下地だったが、表示/PNG と一致する方を採用する。
+    this.ensureCachesClean();
+    const result = this.displayCache;
+    // 全セルを破棄して単一セルに置換（占有は全セルの和＝過剰保持あり・上限40）
+    const union = new Set<number>();
+    for (const cell of flattenCells(this.rootNodes)) {
+      for (const t of this.tileStore.getOccupancy(cell.id)) union.add(t);
+    }
     this.destroyAllCellTextures();
     const cell = createCell('統合レイヤー');
-    this.cellTextures.set(cell.id, baked);
+    // 空の統合結果でもタイルは確保しない（union が空なら占有なし）
+    if (union.size > 0) {
+      this.tileStore.scatterTexture(result, cell.id, [...union], this.tileBaker);
+    }
     this.rootNodes = [cell];
     this.rootEffects = [];
     this.activeCellId = cell.id;
-    this.nonEmptyCells.add(cell.id);
+    this.syncNonEmpty(cell.id);
+    this.repinActive(null);
+    this.markTilesDirty(union);
+    this.maintainTiles();
     this.invalidate();
   }
 
@@ -851,12 +1284,47 @@ export class RenderPipeline {
 
     this.txBounds = { lx, ty, rx, by };
     this.txActive = true;
+    if (this.activeCellId) this.beginPreview(this.activeCellId);
     return { lx, ty, rx, by };
   }
 
   /**
-   * 変形を適用して committed を更新（ドラッグ中の毎フレーム呼ぶ）。
+   * aligned CPU 画像を previewTexture へ書き込む（移動ドラッグ用）。
+   * bytesPerRow は 256 アライン済みを想定（writeTexture はアライン不要）。
+   */
+  private writePreviewFromAligned(data: Uint16Array, bytesPerRow: number): void {
+    this.renderer.device.queue.writeTexture(
+      { texture: this.previewTexture },
+      data as unknown as BufferSource,
+      { bytesPerRow, rowsPerImage: this.canvasHeight },
+      [this.canvasWidth, this.canvasHeight],
+    );
+  }
+
+  /** modal プレビュー開始（移動・変形）。表示は previewTexture に切り替わる */
+  private beginPreview(cellId: string): void {
+    // 現在内容をプレビューへ複写してから override する
+    const view = this.ensureComposed(cellId);
+    const enc = this.renderer.device.createCommandEncoder();
+    enc.copyTextureToTexture(
+      { texture: view }, { texture: this.previewTexture },
+      [this.canvasWidth, this.canvasHeight],
+    );
+    this.renderer.device.queue.submit([enc.finish()]);
+    this.previewOverride = { cellId, texture: this.previewTexture };
+    this.invalidate();
+  }
+
+  /** modal プレビュー終了。tiles への書き戻しは呼び出し側で行う */
+  private endPreview(): void {
+    this.previewOverride = null;
+    this.invalidate();
+  }
+
+  /**
+   * 変形を適用してプレビューを更新（ドラッグ中の毎フレーム呼ぶ）。
    * invMatrix: row-major 3x3 を array<vec4f,3> 形式の 12 floats で渡す。
+   * committed タイルは確定まで触らない。
    */
   updateTransform(invMatrix: Float32Array): void {
     if (!this.txActive || !this.txSrcTexture || !this.txBaseTexture || !this.txBounds) return;
@@ -864,28 +1332,42 @@ export class RenderPipeline {
     this.transformRenderer.render(
       this.txSrcTexture,
       this.txBaseTexture,
-      this.committedTexture,
+      this.previewTexture,
       invMatrix,
       rx - lx, by - ty,
       this.canvasWidth, this.canvasHeight,
     );
-    if (this.activeCellId) this.nonEmptyCells.add(this.activeCellId);
     this.invalidate();
   }
 
-  /** 変形確定。Undo 用スナップショットを返す */
+  /** 変形確定。プレビューをタイルへ書き戻し、Undo 用スナップショットを返す */
   commitTransform(): { snapshot: Uint16Array; bytesPerRow: number } | null {
-    if (!this.txActive || !this.txSnapshot) return null;
+    if (!this.txActive || !this.txSnapshot || !this.activeCellId) return null;
     const snapshot = this.txSnapshot;
     const bytesPerRow = Math.ceil(this.canvasWidth * 8 / 256) * 256;
+    // 書き戻し範囲: 旧占有 ∪ 変形 bounds（1タイル余裕）。過剰保持は上限40で有界
+    const targets = new Set<number>(this.tileStore.getOccupancy(this.activeCellId));
+    if (this.txBounds) {
+      const { lx, ty, rx, by } = this.txBounds;
+      for (const t of this.tileStore.rectToTiles(lx - TILE_MARGIN, ty - TILE_MARGIN, rx + TILE_MARGIN, by + TILE_MARGIN)) {
+        targets.add(t);
+      }
+    }
+    this.tileStore.scatterTexture(this.previewTexture, this.activeCellId, [...targets], this.tileBaker);
+    this.syncNonEmpty(this.activeCellId);
+    this.markTilesDirty(targets);
+    this.endPreview();
+    this.maintainTiles();
     this._clearTransformState();
     return { snapshot, bytesPerRow };
   }
 
-  /** 変形キャンセル: committed を元の状態に戻す */
+  /** 変形キャンセル: タイルは触っていないのでプレビューを捨てるだけ */
   cancelTransform(): void {
     if (!this.txActive || !this.txSnapshot) return;
-    this.updateCommittedTexture(this.txSnapshot);
+    this.endPreview();
+    // ドラッグ中に preview 由来で再計算した display を戻す
+    this.markAllOccupiedDisplayDirty();
     this._clearTransformState();
   }
 
@@ -897,64 +1379,12 @@ export class RenderPipeline {
     this.txBounds = null;
   }
 
-  // --- フィルター（破壊的適用＋Undo・選択範囲対応）---
-  private filterActive = false;
-  private filterSnapshot: Uint16Array | null = null; // Undo 用（aligned）
-  private filterSrc: GPUTexture | null = null;        // 原本コピー（入力）
-
-  isFilterActive(): boolean { return this.filterActive; }
-
-  /** フィルター開始: committed のスナップショット(Undo)と原本コピーを用意 */
-  async beginFilter(): Promise<boolean> {
-    if (this.filterActive) return false;
-    const snap = await this.requestCommittedSnapshot();
-    this.filterSnapshot = snap.data.slice(0);
-    this.filterSrc?.destroy();
-    this.filterSrc = this.renderer.device.createTexture({
-      size: [this.canvasWidth, this.canvasHeight], format: BUFFER_FORMAT,
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-    });
-    const enc = this.renderer.device.createCommandEncoder();
-    enc.copyTextureToTexture({ texture: this.committedTexture }, { texture: this.filterSrc }, [this.canvasWidth, this.canvasHeight]);
-    this.renderer.device.queue.submit([enc.finish()]);
-    this.filterActive = true;
-    return true;
-  }
-
-  /** トーンカーブ LUT を設定（main 側でカーブ編集時に呼ぶ） */
-  setCurveLut(data: Uint8Array): void {
-    this.filterRenderer.setCurveLut(data);
-  }
-
-  /** プレビュー更新: 原本にフィルターを適用し committed に書く（選択範囲があればその内側のみ） */
-  updateFilter(type: FilterType, params: FilterParams): void {
-    if (!this.filterActive || !this.filterSrc) return;
-    this.filterRenderer.apply(type, params, this.filterSrc, this.selectionMask, this.committedTexture);
-    if (this.activeCellId) this.nonEmptyCells.add(this.activeCellId);
-    this.invalidate();
-  }
-
-  /** 確定: プレビュー結果を committed に残したまま状態をクリア（Undo 記録は呼び出し側） */
-  commitFilter(): void {
-    this._clearFilterState();
-  }
-
-  /** キャンセル: committed を元へ戻す */
-  cancelFilter(): void {
-    if (!this.filterActive || !this.filterSnapshot) return;
-    this.updateCommittedTexture(this.filterSnapshot);
-    this._clearFilterState();
-  }
-
-  private _clearFilterState(): void {
-    this.filterActive = false;
-    this.filterSnapshot = null;
-    this.filterSrc?.destroy();
-    this.filterSrc = null;
-  }
-
-  // --- 移動ツール ---
+  // --- 破壊的フィルターモーダル（死にコード: main から未使用。効果チェーンが現行経路）---
+  // T1 で削除。filterRenderer 自体は効果チェーン（非破壊）で使用中のため残す。
+  // --- 移動ツール（T1: previewTexture＋override 方式。タイルは確定まで触らない） ---
   private moveActive = false;
+  private moveLastDx = 0;
+  private moveLastDy = 0;
   // 移動前スナップショット（Undo 用）aligned Uint16Array
   private moveSnapshot: Uint16Array | null = null;
   // 穴あき版（コンテンツを除いた aligned Uint16Array）
@@ -1007,8 +1437,16 @@ export class RenderPipeline {
     this.moveMaskFull = maskFull;
     this.moveBase = base;
     this.moveResult = new Uint16Array(base.length);
+    this.moveLastDx = 0;
+    this.moveLastDy = 0;
 
-    this.updateCommittedTexture(base);
+    // T1: 穴あき版をプレビューへ（タイルは確定まで触らない）
+    const bytesPerRow = Math.ceil(w * 8 / 256) * 256;
+    this.writePreviewFromAligned(base, bytesPerRow);
+    if (this.activeCellId) {
+      this.previewOverride = { cellId: this.activeCellId, texture: this.previewTexture };
+    }
+    this.invalidate();
     this.moveActive = true;
   }
 
@@ -1022,6 +1460,8 @@ export class RenderPipeline {
     const u16pr = Math.ceil(w * 8 / 256) * 256 / 2;
     const { data: cnt, mask, x: cx, y: cy, w: cw, h: ch } = this.moveContent;
     const ndx = Math.round(dx), ndy = Math.round(dy);
+    this.moveLastDx = ndx;
+    this.moveLastDy = ndy;
 
     // 穴あき版をベースにコピー
     this.moveResult.set(this.moveBase);
@@ -1052,16 +1492,32 @@ export class RenderPipeline {
       }
     }
 
-    this.updateCommittedTexture(this.moveResult);
+    // T1: プレビューへ書き込み（タイルは確定まで触らない）
+    const bytesPerRow = Math.ceil(w * 8 / 256) * 256;
+    this.writePreviewFromAligned(this.moveResult, bytesPerRow);
+    this.invalidate();
   }
 
   /**
-   * 移動確定。Undo 用の移動前スナップショットと bytesPerRow を返す。
+   * 移動確定。プレビューをタイルへ書き戻し、Undo 用スナップショットを返す。
    */
   commitMove(): { snapshot: Uint16Array; bytesPerRow: number } | null {
-    if (!this.moveActive || !this.moveSnapshot) return null;
+    if (!this.moveActive || !this.moveSnapshot || !this.activeCellId) return null;
     const snapshot = this.moveSnapshot;
     const bytesPerRow = Math.ceil(this.canvasWidth * 8 / 256) * 256;
+    // 書き戻し範囲: 旧占有 ∪ 移動先 bounds。過剰保持は上限40で有界
+    const targets = new Set<number>(this.tileStore.getOccupancy(this.activeCellId));
+    if (this.moveContent) {
+      const { x, y, w, h } = this.moveContent;
+      for (const t of this.tileStore.rectToTiles(x + this.moveLastDx, y + this.moveLastDy, x + w + this.moveLastDx, y + h + this.moveLastDy)) {
+        targets.add(t);
+      }
+    }
+    this.tileStore.scatterTexture(this.previewTexture, this.activeCellId, [...targets], this.tileBaker);
+    this.syncNonEmpty(this.activeCellId);
+    this.markTilesDirty(targets);
+    this.endPreview();
+    this.maintainTiles();
     this.moveActive = false;
     this.moveSnapshot = null;
     this.moveBase = null;
@@ -1070,10 +1526,11 @@ export class RenderPipeline {
     return { snapshot, bytesPerRow };
   }
 
-  /** 移動キャンセル: committed を移動前の状態に戻す */
+  /** 移動キャンセル: タイルは触っていないのでプレビューを捨てるだけ */
   cancelMove(): void {
     if (!this.moveActive || !this.moveSnapshot) return;
-    this.updateCommittedTexture(this.moveSnapshot);
+    this.endPreview();
+    this.markAllOccupiedDisplayDirty();
     this.moveActive = false;
     this.moveSnapshot = null;
     this.moveBase = null;
@@ -1094,7 +1551,11 @@ export class RenderPipeline {
   setActiveLayer(id: string): void {
     // セルのみアクティブにできる
     const cell = findCell(this.rootNodes, id);
-    if (cell) this.activeCellId = id;
+    if (cell) {
+      const prev = this.activeCellId;
+      this.activeCellId = id;
+      this.repinActive(prev);
+    }
   }
 
   /** セルを追加（アクティブセルのルートレベルの上に挿入） */
@@ -1107,7 +1568,9 @@ export class RenderPipeline {
     } else {
       this.rootNodes.push(cell);
     }
+    const prev = this.activeCellId;
     this.activeCellId = cell.id;
+    this.repinActive(prev);
     this.invalidate();
     return cell.id;
   }
@@ -1140,9 +1603,10 @@ export class RenderPipeline {
     if (!this.activeCellId) return;
     const cells = flattenCells(this.rootNodes);
     if (cells.length <= 1) return; // 最低1枚は残す
-    // アクティブセルのテクスチャを破棄
-    const tex = this.cellTextures.get(this.activeCellId);
-    if (tex) { tex.destroy(); this.cellTextures.delete(this.activeCellId); }
+    const prev = this.activeCellId;
+    // アクティブセルのタイルを破棄
+    this.markCellDirty(this.activeCellId);
+    this.tileStore.releaseCell(this.activeCellId);
     this.clearHistoryBase(this.activeCellId);
     this.nonEmptyCells.delete(this.activeCellId);
     // ツリーから削除
@@ -1150,6 +1614,7 @@ export class RenderPipeline {
     // 新しいアクティブセルを選択
     const remaining = flattenCells(this.rootNodes);
     this.activeCellId = remaining.length > 0 ? remaining[remaining.length - 1].id : null;
+    this.repinActive(prev);
     this.invalidate();
   }
 
@@ -1160,8 +1625,8 @@ export class RenderPipeline {
     const node = findNode(this.rootNodes, id);
     const removedCells = node ? (node.kind === 'cell' ? [node] : flattenCells(node.children)) : [];
     for (const cell of removedCells) {
-      const tex = this.cellTextures.get(cell.id);
-      if (tex) { tex.destroy(); this.cellTextures.delete(cell.id); }
+      this.markCellDirty(cell.id);
+      this.tileStore.releaseCell(cell.id);
       this.clearHistoryBase(cell.id);
       this.nonEmptyCells.delete(cell.id);
     }
@@ -1176,12 +1641,14 @@ export class RenderPipeline {
   moveActiveLayer(dir: 'up' | 'down'): void {
     if (!this.activeCellId) return;
     moveNode(this.rootNodes, this.activeCellId, dir);
+    this.markAllOccupiedDirty();
     this.invalidate();
   }
 
   /** 指定IDのノードを上下に移動 */
   moveNode(id: string, dir: 'up' | 'down'): void {
     moveNode(this.rootNodes, id, dir);
+    this.markAllOccupiedDirty();
     this.invalidate();
   }
 
@@ -1189,6 +1656,12 @@ export class RenderPipeline {
     const node = findNode(this.rootNodes, id);
     if (node) {
       node.visible = visible;
+      // フォルダ可視は配下全体に影響する
+      if (node.kind === 'folder') {
+        for (const c of flattenCells(node.children)) this.markCellDirty(c.id);
+      } else {
+        this.markCellDirty(id);
+      }
       this.invalidate();
     }
   }
@@ -1197,6 +1670,7 @@ export class RenderPipeline {
     const cell = findCell(this.rootNodes, id);
     if (cell) {
       cell.opacity = opacity;
+      this.markCellDirty(id);
       this.invalidate();
     }
   }
@@ -1205,6 +1679,7 @@ export class RenderPipeline {
     const cell = findCell(this.rootNodes, id);
     if (cell) {
       cell.blendMode = mode;
+      this.markCellDirty(id);
       this.invalidate();
     }
   }
@@ -1212,7 +1687,10 @@ export class RenderPipeline {
   /** フォルダの折りたたみ状態を切り替え */
   setFolderCollapsed(id: string, collapsed: boolean): void {
     const node = findNode(this.rootNodes, id);
-    if (node && node.kind === 'folder') node.collapsed = collapsed;
+    if (node && node.kind === 'folder') {
+      node.collapsed = collapsed;
+      for (const c of flattenCells(node.children)) this.markCellDirty(c.id);
+    }
   }
 
   /** ノード名を変更 */
@@ -1226,33 +1704,22 @@ export class RenderPipeline {
   }
 
   /**
-   * 全セルのピクセルデータ（tight packed float16 RGBA）を読み出す
-   * .pmx 保存用
+   * 全セルのタイルデータ（tight float16 RGBA・非空のみ）を読み出す
+   * .pmx v3 保存用
    */
-  async readAllCells(): Promise<{ cell: CellNode; data: Uint16Array }[]> {
-    const { device } = this.renderer;
-    const w = this.canvasWidth, h = this.canvasHeight;
-    const bytesPerRow = Math.ceil(w * 8 / 256) * 256;
-    const alignedU16 = bytesPerRow / 2;
-
+  async readCellTiles(): Promise<{ cell: CellNode; tiles: { tx: number; ty: number; data: Uint16Array }[] }[]> {
+    const out: { cell: CellNode; tiles: { tx: number; ty: number; data: Uint16Array }[] }[] = [];
     const cells = flattenCells(this.rootNodes);
-    const out: { cell: CellNode; data: Uint16Array }[] = [];
     for (const cell of cells) {
-      const committed = this.cellTextures.get(cell.id);
-      if (!committed) continue;
-      const staging = device.createBuffer({ size: bytesPerRow * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-      const enc = device.createCommandEncoder();
-      enc.copyTextureToBuffer({ texture: committed }, { buffer: staging, bytesPerRow }, [w, h]);
-      device.queue.submit([enc.finish()]);
-      await staging.mapAsync(GPUMapMode.READ);
-      const aligned = new Uint16Array(staging.getMappedRange());
-      // 256アライン → tight（width*4 u16/row）に詰め直す
-      const tight = new Uint16Array(w * h * 4);
-      for (let y = 0; y < h; y++) {
-        tight.set(aligned.subarray(y * alignedU16, y * alignedU16 + w * 4), y * w * 4);
+      const occ = this.tileStore.getOccupancy(cell.id);
+      if (occ.size === 0) continue;
+      const tiles: { tx: number; ty: number; data: Uint16Array }[] = [];
+      for (const index of occ) {
+        const tx = TileStore.txOf(index, this.tileStore.tilesX);
+        const ty = TileStore.tyOf(index, this.tileStore.tilesX);
+        tiles.push({ tx, ty, data: await this.tileStore.readTile(cell.id, index) });
       }
-      staging.unmap(); staging.destroy();
-      out.push({ cell, data: tight });
+      out.push({ cell, tiles });
     }
     return out;
   }
@@ -1272,32 +1739,25 @@ export class RenderPipeline {
       this.rootNodes = [cell];
     }
     this.activeCellId = activeId || flattenCells(this.rootNodes)[0]?.id || null;
+    this.repinActive(null);
+    this.maintainTiles();
     this.invalidate();
   }
 
   /**
-   * .pmx 読込: セルのピクセルデータをテクスチャに書き込む
+   * .pmx v3 読込: セルのタイルデータを書き込む
    * loadDocument 後に呼ぶ
    */
-  writeCellData(cellId: string, data: Uint16Array): void {
-    if (findCell(this.rootNodes, cellId)) {
-      const tex = this.getOrCreateCellTexture(cellId);
-      this.writeLayerTight(tex, data);
-      this.nonEmptyCells.add(cellId);
-      this.invalidate();
+  writeCellTiles(cellId: string, tiles: { tx: number; ty: number; data: Uint16Array }[]): void {
+    if (!findCell(this.rootNodes, cellId)) return;
+    for (const { tx, ty, data } of tiles) {
+      const index = ty * this.tileStore.tilesX + tx;
+      this.tileStore.writeTileData(cellId, index, data);
     }
-  }
-
-  /** tight packed float16 データをテクスチャに書き込む */
-  private writeLayerTight(tex: GPUTexture, data: Uint16Array): void {
-    const { device } = this.renderer;
-    const w = this.canvasWidth, h = this.canvasHeight;
-    device.queue.writeTexture(
-      { texture: tex },
-      data as unknown as BufferSource,
-      { bytesPerRow: w * 8, rowsPerImage: h }, // writeTexture は 256 アライン不要
-      [w, h],
-    );
+    this.syncNonEmpty(cellId);
+    this.markCellDirty(cellId);
+    this.maintainTiles();
+    this.invalidate();
   }
 
   // --- ブラシ・スナップショット系（アクティブレイヤー対象）---
@@ -1316,12 +1776,14 @@ export class RenderPipeline {
   }
 
   async requestCommittedSnapshot() {
-    return this.readbackTexture(this.committedTexture);
+    if (!this.activeCellId) throw new Error('No active cell');
+    return this.readbackTexture(this.ensureComposed(this.activeCellId));
   }
 
   /** 全レイヤー合成結果（リニア・プリマルチ）の CPU 読み出し（スポイト用） */
   async requestCompositeSnapshot() {
-    return this.readbackTexture(this.compositeLayers(false));
+    this.ensureCachesClean();
+    return this.readbackTexture(this.displayCache);
   }
 
   private async readbackTexture(tex: GPUTexture) {
@@ -1341,26 +1803,29 @@ export class RenderPipeline {
 
   /**
    * 履歴レコードからアクティブレイヤーの committed を再構築（Undo/Redo 用）
+   * T1: 基準は履歴 owner のタイル集合。committed へ深複製する（基準は redo 用に残す）
    */
   rebakeFromRecords(records: StrokeRecord[]): void {
-    const base = this.activeCellId ? this.historyBaseTextures.get(this.activeCellId) : null;
-    if (base) {
-      const enc = this.renderer.device.createCommandEncoder();
-      enc.copyTextureToTexture(
-        { texture: base }, { texture: this.committedTexture },
-        [this.canvasWidth, this.canvasHeight],
-      );
-      this.renderer.device.queue.submit([enc.finish()]);
-    } else {
-      this.clearTextureContent(this.committedTexture);
+    if (!this.activeCellId) return;
+    const baseOwner = RenderPipeline.historyOwner(this.activeCellId);
+    const hasBase = this.tileStore.getOccupancy(baseOwner).size > 0;
+    // committed を一旦破棄し、基準があれば深複製する。
+    // 旧占有も汚す（再生で触れないタイルの残像を消すため）
+    const oldOcc = new Set(this.tileStore.getOccupancy(this.activeCellId));
+    this.tileStore.releaseCell(this.activeCellId);
+    if (hasBase) {
+      this.tileStore.copyOwner(baseOwner, this.activeCellId);
     }
+    this.markTilesDirty([...oldOcc, ...this.tileStore.getOccupancy(this.activeCellId)]);
     const currentPressureOpacity = this.brushRenderer.getConfig().pressureOpacity;
     const savedRibbonMode = this.ribbonMode;
     this.brushRenderer.updateConfig({ usePointColor: true });
     this.ribbonRenderer.updateConfig({ usePointColor: true });
     for (const rec of records) {
       if (rec.kind === 'fill') {
-        this.updateCommittedTexture(rec.snapshot);
+        // fill スナップショットは全面画像。ゼロ走査で正確に採用する
+        this.tileStore.adoptData(this.activeCellId, rec.snapshot, rec.bytesPerRow / 2, this.canvasWidth, this.canvasHeight);
+        this.syncNonEmpty(this.activeCellId);
       } else if (rec.points.length > 0) {
         // レコードの筆種で再現（混在時は都度切替）
         this.ribbonMode = (rec.brushKind ?? 'stamp') === 'ribbon';
@@ -1379,26 +1844,20 @@ export class RenderPipeline {
     this.ribbonRenderer.updateConfig({ usePointColor: false, pressureOpacity: currentPressureOpacity });
     this.ribbonMode = savedRibbonMode;
     if (this.activeCellId) {
-      if (base || records.length > 0) this.nonEmptyCells.add(this.activeCellId);
-      else this.nonEmptyCells.delete(this.activeCellId);
+      this.syncNonEmpty(this.activeCellId);
     }
     this.invalidate();
   }
 
   /**
-   * Undo 上限から押し出された1操作を、レイヤーごとの固定サイズな基準画像へ焼き込む。
+   * Undo 上限から押し出された1操作を、履歴 owner のタイルへ焼き込む。
    * 呼び出し後は StrokeRecord（特に長い points 配列）を保持する必要がない。
    */
   appendHistoryBaseRecord(cellId: string, record: StrokeRecord): void {
-    let target = this.historyBaseTextures.get(cellId);
-    if (!target) {
-      target = this.makeLayerTexture();
-      this.historyBaseTextures.set(cellId, target);
-    }
+    const baseOwner = RenderPipeline.historyOwner(cellId);
 
     if (record.kind === 'fill') {
-      this.writeTextureData(target, record.snapshot, record.bytesPerRow);
-      this.nonEmptyCells.add(cellId);
+      this.tileStore.adoptData(baseOwner, record.snapshot, record.bytesPerRow / 2, this.canvasWidth, this.canvasHeight);
       return;
     }
     if (record.points.length === 0) return;
@@ -1406,67 +1865,78 @@ export class RenderPipeline {
     const savedConfig = this.brushRenderer.getConfig();
     const savedStroke = this.currentStroke;
     const savedAccum = this.hasStrokeAccum;
+    const savedAccumBBox = this.strokeAccumBBox;
     const savedAlphaLock = this.drawAlphaLock;
     const savedRibbonMode = this.ribbonMode;
     if (record.kind === 'stroke') this.ribbonMode = (record.brushKind ?? 'stamp') === 'ribbon';
     this.currentStroke = [];
     this.hasStrokeAccum = false;
+    this.strokeAccumBBox = null;
     this.drawAlphaLock = record.alphaLock ?? false;
     this.clearTextureContent(this.strokeAccumTexture);
     this.brushRenderer.updateConfig({
       usePointColor: true,
       pressureOpacity: record.pressureOpacity ?? false,
     });
+    // alphaLock 参照は履歴基準の合成ビュー
+    const baseView = this.ensureComposed(baseOwner);
     for (let i = 0; i < record.points.length; i += 4096) {
       if (this.ribbonMode) {
-        this.drawRibbonToIsolated(record.points.slice(i, i + 4096), target);
+        this.drawRibbonToIsolated(record.points.slice(i, i + 4096), baseView);
       } else {
-        this.drawToIsolated(record.points.slice(i, i + 4096), target);
+        this.drawToIsolated(record.points.slice(i, i + 4096), baseView);
       }
       this.compositeRenderer.mergeMax(this.isolatedTexture, this.strokeAccumTexture);
+      this.absorbAccumBounds(record.points.slice(i, i + 4096));
     }
-    this.compositeRenderer.bake(this.strokeAccumTexture, target, record.erase);
+    this.bakeFullscreenToTiles(baseOwner, this.strokeAccumTexture, record.erase ? 'erase' : 'over', this.tilesForBounds(this.strokeAccumBBox));
     this.brushRenderer.updateConfig(savedConfig);
     this.ribbonMode = savedRibbonMode;
     this.currentStroke = savedStroke;
     this.hasStrokeAccum = savedAccum;
+    this.strokeAccumBBox = savedAccumBBox;
     this.drawAlphaLock = savedAlphaLock;
-    this.nonEmptyCells.add(cellId);
   }
 
   /** 履歴全消去時に、Undo対象外の基準画像も破棄する。 */
   clearHistoryBase(cellId: string): void {
-    const base = this.historyBaseTextures.get(cellId);
-    if (base) base.destroy();
-    this.historyBaseTextures.delete(cellId);
+    this.tileStore.releaseCell(RenderPipeline.historyOwner(cellId));
   }
 
-  updateCommittedTexture(data: Uint16Array): void {
-    const width = this.canvasWidth;
-    const bytesPerRow = Math.ceil(width * 8 / 256) * 256;
-    this.writeTextureData(this.committedTexture, data, bytesPerRow);
-    if (this.activeCellId) this.nonEmptyCells.add(this.activeCellId);
+  /**
+   * 全面 CPU 画像をアクティブセルの占有タイルへ書き込む（cancel 復元用）。
+   * shape は変わらない前提。data は aligned 可（bytesPerRow 指定）。
+   */
+  restoreCommittedSnapshot(data: Uint16Array, bytesPerRow: number): void {
+    if (!this.activeCellId) return;
+    const w = this.canvasWidth, h = this.canvasHeight;
+    const stride = bytesPerRow / 2;
+    this.tileStore.scatterData(this.activeCellId, this.tileStore.getOccupancy(this.activeCellId), data, stride, w, h);
+    this.syncNonEmpty(this.activeCellId);
     this.invalidate();
   }
 
-  private writeTextureData(texture: GPUTexture, data: Uint16Array, bytesPerRow: number): void {
-    const { device } = this.renderer;
-    const width = this.canvasWidth;
-    const height = this.canvasHeight;
-    device.queue.writeTexture(
-      { texture },
-      data as unknown as BufferSource,
-      { bytesPerRow, rowsPerImage: height },
-      [width, height]
-    );
+  /**
+   * 全面 CPU 画像から採用（バケツ塗り用）。ゼロ走査で占有を正確に作り直す。
+   * data は aligned 可（bytesPerRow 指定）。
+   */
+  adoptPaintResult(data: Uint16Array, bytesPerRow: number): void {
+    if (!this.activeCellId) return;
+    this.tileStore.adoptData(this.activeCellId, data, bytesPerRow / 2, this.canvasWidth, this.canvasHeight);
+    this.syncNonEmpty(this.activeCellId);
+    this.markCellDirty(this.activeCellId);
+    this.maintainTiles();
+    this.invalidate();
   }
 
   /** アクティブレイヤーをクリア */
   clear() {
     this.currentStroke = [];
     this.hasStrokeAccum = false;
-    this.clearTextureContent(this.committedTexture);
+    this.strokeAccumBBox = null;
     if (this.activeCellId) {
+      this.markCellDirty(this.activeCellId);
+      this.tileStore.releaseCell(this.activeCellId);
       this.clearHistoryBase(this.activeCellId);
       this.nonEmptyCells.delete(this.activeCellId);
     }
@@ -1474,10 +1944,9 @@ export class RenderPipeline {
   }
 
   resizeCanvasSize(w: number, h: number) {
-    // リサイズ前に変形・移動・フィルター操作があればキャンセル
+    // リサイズ前に変形・移動操作があればキャンセル
     if (this.txActive) this.cancelTransform();
     if (this.moveActive) this.cancelMove();
-    if (this.filterActive) this.cancelFilter();
     this.brushRenderer.resize(w * 4, h * 4);
     this.ribbonRenderer.resize(w, h);
     this.brushBboxTexture?.destroy();
@@ -1486,9 +1955,13 @@ export class RenderPipeline {
     this.isolatedTexture.destroy();
     this.strokeAccumTexture.destroy();
     this.liveCombinedTexture.destroy();
-    this.displayA.destroy(); this.displayB.destroy(); this.activeComposite.destroy();
+    this.baseCache.destroy(); this.displayCache.destroy();
+    this.compA.destroy(); this.compB.destroy();
+    this.activeComposite.destroy();
     this.filterScratch.destroy();
     this.cellProcTemp.destroy();
+    this.composeScratch.destroy();
+    this.previewTexture.destroy();
     this.createTextures(w, h);
     this.filterRenderer.resize(w, h);
     this.invalidate();
@@ -1509,8 +1982,9 @@ export class RenderPipeline {
     const height = this.canvasHeight;
     const bytesPerRow = Math.ceil(width * 8 / 256) * 256;
 
-    // 現在ストロークなしで全レイヤーを合成
-    const result = this.compositeLayers(false);
+    // 現在ストロークなしで全レイヤーを合成（キャッシュ経由）
+    this.ensureCachesClean();
+    const result = this.displayCache;
 
     const staging = device.createBuffer({ size: bytesPerRow * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const encoder = device.createCommandEncoder();
@@ -1569,16 +2043,31 @@ export class RenderPipeline {
     this.ribbonRenderer.dispose();
     this.transformRenderer.dispose();
     this.filterRenderer.dispose();
+    this.tileBaker.dispose();
     this._clearTransformState();
-    this._clearFilterState();
+    this._clearMoveState();
     this.brushBboxTexture?.destroy();
     this.isolatedTexture?.destroy();
     this.strokeAccumTexture?.destroy();
     this.liveCombinedTexture?.destroy();
-    this.displayA?.destroy(); this.displayB?.destroy(); this.activeComposite?.destroy();
+    this.baseCache?.destroy(); this.displayCache?.destroy();
+    this.compA?.destroy(); this.compB?.destroy();
+    this.activeComposite?.destroy();
     this.filterScratch?.destroy();
     this.cellProcTemp?.destroy();
+    this.composeScratch?.destroy();
+    this.previewTexture?.destroy();
+    this.blankTile?.destroy();
     this.destroyAllCellTextures();
+  }
+
+  /** 移動状態のクリア（dispose 用。履歴には触れない） */
+  private _clearMoveState(): void {
+    this.moveActive = false;
+    this.moveSnapshot = null;
+    this.moveBase = null;
+    this.moveContent = null;
+    this.moveResult = null;
   }
 }
 

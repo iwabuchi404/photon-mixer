@@ -11,6 +11,21 @@ const MODE_INDEX: Record<BlendMode, number> = {
   normal: 0, multiply: 1, screen: 2, overlay: 3, add: 4,
 };
 
+export interface TileBlendOp {
+  dst: GPUTexture;
+  /** 512²タイルテクスチャ（srcFull 指定時は未使用） */
+  srcTile?: GPUTexture;
+  /** fullscreen ソース（modal/ライブ override 用。指定時は fs_main＋scissor） */
+  srcFull?: GPUTexture;
+  target: GPUTexture;
+  mode: BlendMode;
+  opacity: number;
+  /** タイル原点(px)と scissor 矩形（通常は一致） */
+  tileOx: number;
+  tileOy: number;
+  scissor: { x: number; y: number; w: number; h: number };
+}
+
 export class BlendRenderer {
   private device: GPUDevice;
   private sampler: GPUSampler;
@@ -18,6 +33,7 @@ export class BlendRenderer {
   private uniformStride: number;
   private uniformCapacity = 64;
   private pipeline: GPURenderPipeline | null = null;
+  private tilePipeline: GPURenderPipeline | null = null;
   private layout: GPUBindGroupLayout | null = null;
 
   constructor(device: GPUDevice) {
@@ -54,6 +70,12 @@ export class BlendRenderer {
       fragment: { module, entryPoint: 'fs_main', targets: [{ format }] },
       primitive: { topology: 'triangle-strip' },
     });
+    this.tilePipeline = this.device.createRenderPipeline({
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.layout] }),
+      vertex: { module, entryPoint: 'vs_main' },
+      fragment: { module, entryPoint: 'fs_main_tile', targets: [{ format }] },
+      primitive: { topology: 'triangle-strip' },
+    });
   }
 
   /**
@@ -63,15 +85,62 @@ export class BlendRenderer {
     this.blendBatch([{ dst, src, target, mode, opacity }]);
   }
 
+  /**
+   * T2: タイル単位ブレンドを1つの command buffer / submit にまとめる。
+   * 各 op は scissor 矩形内だけ書き込む。src はタイルテクスチャ。
+   */
+  blendTiles(ops: TileBlendOp[]): void {
+    if (ops.length === 0) return;
+    this.ensureCapacity(ops.length);
+
+    const uniforms = new ArrayBuffer(this.uniformStride * ops.length);
+    const view = new DataView(uniforms);
+    for (let i = 0; i < ops.length; i++) {
+      const offset = i * this.uniformStride;
+      view.setUint32(offset, MODE_INDEX[ops[i].mode], true);
+      view.setFloat32(offset + 4, ops[i].opacity, true);
+      view.setFloat32(offset + 8, ops[i].tileOx, true);
+      view.setFloat32(offset + 12, ops[i].tileOy, true);
+    }
+    this.device.queue.writeBuffer(this.uniformBuffer, 0, uniforms);
+
+    const encoder = this.device.createCommandEncoder();
+    for (let i = 0; i < ops.length; i++) {
+      const { dst, srcTile, srcFull, target, scissor } = ops[i];
+      const srcView = (srcFull ?? srcTile!).createView();
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{ view: target.createView(), loadOp: 'load', storeOp: 'store' }],
+      });
+      pass.setScissorRect(scissor.x, scissor.y, scissor.w, scissor.h);
+      const bindGroup = this.device.createBindGroup({
+        layout: this.layout!,
+        entries: [
+          { binding: 0, resource: dst.createView() },
+          { binding: 1, resource: srcView },
+          { binding: 2, resource: this.sampler },
+          { binding: 3, resource: { buffer: this.uniformBuffer, offset: i * this.uniformStride, size: 16 } },
+        ],
+      });
+      pass.setPipeline(srcFull ? this.pipeline! : this.tilePipeline!);
+      pass.setBindGroup(0, bindGroup);
+      pass.draw(4);
+      pass.end();
+    }
+    this.device.queue.submit([encoder.finish()]);
+  }
+
+  private ensureCapacity(n: number): void {
+    if (n <= this.uniformCapacity) return;
+    while (this.uniformCapacity < n) this.uniformCapacity *= 2;
+    const old = this.uniformBuffer;
+    this.uniformBuffer = this.makeUniformBuffer(this.uniformCapacity);
+    void this.device.queue.onSubmittedWorkDone().then(() => old.destroy());
+  }
+
   /** 連続するレイヤーブレンドを1つの command buffer / submit にまとめる。 */
   blendBatch(ops: { dst: GPUTexture; src: GPUTexture; target: GPUTexture; mode: BlendMode; opacity: number }[]): void {
     if (ops.length === 0) return;
-    if (ops.length > this.uniformCapacity) {
-      while (this.uniformCapacity < ops.length) this.uniformCapacity *= 2;
-      const old = this.uniformBuffer;
-      this.uniformBuffer = this.makeUniformBuffer(this.uniformCapacity);
-      void this.device.queue.onSubmittedWorkDone().then(() => old.destroy());
-    }
+    this.ensureCapacity(ops.length);
 
     const uniforms = new ArrayBuffer(this.uniformStride * ops.length);
     const view = new DataView(uniforms);
