@@ -1,0 +1,50 @@
+# Webデモ (demo/?demo=1) を GitHub Pages へ公開する
+# main への push（対象パス変更時）と手動実行で動く
+name: Demo to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'shaders/**'
+      - 'index.html'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'scripts/build-demo.mjs'
+      - '.github/workflows/demo-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-demo
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run demo:build
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: demo
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

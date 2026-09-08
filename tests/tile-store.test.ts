@@ -182,6 +182,24 @@ describe('TileStore', () => {
     assert.ok(small.every(v => v === 7));
   });
 
+  test('世代管理: 既存タイルへの書き込みでも bump する', () => {
+    const s = new TileStore(makeFakeDevice(), W, H);
+    s.getTile('c1', 0, 0);
+    const v1 = s.version('c1');
+    // 既存タイルへの再書き込み（pmx読込相当）でも世代が進む
+    s.writeTileData('c1', 0, new Uint16Array(512 * 512 * 4));
+    assert.ok(s.version('c1') > v1, 'writeTileData で bump すること');
+    const v2 = s.version('c1');
+    // 外部経路（tileBaker 直接書き）も bumpVersion で通知できる
+    s.bumpVersion('c1');
+    assert.ok(s.version('c1') > v2, 'bumpVersion で bump すること');
+  });
+
+  test('世代管理: 未知 owner は 0', () => {
+    const s = new TileStore(makeFakeDevice(), W, H);
+    assert.strictEqual(s.version('nobody'), 0);
+  });
+
   test('tileRegionNonZero', () => {
     const data = new Uint16Array(10 * 10 * 4);
     assert.strictEqual(tileRegionNonZero(data, 40, 0, 0, 10, 10), false);

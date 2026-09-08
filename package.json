@@ -13,7 +13,10 @@
     "test": "node --import tsx --test tests/*.test.ts",
     "test:watch": "node --import tsx --test --watch tests/*.test.ts",
     "dist:win": "npm run build && electron-builder --win portable",
-    "dist:mac": "npm run build && electron-builder --mac"
+    "dist:mac": "npm run build && electron-builder --mac",
+    "demo:build": "npm run build && node scripts/build-demo.mjs",
+    "demo:serve": "node scripts/serve-demo.mjs",
+    "demo": "npm run demo:build && node scripts/serve-demo.mjs"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",

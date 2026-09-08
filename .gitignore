@@ -10,6 +10,9 @@ screenshots/
 # electron-builder リリース出力
 release/
 
+# Webデモ配布物（CI が生成）
+demo/
+
 # エディタ・AI 設定
 .codex/
 .claude/

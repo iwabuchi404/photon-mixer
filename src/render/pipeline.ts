@@ -374,6 +374,7 @@ export class RenderPipeline {
   private bakeFullscreenToTiles(
     owner: string, src: GPUTexture, mode: TileBakeMode, indices: number[],
   ): void {
+    let wrote = false;
     for (const index of indices) {
       const tx = TileStore.txOf(index, this.tileStore.tilesX);
       const ty = TileStore.tyOf(index, this.tileStore.tilesX);
@@ -381,7 +382,12 @@ export class RenderPipeline {
       if (r.w <= 0 || r.h <= 0) continue;
       const tex = this.tileStore.getTile(owner, tx, ty);
       this.tileBaker.bakeRect(src, tex, mode, r.x, r.y, r.w, r.h, this.canvasWidth, this.canvasHeight);
+      wrote = true;
     }
+    // getTile は新規確保時のみ世代を進めるため、既存タイルへの書き込みを通知する。
+    // これを忘れると ensureComposed が古い合成ビューを返し、一定エリアごとに
+    // 古い内容が表示される（描画中だけ消えて確定で戻る現象の原因）。
+    if (wrote) this.tileStore.bumpVersion(owner);
     // 履歴 owner（h:）は表示対象外なので nonEmpty 管理しない
     if (owner.startsWith('h:')) return;
     this.syncNonEmpty(owner);

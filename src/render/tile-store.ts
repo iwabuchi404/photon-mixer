@@ -269,6 +269,15 @@ export class TileStore {
     this.versions.set(owner, (this.versions.get(owner) ?? 0) + 1);
   }
 
+  /**
+   * 外部経路（tileBaker 直接書き込み）で内容が変わったことを通知する。
+   * 呼び忘れると composed キャッシュが古いままになり、一定エリアごとに
+   * 古い内容が表示される。書き込みパスを追加したら必ず呼ぶこと。
+   */
+  bumpVersion(owner: string): void {
+    this.bump(owner);
+  }
+
   hasTile(cellId: string, index: number): boolean {
     return this.tiles.has(TileStore.key(cellId, index));
   }
@@ -299,6 +308,7 @@ export class TileStore {
     this.tiles.clear();
     this.occupancy.clear();
     this.pinnedOwners.clear();
+    this.versions.clear();
     this.evictions = 0;
   }
 
@@ -383,6 +393,7 @@ export class TileStore {
       { bytesPerRow: r.w * 8, rowsPerImage: r.h },
       [r.w, r.h],
     );
+    // getTile は新規確保時のみ bump するため、既存タイルへの書き込みでも bump する
     this.bump(cellId);
   }
 

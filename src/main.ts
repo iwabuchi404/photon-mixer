@@ -212,12 +212,19 @@ class PhotonMixerApp {
     const overlay = document.getElementById('selection-overlay') as HTMLCanvasElement | null;
     if (overlay) { overlay.width = window.innerWidth; overlay.height = window.innerHeight; }
 
+    // Webデモ (?demo=1): LP・検証用の試用モード。モーダルを出さず即開始する
+    const demoMode = new URLSearchParams(location.search).get('demo') === '1';
+
     try {
       this.renderer = await initRenderer(canvas);
       console.log('WebGPU initialized successfully');
     } catch (e) {
       console.error('Failed to initialize WebGPU:', e);
-      alert('WebGPUの初期化に失敗しました。');
+      if (demoMode) {
+        this.showDemoHint('このブラウザはWebGPUに対応していません。Chrome / Edge でのアクセスをお試しください。');
+      } else {
+        alert('WebGPUの初期化に失敗しました。');
+      }
       return;
     }
 
@@ -258,8 +265,17 @@ class PhotonMixerApp {
       this.startAutosave();
     });
 
-    // 自動保存の復元提案（前回作業があれば）
-    try {
+    // Webデモは確認なしで既定キャンバスを開始する（非力環境向けに軽量サイズ）
+    if (demoMode) {
+      this.createNewCanvas(1600, 1200);
+      modal.style.display = 'none';
+      this.showDemoHint();
+      this.startRenderLoop();
+      this.startAutosave();
+    }
+
+    // 自動保存の復元提案（前回作業があれば。デモでは出さない）
+    if (!demoMode) try {
       const auto = await loadAutosave();
       if (auto) {
         const when = new Date(auto.savedAt).toLocaleString();
@@ -421,6 +437,29 @@ class PhotonMixerApp {
   private showNewCanvasModal(): void {
     const modal = document.getElementById('new-canvas-modal');
     if (modal) modal.style.display = 'block';
+  }
+
+  /**
+   * Webデモ用のヒント表示。クリックで閉じる。message 指定時はエラー表示になる。
+   * index.html に触らず動的生成する（デモ配布物の差分を最小化）。
+   */
+  private showDemoHint(message?: string): void {
+    document.getElementById('demo-hint')?.remove();
+    const el = document.createElement('div');
+    el.id = 'demo-hint';
+    el.style.cssText = [
+      'position:fixed', 'left:50%', 'bottom:18px', 'transform:translateX(-50%)',
+      'background:rgba(20,20,20,0.92)', 'color:#eee', 'border:1px solid #ff7a1a',
+      'border-radius:8px', 'padding:10px 18px', 'font-size:12px', 'line-height:1.7',
+      'font-family:monospace', 'z-index:3000', 'cursor:pointer', 'text-align:center',
+      'max-width:min(90vw,560px)',
+    ].join(';');
+    el.innerHTML = message ?? [
+      'お試しデモ — マウス/ペンでそのまま描けます（クリックで閉じる）',
+      'B:ブラシ / N:テクスチャブラシ / E:消しゴム / 右下「保存(.pmx)」で持ち帰り可',
+    ].join('<br>');
+    el.addEventListener('click', () => el.remove());
+    document.body.appendChild(el);
   }
 
   /** ズームを現在位置を中心に倍率変更（メニュー/ショートカット用） */
