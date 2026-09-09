@@ -30,6 +30,8 @@ import { ToolSettingsStore } from './ui/tool-settings.js';
 import { evToExposure, linearToDisplaySrgb, type TonemapId, type DisplayModeId } from './color/display.js';
 import type { FilterType, FilterParams } from './render/filter.js';
 import { CurveEditor } from './ui/curve-editor.js';
+import { LightHud } from './ui/light-hud.js';
+import { ColorLightWidget } from './ui/color-light-widget.js';
 import type { LinearColor } from './color/types.js';
 import type { StrokePoint } from './pen/stroke.js';
 import type { PointerPoint } from './pen/input.js';
@@ -152,6 +154,10 @@ class PhotonMixerApp {
   private editingEffectId: string | null = null;
   // トーンカーブエディタ
   private curveEditor: CurveEditor | null = null;
+  // K3: 表示露出のペン位置 HUD
+  private lightHud: LightHud | null = null;
+  // K1: 色の光量ウィジェット（描画エリア内）
+  private colorLightWidget: ColorLightWidget | null = null;
   private state: AppState = {
     isDrawing: false,
     currentColor: { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
@@ -481,14 +487,15 @@ class PhotonMixerApp {
     this.updateZoomDisplay();
   }
 
-  /** 露出EV を増減、または絶対値リセット（delta=null で value を設定） */
+  /** 露出EV を増減、または絶対値リセット（delta=null で value を設定）。範囲は -6〜+6 */
   private adjustExposureEV(delta: number | null, value?: number): void {
     const exp = document.getElementById('view-exposure') as HTMLInputElement | null;
     if (!exp) return;
+    const clamp = (v: number) => Math.max(-6, Math.min(6, v));
     if (delta === null) {
-      exp.value = String(value ?? 0);
+      exp.value = String(clamp(value ?? 0));
     } else {
-      exp.value = String(parseFloat(exp.value) + delta);
+      exp.value = String(clamp(parseFloat(exp.value) + delta));
     }
     exp.dispatchEvent(new Event('input'));
   }
@@ -508,6 +515,19 @@ class PhotonMixerApp {
     if (sel) {
       sel.value = id;
       sel.dispatchEvent(new Event('change'));
+    }
+  }
+
+  /** K2: Pキーでピーキング（白飛び確認）トグル。直前のモードに戻る */
+  private prevDisplayMode: DisplayModeId = 'transform';
+  private togglePeaking(): void {
+    const sel = document.getElementById('view-mode') as HTMLSelectElement | null;
+    const cur = (sel?.value ?? 'transform') as DisplayModeId;
+    if (cur === 'clip') {
+      this.setDisplayMode(this.prevDisplayMode);
+    } else {
+      this.prevDisplayMode = cur;
+      this.setDisplayMode('clip');
     }
   }
 
@@ -1223,6 +1243,38 @@ class PhotonMixerApp {
   private setupInteractions(): void {
     const canvas = this.renderer!.canvas;
 
+    // K3: 中クリックでペン位置に露出HUD。window capture でペン入力より先に処理する
+    window.addEventListener('pointerdown', (e) => {
+      if (e.button !== 1) {
+        // HUD表示中の外側クリックは閉じる（描画自体は通す）
+        if (this.lightHud?.isOpen() && !this.lightHud.contains(e.target)) {
+          this.lightHud.close();
+        }
+        return;
+      }
+      e.preventDefault();
+      if (this.lightHud?.isOpen()) {
+        e.stopPropagation();
+        this.lightHud.close();
+        return;
+      }
+      const t = e.target as HTMLElement | null;
+      if (t?.closest?.('#canvas')) {
+        // ペン入力へ流さない（描画中の誤爆でストロークが壊れるのを防ぐ）
+        e.stopPropagation();
+        if (!this.state.isDrawing) this.lightHud?.open(e.clientX, e.clientY);
+      }
+    }, true);
+
+    // K3: HUD表示中はホイールを露出調整に使う（ズームを横取り）
+    window.addEventListener('wheel', (e) => {
+      if (!this.lightHud?.isOpen()) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.adjustExposureEV(e.deltaY < 0 ? +0.5 : -0.5);
+      this.lightHud.refresh();
+    }, { passive: false, capture: true });
+
     // ホイール操作（ズーム or 回転）
     canvas.addEventListener('wheel', (e) => {
       e.preventDefault();
@@ -1293,6 +1345,7 @@ class PhotonMixerApp {
         case 'm': this.setTool('select'); break;
         case 'w': this.setTool('move'); break;
         case 't': this.setTool('transform'); break;
+        case 'p': this.togglePeaking(); break; // K2: ピーキング表示トグル
         case '[': this.adjustBrushSize(-2); break;
         case ']': this.adjustBrushSize(+2); break;
         case 'h': // 左右反転
@@ -1314,7 +1367,8 @@ class PhotonMixerApp {
             this.commitTransformUI();
           }
           break;
-        case 'Escape': // 変形キャンセル
+        case 'Escape': // 変形キャンセル（HUDが開いていれば先に閉じる）
+          if (this.lightHud?.isOpen()) this.lightHud.close();
           if (this.state.currentTool === 'transform') {
             e.preventDefault();
             this.cancelTransformUI();
@@ -2198,6 +2252,11 @@ class PhotonMixerApp {
     this.refreshToolOptions(this.state.currentTool);
     // 初期ツール（リボン筆）は間隔概念なし＝密に補間
     this.interpolator.updateConfig({ spacing: 1 });
+    // K3: 表示露出 HUD（中クリックで開く）。既存の view-exposure と同じ値を共有
+    this.lightHud = new LightHud({
+      getEV: () => parseFloat((document.getElementById('view-exposure') as HTMLInputElement).value),
+      setEV: (ev) => this.adjustExposureEV(null, ev),
+    });
 
     // 左の縦ツールバー（定義から自動生成）。クリックは onSelect 経由で setTool へ。
     this.toolBar = document.getElementById('tool-bar') as ToolBar | null;
@@ -2276,6 +2335,14 @@ class PhotonMixerApp {
       colorPicker.value = hex;
       this.renderPipeline?.updateBrushConfig({ color: { ...this.state.currentColor } });
     });
+
+    // K1: 色の光量ウィジェット（カラーピッカーと同一 state を双方向共有）
+    this.colorLightWidget = new ColorLightWidget({
+      getColor: () => ({ ...this.state.currentColor }),
+      getEV: () => this.colorPicker?.getEV() ?? 0,
+      setEV: (ev) => this.colorPicker?.setEV(ev),
+    });
+    this.colorPicker.onUpdate(() => this.colorLightWidget?.refresh());
 
     mixModeSelect.addEventListener('change', () => {
       this.engineCtx.setMixMode(mixModeSelect.value as BrushMixMode);

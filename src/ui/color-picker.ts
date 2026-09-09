@@ -136,6 +136,27 @@ export class ColorPicker {
     this.renderAll();
   }
 
+  /** 現在の EV（K1 ウィジェット同期用） */
+  getEV(): number { return this.ev; }
+
+  /** EV を外部から設定（K1 ウィジェット用）。スライダーと同じ経路 */
+  setEV(ev: number): void {
+    this.ev = Math.max(-6, Math.min(6, ev));
+    this.evSlider.value = String(this.ev);
+    this.updateReadout();
+    this.emit(false);
+  }
+
+  /** 現在の色（LinearColor, HDR可） */
+  getLinearColor(): LinearColor { return this.currentLinear(); }
+
+  /** 色・EV 変更の購読（K1 ウィジェット用）。emit/setLinear 時に通知 */
+  private updateListeners: (() => void)[] = [];
+  onUpdate(fn: () => void): void { this.updateListeners.push(fn); }
+  private notifyUpdate(): void {
+    for (const fn of this.updateListeners) fn();
+  }
+
   /** スウォッチ取得（.pmx 保存用・LinearColor 配列） */
   getSwatches(): LinearColor[] { return this.swatches.map(c => ({ ...c })); }
   /** スウォッチ設定（.pmx 読込時） */
@@ -169,6 +190,7 @@ export class ColorPicker {
     this.h = hsv.h; this.s = hsv.s; this.v = hsv.v;
     this.evSlider.value = this.ev.toFixed(2);
     this.renderAll();
+    this.notifyUpdate();
   }
 
   /** 現在の色（LinearColor, HDR可, a=1） */
@@ -188,6 +210,7 @@ export class ColorPicker {
     this.onChange(color);
     this.updateReadout();
     if (addHistory) this.pushHistory(color);
+    this.notifyUpdate();
   }
 
   // --- 描画 ---
