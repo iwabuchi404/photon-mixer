@@ -226,10 +226,11 @@ class PhotonMixerApp {
       console.log('WebGPU initialized successfully');
     } catch (e) {
       console.error('Failed to initialize WebGPU:', e);
+      const detail = e instanceof Error ? e.message : String(e);
       if (demoMode) {
-        this.showDemoHint('このブラウザはWebGPUに対応していません。Chrome / Edge / Safari 26 以降でのアクセスをお試しください。');
+        this.showDemoHint(`このブラウザはWebGPUに対応していません。Chrome / Edge / Safari 26 以降でのアクセスをお試しください。（${detail}）`);
       } else {
-        alert('WebGPUの初期化に失敗しました。');
+        alert(`WebGPUの初期化に失敗しました。\n${detail}`);
       }
       return;
     }
