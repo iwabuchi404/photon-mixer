@@ -10,6 +10,8 @@ export interface TouchGestureCallbacks {
   zoom(factor: number, cx: number, cy: number): void;
   /** pan/zoom 後に呼び出される（パイプラインへの反映用）。頻繁に呼ばれる。 */
   sync(): void;
+  /** ペンの接触を検出したときに呼ばれる（自動切替用。任意） */
+  onPenDetected?(): void;
 }
 
 export class TouchGestureManager {
@@ -46,6 +48,7 @@ export class TouchGestureManager {
       this.penActive = true;
       this.pointers.clear();
       this.mode = 'none';
+      this.cb.onPenDetected?.();
       return;
     }
     if (e.pointerType !== 'touch') return;

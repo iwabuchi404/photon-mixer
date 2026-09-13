@@ -105,4 +105,18 @@ describe('TouchGestureManager', () => {
     fire('pointermove', { pointerId: 7, pointerType: 'mouse', clientX: 200, clientY: 200 });
     assert.strictEqual(pans, 0);
   });
+
+  test('ペン接触で onPenDetected が呼ばれる', () => {
+    const { canvas, fire } = makeCanvas();
+    let detected = 0;
+    new TouchGestureManager(canvas, {
+      pan: () => {},
+      zoom: () => {},
+      sync: () => {},
+      onPenDetected: () => detected++,
+    });
+    fire('pointerdown', { pointerId: 9, pointerType: 'pen', clientX: 300, clientY: 300 });
+    assert.strictEqual(detected, 1);
+    fire('pointerup', { pointerId: 9, pointerType: 'pen', clientX: 300, clientY: 300 });
+  });
 });

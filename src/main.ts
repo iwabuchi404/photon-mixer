@@ -254,6 +254,10 @@ class PhotonMixerApp {
       pan: (dx, dy) => this.viewport.pan(dx, dy),
       zoom: (factor, cx, cy) => this.viewport.zoom(factor, cx, cy),
       sync: () => { this.applyViewport(); this.updateZoomDisplay(); },
+      onPenDetected: () => {
+        // ペン初検出でタッチをパンへ自動切替（ユーザーが明示指定済みなら尊重）
+        if (!this.touchDrawExplicit) this.setTouchDraw(false);
+      },
     });
     this.applyTouchDrawSetting();
 
@@ -949,6 +953,10 @@ class PhotonMixerApp {
     if (this.state.isPanning) return;
 
     const { type, point } = event;
+
+    // 筆圧下限：ホバー等の筆圧0（未満）イベントは描画・操作の対象外
+    // （マウス/タッチは常に0.5なので影響なし。up は必ず通して終端処理する）
+    if (type !== 'up' && point.pressure < this.minPressure) return;
 
     // スクリーン座標 -> キャンバス座標
     const { x, y } = this.viewport.toCanvas(point.x, point.y);
@@ -2674,29 +2682,72 @@ class PhotonMixerApp {
     });
   }
 
+  /** ユーザーが手動でタッチ設定を変えたら true（ペン自動切替の対象外になる） */
+  private touchDrawExplicit = false;
+  /** この筆圧未満の down/move を無視する（Sペン等のホバー誤描画対策）。0〜0.3 */
+  private minPressure = 0.03;
+
   /** 「タッチで描画」設定を保存値から反映（pen + gesture の両方へ） */
   private applyTouchDrawSetting(): void {
-    let enabled = false;
+    let saved: string | null = null;
     try {
-      enabled = localStorage.getItem('pm-touch-draw') === '1';
+      saved = localStorage.getItem('pm-touch-draw');
     } catch { /* ignore */ }
+    if (saved !== null) {
+      this.touchDrawExplicit = true;
+      this.setTouchDraw(saved === '1', false);
+      return;
+    }
+    // 未指定時の既定：精密ポインタ（ペン/マウス）環境はパン、指専用端末は描画
+    let coarseOnly = false;
+    try {
+      coarseOnly = window.matchMedia?.('(pointer: coarse)').matches === true
+        && window.matchMedia?.('(pointer: fine)').matches === false;
+    } catch { /* ignore */ }
+    this.setTouchDraw(coarseOnly, false);
+  }
+
+  /** タッチ描画設定を適用＋チェックボックス反映＋保存 */
+  private setTouchDraw(enabled: boolean, persist = true): void {
     this.penInput?.setTouchDrawEnabled(enabled);
     this.touchGestures?.setTouchDrawEnabled(enabled);
     const checkbox = document.getElementById('touch-draw') as HTMLInputElement | null;
     if (checkbox) checkbox.checked = enabled;
+    if (persist) {
+      try {
+        localStorage.setItem('pm-touch-draw', enabled ? '1' : '0');
+      } catch { /* ignore */ }
+    }
   }
 
   /** タッチ描画チェックボックスとドロワートグルの配線（setupControls から呼ぶ） */
   private setupMobileUI(): void {
     const touchDraw = document.getElementById('touch-draw') as HTMLInputElement | null;
     touchDraw?.addEventListener('change', () => {
-      const enabled = touchDraw.checked;
-      try {
-        localStorage.setItem('pm-touch-draw', enabled ? '1' : '0');
-      } catch { /* ignore */ }
-      this.penInput?.setTouchDrawEnabled(enabled);
-      this.touchGestures?.setTouchDrawEnabled(enabled);
+      this.touchDrawExplicit = true; // 手動指定を記憶（ペン自動切替の対象外）
+      this.setTouchDraw(touchDraw.checked);
     });
+    // 筆圧下限スライダー（ホバー誤描画対策。デバイス特性なので全体設定）
+    const minP = document.getElementById('min-pressure') as HTMLInputElement | null;
+    const minPVal = document.getElementById('min-pressure-val');
+    if (minP) {
+      let savedPct = 3;
+      try {
+        const s = localStorage.getItem('pm-min-pressure');
+        if (s !== null) savedPct = Math.max(0, Math.min(30, parseInt(s) || 0));
+      } catch { /* ignore */ }
+      minP.value = savedPct.toString();
+      if (minPVal) minPVal.textContent = savedPct.toString();
+      this.minPressure = savedPct / 100;
+      minP.addEventListener('input', () => {
+        const pct = parseInt(minP.value) || 0;
+        if (minPVal) minPVal.textContent = pct.toString();
+        this.minPressure = pct / 100;
+        try {
+          localStorage.setItem('pm-min-pressure', pct.toString());
+        } catch { /* ignore */ }
+      });
+    }
     // 狭幅時のドロワー開閉
     const wireDrawer = (btnId: string, dockId: string) => {
       const btn = document.getElementById(btnId);

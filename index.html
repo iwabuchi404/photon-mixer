@@ -458,6 +458,11 @@
         <input type="checkbox" id="touch-draw" style="flex:none;width:auto;">
         <span style="color:var(--pm-text-dim); font-size:10px;">タッチで描画（OFFでパン）</span>
       </div>
+      <div class="ctrl-row" id="pressure-floor-row">
+        <span class="ctrl-label">筆圧下限</span>
+        <input type="range" id="min-pressure" min="0" max="30" value="3">
+        <span id="min-pressure-val" class="ctrl-val">3</span><span class="ctrl-unit">%</span>
+      </div>
 
       <div class="ctrl-row" id="transform-controls" style="display:none;">
         <span class="ctrl-label">変形</span>
