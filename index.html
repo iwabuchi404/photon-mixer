@@ -373,6 +373,44 @@
       border: 1px solid #000;
       cursor: pointer;
     }
+
+    /* === モバイル: ドロワー開閉ボタン（狭幅時のみ表示） === */
+    .dock-toggle {
+      display: none;
+      position: fixed;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 30px;
+      height: 64px;
+      background: var(--pm-panel);
+      border: 1px solid var(--pm-border);
+      color: var(--pm-text-dim);
+      font-size: 14px;
+      cursor: pointer;
+      z-index: 1001;
+      align-items: center;
+      justify-content: center;
+      user-select: none;
+    }
+    #left-dock-toggle { left: 0; border-radius: 0 8px 8px 0; border-left: none; }
+    #right-dock-toggle { right: 0; border-radius: 8px 0 0 8px; border-right: none; }
+
+    /* 狭幅時: 左右ドックを画面外へ退避し、開いたときだけオーバーレイ表示 */
+    @media (max-width: 900px) {
+      #left-dock {
+        transform: translateX(calc(-100% - 12px));
+        transition: transform 0.2s ease;
+        max-width: 78vw;
+      }
+      #right-dock {
+        transform: translateX(calc(100% + 12px));
+        transition: transform 0.2s ease;
+        max-width: 78vw;
+      }
+      #left-dock.open, #right-dock.open { transform: none; }
+      .dock-toggle { display: flex; }
+      #perf-monitor { font-size: 9px; gap: 8px; padding: 4px 8px; }
+    }
   </style>
 </head>
 <body>
@@ -382,6 +420,10 @@
     <div>Points: <span id="points" class="perf-value">0</span></div>
     <div>Zoom: <span id="zoom-val" class="perf-value">100</span>%</div>
   </div>
+
+  <!-- モバイル用ドロワー開閉ボタン（狭幅時のみ表示） -->
+  <button id="left-dock-toggle" class="dock-toggle" title="ツールパネル">▶</button>
+  <button id="right-dock-toggle" class="dock-toggle" title="カラー・レイヤー">◀</button>
 
   <!-- 新規キャンバスダイアログ -->
   <div id="new-canvas-modal" style="position: fixed; inset: 0; background: rgba(0,0,0,0.8); display: flex; align-items: center; justify-content: center; z-index: 2000;">
@@ -411,6 +453,11 @@
         <span class="tool-header-badge" title="設定はツールごとに個別保持されます">個別設定</span>
       </div>
       <div id="tool-hint" class="tool-hint" style="display:none;"></div>
+      <div class="ctrl-row" id="touch-row">
+        <span class="ctrl-label">タッチ</span>
+        <input type="checkbox" id="touch-draw" style="flex:none;width:auto;">
+        <span style="color:var(--pm-text-dim); font-size:10px;">タッチで描画（OFFでパン）</span>
+      </div>
 
       <div class="ctrl-row" id="transform-controls" style="display:none;">
         <span class="ctrl-label">変形</span>

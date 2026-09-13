@@ -4,6 +4,7 @@
 
 import { initRenderer } from './core/renderer.js';
 import { PenInputManager } from './pen/input.js';
+import { TouchGestureManager } from './pen/touch-gestures.js';
 import { StabilizationController } from './pen/stabilization-mode.js';
 import { Interpolator } from './pen/interpolation.js';
 import { LiveStrokeProcessor, type LiveStrokeUpdate } from './pen/live-stroke.js';
@@ -134,6 +135,7 @@ const TOOL_HINTS: Partial<Record<Tool, string>> = {
 class PhotonMixerApp {
   private renderer: Awaited<ReturnType<typeof initRenderer>> | null = null;
   private penInput: PenInputManager | null = null;
+  private touchGestures: TouchGestureManager | null = null;
   private stabilizer: StabilizationController;
   private interpolator: Interpolator;
   private postCorrector: PostCorrector;
@@ -246,6 +248,14 @@ class PhotonMixerApp {
 
     this.penInput = new PenInputManager(canvas);
     this.penInput.onPenInput((event) => this.handlePenInput(event));
+
+    // タッチジェスチャ（1本指パン / 2本指ピンチズーム）
+    this.touchGestures = new TouchGestureManager(canvas, {
+      pan: (dx, dy) => this.viewport.pan(dx, dy),
+      zoom: (factor, cx, cy) => this.viewport.zoom(factor, cx, cy),
+      sync: () => { this.applyViewport(); this.updateZoomDisplay(); },
+    });
+    this.applyTouchDrawSetting();
 
     window.addEventListener('resize', () => this.handleResize());
     // アイドル時は描画を止めるため、OSの再表示・復帰時だけ明示的に再描画する。
@@ -2237,6 +2247,8 @@ class PhotonMixerApp {
   }
 
   private setupControls(): void {
+    // モバイル UI（タッチ描画チェック・ドロワートグル）
+    this.setupMobileUI();
     // UI→エンジン反映の窓口を生成（strokeManager/stabilizer は構築済み、pipeline は遅延参照）
     this.engineCtx = createEngineCtx({
       strokeManager: this.strokeManager,
@@ -2660,6 +2672,45 @@ class PhotonMixerApp {
       // 入力をリセット
       presetFileInput.value = '';
     });
+  }
+
+  /** 「タッチで描画」設定を保存値から反映（pen + gesture の両方へ） */
+  private applyTouchDrawSetting(): void {
+    let enabled = false;
+    try {
+      enabled = localStorage.getItem('pm-touch-draw') === '1';
+    } catch { /* ignore */ }
+    this.penInput?.setTouchDrawEnabled(enabled);
+    this.touchGestures?.setTouchDrawEnabled(enabled);
+    const checkbox = document.getElementById('touch-draw') as HTMLInputElement | null;
+    if (checkbox) checkbox.checked = enabled;
+  }
+
+  /** タッチ描画チェックボックスとドロワートグルの配線（setupControls から呼ぶ） */
+  private setupMobileUI(): void {
+    const touchDraw = document.getElementById('touch-draw') as HTMLInputElement | null;
+    touchDraw?.addEventListener('change', () => {
+      const enabled = touchDraw.checked;
+      try {
+        localStorage.setItem('pm-touch-draw', enabled ? '1' : '0');
+      } catch { /* ignore */ }
+      this.penInput?.setTouchDrawEnabled(enabled);
+      this.touchGestures?.setTouchDrawEnabled(enabled);
+    });
+    // 狭幅時のドロワー開閉
+    const wireDrawer = (btnId: string, dockId: string) => {
+      const btn = document.getElementById(btnId);
+      const dock = document.getElementById(dockId);
+      btn?.addEventListener('click', () => {
+        const other = dockId === 'left-dock'
+          ? document.getElementById('right-dock')
+          : document.getElementById('left-dock');
+        other?.classList.remove('open');
+        dock?.classList.toggle('open');
+      });
+    };
+    wireDrawer('left-dock-toggle', 'left-dock');
+    wireDrawer('right-dock-toggle', 'right-dock');
   }
 
   /**

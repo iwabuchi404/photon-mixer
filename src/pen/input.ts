@@ -33,9 +33,15 @@ export type PenInputHandler = (event: PenInputEvent) => void;
  */
 export class PenInputManager {
   private handlers: PenInputHandler[] = [];
+  /** true のときタッチも描画入力として受け付ける（既定 false: 誤操作防止） */
+  private touchDrawEnabled = false;
 
   constructor(private canvas: HTMLCanvasElement) {
     this.setupEventListeners();
+  }
+
+  setTouchDrawEnabled(enabled: boolean): void {
+    this.touchDrawEnabled = enabled;
   }
 
   /**
@@ -73,7 +79,7 @@ export class PenInputManager {
    * getCoalescedEvents() 非対応環境では通常イベント1点へフォールバックする。
    */
   private handlePointerMove(e: PointerEvent): void {
-    if (e.pointerType === 'touch') return;
+    if (e.pointerType === 'touch' && !this.touchDrawEnabled) return;
 
     const coalesced = typeof e.getCoalescedEvents === 'function'
       ? e.getCoalescedEvents()
@@ -89,8 +95,8 @@ export class PenInputManager {
    * ポインターイベントを処理
    */
   private handlePointerEvent(e: PointerEvent, type: 'down' | 'move' | 'up'): void {
-    // タッチは除外（タブレットでの誤操作防止）
-    if (e.pointerType === 'touch') {
+    // タッチは「タッチで描画」ON のときのみ受け付ける（タブレットでの誤操作防止）
+    if (e.pointerType === 'touch' && !this.touchDrawEnabled) {
       return;
     }
 
@@ -99,8 +105,10 @@ export class PenInputManager {
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
-    // 筆圧を取得（ペン: 0-1、マウス: 常に0.5）
-    const pressure = e.pointerType === 'pen' && e.pressure !== 0.5 ? e.pressure : 0.5;
+    // 筆圧を取得（ペン: 0-1、マウス: 常に0.5、タッチ: 報告値がなければ0.5）
+    const pressure = e.pointerType === 'pen' && e.pressure !== 0.5 ? e.pressure
+      : e.pointerType === 'touch' ? (e.pressure > 0 ? e.pressure : 0.5)
+      : 0.5;
 
     // 傾きを取得（ペン: -90 to 90、マウス: 常に0）
     const tiltX = e.pointerType === 'pen' ? e.tiltX : 0;
