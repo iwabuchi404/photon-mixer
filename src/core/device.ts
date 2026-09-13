@@ -28,9 +28,9 @@ export async function initGPUDevice(canvas: HTMLCanvasElement): Promise<GPUDevic
   }
 
   // デバイス取得
-  const device = await adapter.requestDevice({
-    requiredFeatures: ['float32-filterable'],
-  });
+  // 注意: float32-filterable は Safari 非対応のため要求しない。
+  // float32 テクスチャのフィルタリングは未使用（全て rgba16float / rgba8unorm / r8unorm）。
+  const device = await adapter.requestDevice({});
 
   if (!device) {
     throw new Error('Failed to get GPU device');
