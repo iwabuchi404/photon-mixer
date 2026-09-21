@@ -406,6 +406,7 @@
       align-items: center;
       justify-content: center;
       user-select: none;
+      touch-action: manipulation;
     }
     #left-dock-toggle { left: 0; border-radius: 0 8px 8px 0; border-left: none; }
     #right-dock-toggle { right: 0; border-radius: 8px 0 0 8px; border-right: none; }
@@ -475,8 +476,8 @@
       </div>
       <div class="ctrl-row" id="pressure-floor-row">
         <span class="ctrl-label">筆圧下限</span>
-        <input type="range" id="min-pressure" min="0" max="30" value="3">
-        <span id="min-pressure-val" class="ctrl-val">3</span><span class="ctrl-unit">%</span>
+        <input type="range" id="min-pressure" min="0" max="10" step="0.1" value="0">
+        <span id="min-pressure-val" class="ctrl-val">0</span><span class="ctrl-unit">%</span>
       </div>
 
       <div class="ctrl-row" id="transform-controls" style="display:none;">

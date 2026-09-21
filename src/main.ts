@@ -2837,8 +2837,8 @@ class PhotonMixerApp {
 
   /** ユーザーが手動でタッチ設定を変えたら true（ペン自動切替の対象外になる） */
   private touchDrawExplicit = false;
-  /** この筆圧未満の down/move を無視する（Sペン等のホバー誤描画対策）。0〜0.3 */
-  private minPressure = 0.03;
+  /** この筆圧未満の down/move を無視する（Sペン等のホバー誤描画対策）。0〜0.1 */
+  private minPressure = 0;
 
   /** 「タッチで描画」設定を保存値から反映（pen + gesture の両方へ） */
   private applyTouchDrawSetting(): void {
@@ -2884,16 +2884,16 @@ class PhotonMixerApp {
     const minP = document.getElementById('min-pressure') as HTMLInputElement | null;
     const minPVal = document.getElementById('min-pressure-val');
     if (minP) {
-      let savedPct = 3;
+      let savedPct = 0;
       try {
         const s = localStorage.getItem('pm-min-pressure');
-        if (s !== null) savedPct = Math.max(0, Math.min(30, parseInt(s) || 0));
+        if (s !== null) savedPct = Math.max(0, Math.min(10, parseFloat(s) || 0));
       } catch { /* ignore */ }
       minP.value = savedPct.toString();
       if (minPVal) minPVal.textContent = savedPct.toString();
       this.minPressure = savedPct / 100;
       minP.addEventListener('input', () => {
-        const pct = parseInt(minP.value) || 0;
+        const pct = parseFloat(minP.value) || 0;
         if (minPVal) minPVal.textContent = pct.toString();
         this.minPressure = pct / 100;
         try {
@@ -2901,11 +2901,15 @@ class PhotonMixerApp {
         } catch { /* ignore */ }
       });
     }
-    // 狭幅時のドロワー開閉
+    // 狭幅時のドロワー開閉（click ではなく pointerdown で受ける。
+    // ペンのタップは微振動で click が失われやすく、開閉できなくなるため）
     const wireDrawer = (btnId: string, dockId: string) => {
       const btn = document.getElementById(btnId);
       const dock = document.getElementById(dockId);
-      btn?.addEventListener('click', () => {
+      btn?.addEventListener('pointerdown', (e) => {
+        if (!e.isPrimary) return;
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
+        e.preventDefault();
         const other = dockId === 'left-dock'
           ? document.getElementById('right-dock')
           : document.getElementById('left-dock');
