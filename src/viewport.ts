@@ -69,6 +69,20 @@ export class Viewport {
   }
 
   /**
+   * スクリーン差分 -> キャンバス差分（toCanvas の差分版。パン・中心オフセットは相殺される）
+   */
+  deltaToCanvas(sdx: number, sdy: number): { x: number; y: number } {
+    const cos = Math.cos(-this.rotation);
+    const sin = Math.sin(-this.rotation);
+    const rx = sdx * cos - sdy * sin;
+    const ry = sdx * sin + sdy * cos;
+    let cx = rx / this.scale;
+    const cy = ry / this.scale;
+    if (this.flipX) cx = -cx;
+    return { x: cx, y: cy };
+  }
+
+  /**
    * ズーム（指定スクリーン座標を中心に）
    */
   zoom(factor: number, cx: number, cy: number): void {

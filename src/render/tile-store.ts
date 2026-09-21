@@ -182,27 +182,39 @@ export class TileStore {
     this.touch(rec);
   }
 
-  /** 1タイルを RAM へ退避（非破壊 readback）。呼び出し側で予算判断すること */
-  private async evictTile(rec: TileRecord): Promise<void> {
-    if (!rec.texture || rec.pinned) return;
+  /**
+   * 1タイルを RAM へ退避（非破壊 readback）。呼び出し側で予算判断すること。
+   * mapAsync 待機中に当該タイルへアクセス（書き込み・復帰・解放）があった場合は
+   * stale な読み出しで上書きしないよう退避を中止し false を返す。
+   */
+  private async evictTile(rec: TileRecord): Promise<boolean> {
+    if (!rec.texture || rec.pinned) return false;
+    const key = TileStore.key(rec.cellId, rec.index);
+    const texture = rec.texture;
+    const usedAt = rec.lastUsed;
     const staging = this.device.createBuffer({
       size: TILE_BYTES,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     });
     const enc = this.device.createCommandEncoder();
     enc.copyTextureToBuffer(
-      { texture: rec.texture },
+      { texture },
       { buffer: staging, bytesPerRow: TILE_SIZE * 8 },
       [TILE_SIZE, TILE_SIZE],
     );
     this.device.queue.submit([enc.finish()]);
     await staging.mapAsync(GPUMapMode.READ);
-    rec.mirror = new Uint16Array(staging.getMappedRange().slice(0));
+    const data = new Uint16Array(staging.getMappedRange().slice(0));
     staging.unmap();
     staging.destroy();
-    rec.texture.destroy();
+    if (this.tiles.get(key) !== rec || rec.texture !== texture || rec.lastUsed !== usedAt) {
+      return false; // 待機中に書き込み等が走った: テクスチャを維持して中止
+    }
+    rec.mirror = data;
+    texture.destroy();
     rec.texture = null;
     this.evictions++;
+    return true;
   }
 
   /**
@@ -213,15 +225,17 @@ export class TileStore {
   async maintain(): Promise<boolean> {
     if (this.maintaining) return true;
     this.maintaining = true;
+    const tried = new Set<TileRecord>();
     try {
       for (;;) {
         if (this.gpuBytes() <= this.gpuBudgetBytes) return true;
         let oldest: TileRecord | null = null;
         for (const rec of this.tiles.values()) {
-          if (!rec.texture || rec.pinned) continue;
+          if (!rec.texture || rec.pinned || tried.has(rec)) continue;
           if (!oldest || rec.lastUsed < oldest.lastUsed) oldest = rec;
         }
         if (!oldest) return false;
+        tried.add(oldest);
         await this.evictTile(oldest);
       }
     } finally {

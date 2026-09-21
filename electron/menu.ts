@@ -89,7 +89,7 @@ export function buildAppMenu(mainWindow: BrowserWindow): void {
         { label: '選択を反転', accelerator: 'CmdOrCtrl+Shift+I', click: () => send({ action: 'select:invert' }) },
         { label: '選択を解除', accelerator: 'CmdOrCtrl+D', click: () => send({ action: 'select:deselect' }) },
         { type: 'separator' },
-        { label: 'キャンバスをクリア', click: () => send({ action: 'edit:clear-canvas' }) },
+        { label: 'アクティブレイヤーをクリア', click: () => send({ action: 'edit:clear-canvas' }) },
       ],
     },
     // ---- レイヤー ----

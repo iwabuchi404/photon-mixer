@@ -91,28 +91,37 @@ export class ColorLightWidget {
       if (!this.dragging) this.panel.style.display = 'none';
     });
 
-    // ドラッグで移動（スライダー上は除外）
+    // ドラッグで移動（スライダー上は除外）。タップ（ほぼ動かず離す）はEVパネルの開閉
     chip.addEventListener('pointerdown', (e) => {
       if ((e.target as HTMLElement).closest('input')) return;
       e.preventDefault();
       this.dragging = true;
       chip.style.cursor = 'grabbing';
       const sx = e.clientX, sy = e.clientY;
+      let moved = false;
       const rect = el.getBoundingClientRect();
       const ox = sx - rect.left, oy = sy - rect.top;
       const move = (ev: PointerEvent) => {
+        if (Math.hypot(ev.clientX - sx, ev.clientY - sy) > 4) moved = true;
         this.place(ev.clientX - ox, ev.clientY - oy, true);
       };
       const up = () => {
         window.removeEventListener('pointermove', move);
         window.removeEventListener('pointerup', up);
+        window.removeEventListener('pointercancel', up);
         this.dragging = false;
         chip.style.cursor = 'grab';
-        this.panel.style.display = 'none';
-        this.savePos();
+        if (moved) {
+          this.panel.style.display = 'none';
+          this.savePos();
+        } else {
+          // タップ: ホバーの無いタッチ環境でもEVスライダーへ到達できるようにする
+          this.panel.style.display = this.panel.style.display === 'none' ? 'block' : 'none';
+        }
       };
       window.addEventListener('pointermove', move);
       window.addEventListener('pointerup', up);
+      window.addEventListener('pointercancel', up);
     });
 
     window.addEventListener('resize', () => this.clampIntoCanvas());
@@ -121,7 +130,10 @@ export class ColorLightWidget {
       const t = e.target as HTMLElement | null;
       if (e.button === 0 && t?.closest?.('#canvas')) this.setInteractive(false);
     }, true);
+    // pointerup でも pointercancel でも必ず復帰する
+    // （cancel を拾わないとタッチ/ペンで操作不能のまま残る）
     window.addEventListener('pointerup', () => this.setInteractive(true), true);
+    window.addEventListener('pointercancel', () => this.setInteractive(true), true);
     this.restorePos();
     this.refresh();
   }

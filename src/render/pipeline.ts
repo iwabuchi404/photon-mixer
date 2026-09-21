@@ -309,7 +309,7 @@ export class RenderPipeline {
   private maintainTiles(): void {
     void this.tileStore.maintain().then((ok) => {
       if (!ok) console.warn('[tiles] over budget: all tiles pinned');
-    });
+    }).catch((e) => console.warn('[tiles] maintain failed', e));
   }
 
   /** タイル統計（診断・verify 用） */
@@ -1564,15 +1564,24 @@ export class RenderPipeline {
     }
   }
 
-  /** セルを追加（アクティブセルのルートレベルの上に挿入） */
-  addLayer(): string {
+  /**
+   * セルを追加（アクティブセルのルートレベルの上に挿入）。
+   * intoFolderId 指定時はそのフォルダの末尾（=最前面）に追加する。
+   */
+  addLayer(intoFolderId?: string): string {
     const cell = this.createEmptyCell(`レイヤー ${flattenCells(this.rootNodes).length + 1}`);
-    // アクティブセルと同じ親の子として、その上に挿入
-    const parent = this.activeCellId ? findParent(this.rootNodes, this.activeCellId) : null;
-    if (parent) {
-      parent.parent.splice(parent.index + 1, 0, cell);
+    const folder = intoFolderId ? findNode(this.rootNodes, intoFolderId) : null;
+    if (folder?.kind === 'folder') {
+      folder.children.push(cell);
+      folder.collapsed = false;
     } else {
-      this.rootNodes.push(cell);
+      // アクティブセルと同じ親の子として、その上に挿入
+      const parent = this.activeCellId ? findParent(this.rootNodes, this.activeCellId) : null;
+      if (parent) {
+        parent.parent.splice(parent.index + 1, 0, cell);
+      } else {
+        this.rootNodes.push(cell);
+      }
     }
     const prev = this.activeCellId;
     this.activeCellId = cell.id;
@@ -1581,17 +1590,72 @@ export class RenderPipeline {
     return cell.id;
   }
 
-  /** フォルダを追加 */
-  addFolder(): string {
+  /** フォルダを追加。intoFolderId 指定時はそのフォルダ内に作成する */
+  addFolder(intoFolderId?: string): string {
     const folder = createFolder(`フォルダ ${this.countFolders() + 1}`);
-    const parent = this.activeCellId ? findParent(this.rootNodes, this.activeCellId) : null;
-    if (parent) {
-      parent.parent.splice(parent.index + 1, 0, folder);
+    const target = intoFolderId ? findNode(this.rootNodes, intoFolderId) : null;
+    if (target?.kind === 'folder') {
+      target.children.push(folder);
+      target.collapsed = false;
     } else {
-      this.rootNodes.push(folder);
+      const parent = this.activeCellId ? findParent(this.rootNodes, this.activeCellId) : null;
+      if (parent) {
+        parent.parent.splice(parent.index + 1, 0, folder);
+      } else {
+        this.rootNodes.push(folder);
+      }
     }
     this.invalidate();
     return folder.id;
+  }
+
+  /** ノード名を変更 */
+  renameNode(id: string, name: string): void {
+    const node = findNode(this.rootNodes, id);
+    if (node && name) node.name = name;
+  }
+
+  /**
+   * ノードをフォルダ（targetFolderId=null でルート）の末尾へ移動する。
+   * フォルダを自分自身や子孫へ入れる操作は拒否する。
+   */
+  reparentNode(id: string, targetFolderId: string | null): boolean {
+    if (id === targetFolderId) return false;
+    const node = findNode(this.rootNodes, id);
+    if (!node) return false;
+    if (targetFolderId) {
+      const target = findNode(this.rootNodes, targetFolderId);
+      if (!target || target.kind !== 'folder') return false;
+      if (node.kind === 'folder' && findNode(node.children, targetFolderId)) return false;
+      removeNode(this.rootNodes, id);
+      target.children.push(node);
+      target.collapsed = false;
+    } else {
+      removeNode(this.rootNodes, id);
+      this.rootNodes.push(node);
+    }
+    this.markAllOccupiedDirty();
+    this.invalidate();
+    return true;
+  }
+
+  /**
+   * ノードを targetId と同じ親の中で target の位置へ移動する
+   * （target の直前に挿入 = 表示上は target 行の直下）。
+   */
+  moveNodeNextTo(id: string, targetId: string): boolean {
+    if (id === targetId) return false;
+    const node = findNode(this.rootNodes, id);
+    const tp = findParent(this.rootNodes, targetId);
+    if (!node || !tp) return false;
+    if (node.kind === 'folder' && findNode(node.children, targetId)) return false;
+    removeNode(this.rootNodes, id);
+    const tp2 = findParent(this.rootNodes, targetId);
+    if (!tp2) this.rootNodes.push(node);
+    else tp2.parent.splice(tp2.index, 0, node);
+    this.markAllOccupiedDirty();
+    this.invalidate();
+    return true;
   }
 
   private countFolders(): number {
@@ -1827,32 +1891,36 @@ export class RenderPipeline {
     const savedRibbonMode = this.ribbonMode;
     this.brushRenderer.updateConfig({ usePointColor: true });
     this.ribbonRenderer.updateConfig({ usePointColor: true });
-    for (const rec of records) {
-      if (rec.kind === 'fill') {
-        // fill スナップショットは全面画像。ゼロ走査で正確に採用する
-        this.tileStore.adoptData(this.activeCellId, rec.snapshot, rec.bytesPerRow / 2, this.canvasWidth, this.canvasHeight);
-        this.syncNonEmpty(this.activeCellId);
-      } else if (rec.points.length > 0) {
-        // レコードの筆種で再現（混在時は都度切替）
-        this.ribbonMode = (rec.brushKind ?? 'stamp') === 'ribbon';
-        // レコードに保存した alphaLock で再現（描画順は元と同じなのでマスクも一致）
-        this.brushRenderer.updateConfig({ pressureOpacity: rec.pressureOpacity ?? false });
-        this.ribbonRenderer.updateConfig({ pressureOpacity: rec.pressureOpacity ?? false });
-        this.beginIncrementalStroke(rec.alphaLock ?? false);
-        // 巨大な1ストロークも固定点数の局所bboxへ分けて再生する。
-        for (let i = 0; i < rec.points.length; i += 4096) {
-          this.appendIncrementalStroke(rec.points.slice(i, i + 4096));
+    try {
+      for (const rec of records) {
+        if (rec.kind === 'fill') {
+          // fill スナップショットは全面画像。ゼロ走査で正確に採用する
+          this.tileStore.adoptData(this.activeCellId, rec.snapshot, rec.bytesPerRow / 2, this.canvasWidth, this.canvasHeight);
+          this.syncNonEmpty(this.activeCellId);
+        } else if (rec.points.length > 0) {
+          // レコードの筆種で再現（混在時は都度切替）
+          this.ribbonMode = (rec.brushKind ?? 'stamp') === 'ribbon';
+          // レコードに保存した alphaLock で再現（描画順は元と同じなのでマスクも一致）
+          this.brushRenderer.updateConfig({ pressureOpacity: rec.pressureOpacity ?? false });
+          this.ribbonRenderer.updateConfig({ pressureOpacity: rec.pressureOpacity ?? false });
+          this.beginIncrementalStroke(rec.alphaLock ?? false);
+          // 巨大な1ストロークも固定点数の局所bboxへ分けて再生する。
+          for (let i = 0; i < rec.points.length; i += 4096) {
+            this.appendIncrementalStroke(rec.points.slice(i, i + 4096));
+          }
+          this.finishIncrementalStroke([], rec.erase);
         }
-        this.finishIncrementalStroke([], rec.erase);
       }
+    } finally {
+      // 例外時もブラシ設定・モードを必ず復元する（以降の描画が壊れないよう）
+      this.brushRenderer.updateConfig({ usePointColor: false, pressureOpacity: currentPressureOpacity });
+      this.ribbonRenderer.updateConfig({ usePointColor: false, pressureOpacity: currentPressureOpacity });
+      this.ribbonMode = savedRibbonMode;
+      if (this.activeCellId) {
+        this.syncNonEmpty(this.activeCellId);
+      }
+      this.invalidate();
     }
-    this.brushRenderer.updateConfig({ usePointColor: false, pressureOpacity: currentPressureOpacity });
-    this.ribbonRenderer.updateConfig({ usePointColor: false, pressureOpacity: currentPressureOpacity });
-    this.ribbonMode = savedRibbonMode;
-    if (this.activeCellId) {
-      this.syncNonEmpty(this.activeCellId);
-    }
-    this.invalidate();
   }
 
   /**
@@ -1884,24 +1952,27 @@ export class RenderPipeline {
       usePointColor: true,
       pressureOpacity: record.pressureOpacity ?? false,
     });
-    // alphaLock 参照は履歴基準の合成ビュー
-    const baseView = this.ensureComposed(baseOwner);
-    for (let i = 0; i < record.points.length; i += 4096) {
-      if (this.ribbonMode) {
-        this.drawRibbonToIsolated(record.points.slice(i, i + 4096), baseView);
-      } else {
-        this.drawToIsolated(record.points.slice(i, i + 4096), baseView);
+    try {
+      // alphaLock 参照は履歴基準の合成ビュー
+      const baseView = this.ensureComposed(baseOwner);
+      for (let i = 0; i < record.points.length; i += 4096) {
+        if (this.ribbonMode) {
+          this.drawRibbonToIsolated(record.points.slice(i, i + 4096), baseView);
+        } else {
+          this.drawToIsolated(record.points.slice(i, i + 4096), baseView);
+        }
+        this.compositeRenderer.mergeMax(this.isolatedTexture, this.strokeAccumTexture);
+        this.absorbAccumBounds(record.points.slice(i, i + 4096));
       }
-      this.compositeRenderer.mergeMax(this.isolatedTexture, this.strokeAccumTexture);
-      this.absorbAccumBounds(record.points.slice(i, i + 4096));
+      this.bakeFullscreenToTiles(baseOwner, this.strokeAccumTexture, record.erase ? 'erase' : 'over', this.tilesForBounds(this.strokeAccumBBox));
+    } finally {
+      this.brushRenderer.updateConfig(savedConfig);
+      this.ribbonMode = savedRibbonMode;
+      this.currentStroke = savedStroke;
+      this.hasStrokeAccum = savedAccum;
+      this.strokeAccumBBox = savedAccumBBox;
+      this.drawAlphaLock = savedAlphaLock;
     }
-    this.bakeFullscreenToTiles(baseOwner, this.strokeAccumTexture, record.erase ? 'erase' : 'over', this.tilesForBounds(this.strokeAccumBBox));
-    this.brushRenderer.updateConfig(savedConfig);
-    this.ribbonMode = savedRibbonMode;
-    this.currentStroke = savedStroke;
-    this.hasStrokeAccum = savedAccum;
-    this.strokeAccumBBox = savedAccumBBox;
-    this.drawAlphaLock = savedAlphaLock;
   }
 
   /** 履歴全消去時に、Undo対象外の基準画像も破棄する。 */

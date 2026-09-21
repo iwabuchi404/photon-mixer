@@ -59,8 +59,8 @@ try {
   // Tab で UI 非表示
   await key(page,'Tab');
   await new Promise(r=>setTimeout(r,100));
-  const uiHidden = await page.evaluate(()=>document.getElementById('brush-controls').style.display);
-  console.log('Tab 後 brush-controls display:', uiHidden, '（none 期待）');
+  const uiHidden = await page.evaluate(()=>document.getElementById('left-dock').style.display);
+  console.log('Tab 後 left-dock display:', uiHidden, '（none 期待）');
   await key(page,'Tab'); // 戻す
   await new Promise(r=>setTimeout(r,100));
 

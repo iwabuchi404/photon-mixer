@@ -12,6 +12,7 @@ import { PostCorrector } from './pen/post-correction.js';
 import { StrokeManager, StrokeHistory, type StrokeRecord } from './pen/stroke.js';
 import { RenderPipeline } from './render/pipeline.js';
 import type { LayerNode, CellNode, EffectChainItem } from './render/layer-model.js';
+import { findCell, findNode, flattenCells } from './render/layer-model.js';
 import { PerfMonitor } from './ui/perf-monitor.js';
 import { Viewport } from './viewport.js';
 import { srgbToLinear, linearColorToSrgb } from './color/linear.js';
@@ -154,6 +155,8 @@ class PhotonMixerApp {
   private toolSettings!: ToolSettingsStore;
   // 編集中の効果レイヤーID（null=効果を編集していない）
   private editingEffectId: string | null = null;
+  // レイヤーパネルで選択中のノードID（セル or フォルダ。null=アクティブセルに追従）
+  private selectedNodeId: string | null = null;
   // トーンカーブエディタ
   private curveEditor: CurveEditor | null = null;
   // K3: 表示露出のペン位置 HUD
@@ -296,21 +299,27 @@ class PhotonMixerApp {
     }
 
     // 自動保存の復元提案（前回作業があれば。デモでは出さない）
-    if (!demoMode) try {
-      const auto = await loadAutosave();
-      if (auto) {
-        const when = new Date(auto.savedAt).toLocaleString();
-        if (confirm(`前回の作業（${when}）が見つかりました。復元しますか？`)) {
-          const file = new File([auto.blob], 'autosave.pmx');
-          await this.openPmxFile(file);
-          modal.style.display = 'none';
-          this.startRenderLoop();
-          this.startAutosave();
+    // 新規キャンバスモーダルと confirm が重なって出ないよう、判断が済むまで一旦隠す
+    if (!demoMode) {
+      modal.style.display = 'none';
+      let restored = false;
+      try {
+        const auto = await loadAutosave();
+        if (auto) {
+          const when = new Date(auto.savedAt).toLocaleString();
+          if (confirm(`前回の作業（${when}）が見つかりました。復元しますか？`)) {
+            const file = new File([auto.blob], 'autosave.pmx');
+            await this.openPmxFile(file);
+            this.startRenderLoop();
+            this.startAutosave();
+            restored = true;
+          }
         }
+      } catch (e) {
+        // 自動保存スロットが無い/未初期化でも致命的ではない
+        console.log('autosave restore skipped:', (e as Error)?.message ?? e);
       }
-    } catch (e) {
-      // 自動保存スロットが無い/未初期化でも致命的ではない
-      console.log('autosave restore skipped:', (e as Error)?.message ?? e);
+      if (!restored) modal.style.display = 'flex';
     }
 
     // Electron アプリメニューからのアクションを受信
@@ -335,10 +344,12 @@ class PhotonMixerApp {
     switch (msg.action) {
       // ---- ファイル ----
       case 'file:new':
-        this.showNewCanvasModal();
+        if (this.confirmDiscard('新規キャンバスを作成します。')) this.showNewCanvasModal();
         break;
       case 'file:open':
-        (document.getElementById('pmx-file-input') as HTMLInputElement | null)?.click();
+        if (this.confirmDiscard('.pmx を開きます。')) {
+          (document.getElementById('pmx-file-input') as HTMLInputElement | null)?.click();
+        }
         break;
       case 'file:save-pmx':
         this.savePmxFile();
@@ -355,8 +366,7 @@ class PhotonMixerApp {
         if (this.activeHistory().redo()) this.renderPipeline?.rebakeFromRecords(this.activeHistory().getAllRecords());
         break;
       case 'edit:clear-canvas':
-        this.renderPipeline?.clear();
-        this.activeHistory().clear();
+        this.clearActiveLayer();
         break;
 
       // ---- 選択 ----
@@ -372,29 +382,22 @@ class PhotonMixerApp {
 
       // ---- レイヤー ----
       case 'layer:add':
-        this.renderPipeline?.addLayer();
+        this.renderPipeline?.addLayer(this.selectedFolderId());
         this.rebuildLayerPanel();
         this.refreshEffectEdit();
         break;
       case 'layer:add-folder':
-        this.renderPipeline?.addFolder();
+        this.renderPipeline?.addFolder(this.selectedFolderId());
         this.rebuildLayerPanel();
         break;
-      case 'layer:delete': {
-        const id = this.renderPipeline?.getActiveLayerId();
-        this.renderPipeline?.removeActiveLayer();
-        if (id) this.layerHistories.delete(id);
-        this.rebuildLayerPanel();
-        this.refreshEffectEdit();
+      case 'layer:delete':
+        this.deleteSelectedNode();
         break;
-      }
       case 'layer:move-up':
-        this.renderPipeline?.moveActiveLayer('up');
-        this.rebuildLayerPanel();
+        this.moveSelectedNode('up');
         break;
       case 'layer:move-down':
-        this.renderPipeline?.moveActiveLayer('down');
-        this.rebuildLayerPanel();
+        this.moveSelectedNode('down');
         break;
 
       // ---- エフェクト ----
@@ -457,7 +460,8 @@ class PhotonMixerApp {
   /** 新規キャンバス作成モーダルを再表示する */
   private showNewCanvasModal(): void {
     const modal = document.getElementById('new-canvas-modal');
-    if (modal) modal.style.display = 'block';
+    // 初期スタイル（index.html 側）は flex + 中央揃え。block にすると左上に寄る
+    if (modal) modal.style.display = 'flex';
   }
 
   /**
@@ -614,8 +618,19 @@ class PhotonMixerApp {
     if (!list || !this.renderPipeline) return;
     const nodes = this.renderPipeline.getRootNodes();
     const activeId = this.renderPipeline.getActiveLayerId();
+    // 選択ノードがツリーから消えていればアクティブセルにフォールバック
+    if (this.selectedNodeId && !findNode(nodes, this.selectedNodeId)) this.selectedNodeId = null;
+    const selectedId = this.selectedNodeId ?? activeId;
 
     list.innerHTML = '';
+    // パネル背景へのドロップ = ルート末尾へ移動
+    list.ondragover = (e) => e.preventDefault();
+    list.ondrop = (e) => {
+      if (e.target !== list) return; // 行上のドロップは行側のハンドラが処理
+      e.preventDefault();
+      const srcId = e.dataTransfer?.getData('text/plain');
+      if (srcId && this.renderPipeline?.reparentNode(srcId, null)) this.rebuildLayerPanel();
+    };
     // 前面（配列末尾）が上に来るよう逆順で表示
     const renderNodes = (nodeList: LayerNode[], depth: number) => {
       for (let i = nodeList.length - 1; i >= 0; i--) {
@@ -624,9 +639,52 @@ class PhotonMixerApp {
         row.className = 'layer-row' + (node.kind === 'folder' ? ' folder-row' : '');
         row.style.paddingLeft = `${6 + depth * 14}px`;
         if (node.id === activeId) row.classList.add('active');
+        if (node.id === selectedId) row.classList.add('selected');
+
+        // ドラッグ&ドロップ: フォルダ行へは「中へ移動」、セル行へは「その位置へ移動」
+        row.draggable = true;
+        row.addEventListener('dragstart', (e) => {
+          e.dataTransfer?.setData('text/plain', node.id);
+          if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+        });
+        row.addEventListener('dragover', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+          row.classList.add('drop-target');
+        });
+        row.addEventListener('dragleave', () => row.classList.remove('drop-target'));
+        row.addEventListener('drop', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          row.classList.remove('drop-target');
+          const srcId = e.dataTransfer?.getData('text/plain');
+          if (!srcId || srcId === node.id || !this.renderPipeline) return;
+          const moved = node.kind === 'folder'
+            ? this.renderPipeline.reparentNode(srcId, node.id)
+            : this.renderPipeline.moveNodeNextTo(srcId, node.id);
+          if (moved) this.rebuildLayerPanel();
+        });
+
+        const eye = document.createElement('span');
+        eye.className = 'layer-eye' + (node.visible ? '' : ' hidden');
+        eye.textContent = node.visible ? '◉' : '○';
+        eye.addEventListener('click', (e) => {
+          e.stopPropagation();
+          this.renderPipeline?.setLayerVisible(node.id, !node.visible);
+          this.rebuildLayerPanel();
+        });
+        const nameEl = document.createElement('span');
+        nameEl.className = 'layer-name';
+        nameEl.textContent = node.name;
+        nameEl.title = 'ダブルクリックで名前を変更';
+        nameEl.addEventListener('dblclick', (e) => {
+          e.stopPropagation();
+          this.startRename(nameEl, node);
+        });
 
         if (node.kind === 'folder') {
-          // フォルダ行: 畳み展开 + 表示 + 名前
+          // フォルダ行: 畳み展开 + 表示 + 名前 + 選択（アクティブセルは変えない）
           const collapse = document.createElement('span');
           collapse.className = 'collapse-arrow';
           collapse.textContent = node.collapsed ? '▸' : '▾';
@@ -635,20 +693,13 @@ class PhotonMixerApp {
             this.renderPipeline?.setFolderCollapsed(node.id, !node.collapsed);
             this.rebuildLayerPanel();
           });
-          const eye = document.createElement('span');
-          eye.className = 'layer-eye' + (node.visible ? '' : ' hidden');
-          eye.textContent = node.visible ? '◉' : '○';
-          eye.addEventListener('click', (e) => {
-            e.stopPropagation();
-            this.renderPipeline?.setLayerVisible(node.id, !node.visible);
-            this.rebuildLayerPanel();
-          });
-          const nameEl = document.createElement('span');
-          nameEl.className = 'layer-name';
-          nameEl.textContent = node.name;
           row.appendChild(collapse);
           row.appendChild(eye);
           row.appendChild(nameEl);
+          row.addEventListener('click', () => {
+            this.selectedNodeId = node.id;
+            this.rebuildLayerPanel();
+          });
           list.appendChild(row);
           if (!node.collapsed) {
             renderNodes(node.children, depth + 1);
@@ -661,17 +712,6 @@ class PhotonMixerApp {
           band.style.width = `${Math.round(node.opacity * 100)}%`;
           row.appendChild(band);
 
-          const eye = document.createElement('span');
-          eye.className = 'layer-eye' + (node.visible ? '' : ' hidden');
-          eye.textContent = node.visible ? '◉' : '○';
-          eye.addEventListener('click', (e) => {
-            e.stopPropagation();
-            this.renderPipeline?.setLayerVisible(node.id, !node.visible);
-            this.rebuildLayerPanel();
-          });
-          const nameEl = document.createElement('span');
-          nameEl.className = 'layer-name';
-          nameEl.textContent = node.name;
           const lock = document.createElement('span');
           lock.className = 'layer-lock' + (node.alphaLock ? ' on' : '');
           lock.textContent = node.alphaLock ? '🔒' : '🔓';
@@ -685,6 +725,7 @@ class PhotonMixerApp {
           row.appendChild(nameEl);
           row.appendChild(lock);
           row.addEventListener('click', () => {
+            this.selectedNodeId = node.id;
             this.renderPipeline?.setActiveLayer(node.id);
             this.rebuildLayerPanel();
             this.refreshEffectEdit();
@@ -750,20 +791,20 @@ class PhotonMixerApp {
     if (!list || !this.renderPipeline) return;
     list.innerHTML = '';
     let effects: EffectChainItem[];
+    // 「セル」タブには対象セル名を出して、どのレイヤーへ効果を足すか明確にする
+    const cellTab = document.getElementById('effect-tab-cell');
+    if (cellTab) {
+      const activeId = this.renderPipeline.getActiveLayerId();
+      const name = activeId ? findCell(this.renderPipeline.getRootNodes(), activeId)?.name : null;
+      cellTab.textContent = name ? `セル: ${name}` : 'セル';
+      cellTab.title = 'アクティブセルの効果チェーン';
+    }
     if (this.effectTab === 'root') {
       effects = this.renderPipeline.getRootEffects();
     } else {
       const activeId = this.renderPipeline.getActiveLayerId();
       if (!activeId) { return; }
-      const nodes = this.renderPipeline.getRootNodes();
-      const findCell = (list: LayerNode[]): CellNode | null => {
-        for (const n of list) {
-          if (n.kind === 'cell' && n.id === activeId) return n;
-          if (n.kind === 'folder') { const c = findCell(n.children); if (c) return c; }
-        }
-        return null;
-      };
-      const cell = findCell(nodes);
+      const cell = findCell(this.renderPipeline.getRootNodes(), activeId);
       effects = cell?.effects ?? [];
     }
     for (const eff of effects) {
@@ -830,7 +871,7 @@ class PhotonMixerApp {
       URL.revokeObjectURL(url);
     } catch (e) {
       console.error('Failed to save .pmx:', e);
-      alert('.pmx の保存に失敗しました。');
+      alert(`.pmx の保存に失敗しました。\n${(e as Error)?.message ?? e}`);
     }
   }
 
@@ -862,7 +903,7 @@ class PhotonMixerApp {
       this.updateZoomDisplay();
     } catch (e) {
       console.error('Failed to open .pmx:', e);
-      alert('.pmx の読み込みに失敗しました。');
+      alert(`.pmx の読み込みに失敗しました。\n${(e as Error)?.message ?? e}`);
     }
   }
 
@@ -884,11 +925,87 @@ class PhotonMixerApp {
   private uiHidden = false;
   private toggleUI(): void {
     this.uiHidden = !this.uiHidden;
+    // 旧ID 'brush-controls' は UI v2 で廃止済み。ドック全体＋浮動ウィジェットを隠す
     const display = this.uiHidden ? 'none' : '';
-    for (const id of ['brush-controls', 'layer-panel', 'perf-monitor']) {
+    for (const id of ['left-dock', 'right-dock', 'perf-monitor', 'color-light-widget']) {
       const el = document.getElementById(id);
       if (el) el.style.display = display;
     }
+  }
+
+  /** 作業内容を失う操作の前の共通確認 */
+  private confirmDiscard(what: string): boolean {
+    return confirm(`${what}\n現在の作業内容は失われます。よろしいですか？`);
+  }
+
+  /** パネル選択がフォルダならそのIDを返す（＋ボタン等の追加先判定用） */
+  private selectedFolderId(): string | undefined {
+    const id = this.selectedNodeId;
+    if (!id || !this.renderPipeline) return undefined;
+    const node = findNode(this.renderPipeline.getRootNodes(), id);
+    return node?.kind === 'folder' ? node.id : undefined;
+  }
+
+  /** パネルで選択中のノード（セル or フォルダ）を削除する */
+  private deleteSelectedNode(): void {
+    if (!this.renderPipeline) return;
+    const id = this.selectedNodeId ?? this.renderPipeline.getActiveLayerId();
+    if (!id) return;
+    const node = findNode(this.renderPipeline.getRootNodes(), id);
+    if (!node) return;
+    const removedCells = node.kind === 'cell' ? [node] : flattenCells(node.children);
+    // 全セルを失うと描画先が無くなるため拒否
+    if (flattenCells(this.renderPipeline.getRootNodes()).length <= removedCells.length) {
+      alert('最後のレイヤーは削除できません。');
+      return;
+    }
+    const msg = node.kind === 'folder'
+      ? `フォルダ「${node.name}」と中のレイヤー ${removedCells.length} 枚をすべて削除します。\n元に戻せません。`
+      : `レイヤー「${node.name}」を削除します。\n元に戻せません。`;
+    if (!confirm(msg)) return;
+    for (const c of removedCells) this.layerHistories.delete(c.id);
+    this.renderPipeline.removeNode(id);
+    if (this.selectedNodeId === id) this.selectedNodeId = null;
+    this.rebuildLayerPanel();
+    this.refreshEffectEdit();
+  }
+
+  /** 選択中のノード（セル or フォルダ）を上下に移動 */
+  private moveSelectedNode(dir: 'up' | 'down'): void {
+    const id = this.selectedNodeId ?? this.renderPipeline?.getActiveLayerId();
+    if (id) this.renderPipeline?.moveNode(id, dir);
+    this.rebuildLayerPanel();
+  }
+
+  /** アクティブレイヤーの消去（パネル・メニュー共通。破壊的なので確認する） */
+  private clearActiveLayer(): void {
+    if (!confirm('アクティブレイヤーの内容をすべて消去します。\n元に戻せません。')) return;
+    this.renderPipeline?.clear();
+    this.activeHistory().clear();
+  }
+
+  /** レイヤー名のインラインリネーム（ダブルクリックで開始） */
+  private startRename(nameEl: HTMLElement, node: LayerNode): void {
+    const input = document.createElement('input');
+    input.className = 'layer-rename';
+    input.value = node.name;
+    nameEl.replaceWith(input);
+    input.focus();
+    input.select();
+    let done = false;
+    const commit = (apply: boolean) => {
+      if (done) return;
+      done = true;
+      const v = input.value.trim();
+      if (apply && v) this.renderPipeline?.renameNode(node.id, v);
+      this.rebuildLayerPanel();
+    };
+    input.addEventListener('keydown', (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter') commit(true);
+      else if (e.key === 'Escape') commit(false);
+    });
+    input.addEventListener('blur', () => commit(true));
   }
 
   /** ブラシサイズを delta だけ増減（[ ] ショートカット用） */
@@ -988,9 +1105,16 @@ class PhotonMixerApp {
           // beginMove は非同期（GPU→CPU 読み出し）なのでフラグで待ち状態を管理
           this.moveStarting = true;
           this.renderPipeline?.beginMove().then(() => {
+            if (!this.moveStarting) {
+              // 待機中に up / ツール切替でキャンセル済み → beginMove が立てたプレビューを後始末
+              this.renderPipeline?.cancelMove();
+              return;
+            }
             this.isMoveActive = true;
             this.moveStarting = false;
             this.moveOrigin = { x: transformedPoint.x, y: transformedPoint.y };
+          }).catch(() => {
+            this.moveStarting = false;
           });
           return;
         }
@@ -1065,30 +1189,34 @@ class PhotonMixerApp {
           const idx = this.txHandleIndex;
 
           if (idx === 8) {
-            // 回転ハンドル
-            this.txTheta = this.txDragOrigin.theta + (Math.atan2(ddy, ddx) - this.txDragOrigin.angle);
+            // 回転ハンドル（ビュー反転時は画面の回転方向が逆になる）
+            const flip = this.viewport.getTransform().flip;
+            this.txTheta = this.txDragOrigin.theta + flip * (Math.atan2(ddy, ddx) - this.txDragOrigin.angle);
           } else if (idx % 2 === 0 && idx >= 0 && idx <= 7) {
             // コーナーハンドル: 等比スケール（中心からの距離比）
             const d1 = Math.hypot(ddx, ddy);
             const factor = d1 / (this.txDragOrigin.dist || 1);
             this.txSx = Math.max(0.05, this.txDragOrigin.sx * factor);
             this.txSy = Math.max(0.05, this.txDragOrigin.sy * factor);
-          } else if (idx === 1 || idx === 5) {
-            // 上/下辺中点: y スケール
-            const d1 = Math.abs(ddy);
-            const factor = d1 / (Math.abs(this.txDragOrigin.dist) || 1);
-            this.txSy = Math.max(0.05, this.txDragOrigin.sy * factor);
-          } else if (idx === 3 || idx === 7) {
-            // 右/左辺中点: x スケール
-            const d1 = Math.abs(ddx);
-            const factor = d1 / (Math.abs(this.txDragOrigin.dist) || 1);
-            this.txSx = Math.max(0.05, this.txDragOrigin.sx * factor);
+          } else if (idx === 1 || idx === 5 || idx === 3 || idx === 7) {
+            // 辺中点ハンドル: 変形ボックスのローカル軸（画面空間）への射影距離比。
+            // ビュー回転・txTheta・反転を含む実際の軸は現在のハンドル位置から取る
+            const handles = this.getTransformHandles();
+            const [a, b] = (idx === 1 || idx === 5) ? [1, 5] : [7, 3];
+            const ax = handles[b].x - handles[a].x, ay = handles[b].y - handles[a].y;
+            const al = Math.hypot(ax, ay) || 1;
+            const ux = ax / al, uy = ay / al;
+            const d1 = Math.abs(ddx * ux + ddy * uy);
+            const odx = this.txDragOrigin.x - centerScreen.x, ody = this.txDragOrigin.y - centerScreen.y;
+            const d0 = Math.abs(odx * ux + ody * uy) || 1;
+            const factor = d1 / d0;
+            if (idx === 1 || idx === 5) this.txSy = Math.max(0.05, this.txDragOrigin.sy * factor);
+            else this.txSx = Math.max(0.05, this.txDragOrigin.sx * factor);
           } else {
-            // ハンドル外 or idx=-1: 全体平行移動
-            // スクリーン差をキャンバス差に変換（スケールのみ考慮、回転は省略でOK）
-            const scale = this.viewport.getTransform().scale;
-            this.txTx = this.txDragOrigin.tx + (point.x - this.txDragOrigin.x) / scale;
-            this.txTy = this.txDragOrigin.ty + (point.y - this.txDragOrigin.y) / scale;
+            // ハンドル外 or idx=-1: 全体平行移動（ビュー回転・反転を含めてキャンバス差へ変換）
+            const d = this.viewport.deltaToCanvas(point.x - this.txDragOrigin.x, point.y - this.txDragOrigin.y);
+            this.txTx = this.txDragOrigin.tx + d.x;
+            this.txTy = this.txDragOrigin.ty + d.y;
           }
 
           this.renderPipeline?.updateTransform(this.buildInvMatrix());
@@ -1139,6 +1267,7 @@ class PhotonMixerApp {
           if (this.moveStarting) {
             // beginMove がまだ完了していない場合はキャンセル扱い
             this.moveStarting = false;
+            this.moveOrigin = null;
             this.renderPipeline?.cancelMove();
             return;
           }
@@ -1286,21 +1415,27 @@ class PhotonMixerApp {
     }, true);
 
     // K3: HUD表示中はホイールを露出調整に使う（ズームを横取り）
+    // ただし対象はキャンバス/HUD上のみ — パネル上のホイールはスクロールを優先する
     window.addEventListener('wheel', (e) => {
       if (!this.lightHud?.isOpen()) return;
+      const t = e.target as HTMLElement | null;
+      if (!t?.closest?.('#canvas') && !this.lightHud.contains(t)) return;
       e.preventDefault();
       e.stopPropagation();
       this.adjustExposureEV(e.deltaY < 0 ? +0.5 : -0.5);
       this.lightHud.refresh();
     }, { passive: false, capture: true });
 
-    // ホイール操作（ズーム or 回転）
+    // ホイール操作（ズーム / ピンチ / 回転）
     canvas.addEventListener('wheel', (e) => {
       e.preventDefault();
       if (e.altKey) {
         // Alt + ホイールで回転
         const delta = e.deltaY > 0 ? 0.05 : -0.05; // ラジアン
         this.viewport.rotate(delta);
+      } else if (e.ctrlKey) {
+        // トラックパッドのピンチは ctrl+wheel として届く。deltaY 比例で滑らかに
+        this.viewport.zoom(Math.exp(-e.deltaY * 0.01), e.clientX, e.clientY);
       } else {
         // ホイールのみでズーム
         const factor = e.deltaY < 0 ? 1.1 : 0.9;
@@ -1316,10 +1451,28 @@ class PhotonMixerApp {
     let lastX = 0;
     let lastY = 0;
 
+    // クリック/ドラッグでフォーカスを得たボタン・スライダー等を pointerup で解放する。
+    // 残ったままだと Space/Enter が「ショートカット + ボタン再押下」の二重発火になる
+    window.addEventListener('pointerup', () => {
+      const ae = document.activeElement as HTMLElement | null;
+      if (!ae) return;
+      if (ae.tagName === 'BUTTON') ae.blur();
+      else if (ae instanceof HTMLInputElement && (ae.type === 'range' || ae.type === 'checkbox')) ae.blur();
+    });
+
     window.addEventListener('keydown', (e) => {
-      // 入力欄フォーカス中はショートカットを抑制（誤発火防止）
-      const tag = (document.activeElement as HTMLElement | null)?.tagName;
-      if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+      // テキスト系入力のフォーカス中のみショートカットを抑制。
+      // （range/checkbox/button は pointerup で blur されるが、キーボード操作等で
+      //   フォーカスが残った場合に備え Space/Enter の既定動作だけ潰す）
+      const ae = document.activeElement as HTMLElement | null;
+      const tag = ae?.tagName;
+      if (tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (ae instanceof HTMLInputElement
+        && !['range', 'checkbox', 'radio', 'button', 'color', 'file'].includes(ae.type)) return;
+      if ((tag === 'BUTTON' || ae instanceof HTMLInputElement)
+        && (e.code === 'Space' || e.key === 'Enter')) {
+        e.preventDefault();
+      }
 
       // --- Ctrl 系 ---
       if (e.ctrlKey) {
@@ -1386,11 +1539,16 @@ class PhotonMixerApp {
             this.commitTransformUI();
           }
           break;
-        case 'Escape': // 変形キャンセル（HUDが開いていれば先に閉じる）
-          if (this.lightHud?.isOpen()) this.lightHud.close();
-          if (this.state.currentTool === 'transform') {
+        case 'Escape': // HUD > 変形取消 > 選択解除 の優先順で1つだけ処理
+          if (this.lightHud?.isOpen()) { this.lightHud.close(); break; }
+          if (this.state.currentTool === 'transform' && (this.txActive || this.txStarting)) {
             e.preventDefault();
             this.cancelTransformUI();
+            break;
+          }
+          if (this.selectionSegments) {
+            e.preventDefault();
+            this.clearSelectionUI();
           }
           break;
       }
@@ -1899,7 +2057,10 @@ class PhotonMixerApp {
       return;
     }
     const title = document.getElementById('effect-editor-title');
-    const ownerLabel = eff.owner.kind === 'root' ? '撮影スタック' : `セル: ${eff.owner.cellId}`;
+    const cellName = eff.owner.kind === 'cell'
+      ? findCell(this.renderPipeline?.getRootNodes() ?? [], eff.owner.cellId)?.name ?? eff.owner.cellId
+      : '';
+    const ownerLabel = eff.owner.kind === 'root' ? '撮影スタック' : `セル「${cellName}」`;
     if (title) title.textContent = `⚙ ${ownerLabel} の効果設定`;
     const visible = new Set(PhotonMixerApp.FILTER_PARAMS[eff.filterType]);
     document.querySelectorAll<HTMLElement>('#filter-params [data-fparam]').forEach(row => {
@@ -1925,6 +2086,7 @@ class PhotonMixerApp {
     if (!this.editingEffectId || !this.renderPipeline) return;
     const eff = this.renderPipeline.getEffect(this.editingEffectId);
     if (!eff) return;
+    if (!confirm('効果をピクセルに焼き込みます。\nすべてのレイヤーの Undo 履歴が消去され、元に戻せません。')) return;
     if (eff.owner.kind === 'root') {
       this.renderPipeline.freezeRootEffects();
     } else {
@@ -2382,40 +2544,25 @@ class PhotonMixerApp {
         URL.revokeObjectURL(url);
       } catch (e) {
         console.error('PNG export failed:', e);
-        alert('PNG 書き出しに失敗しました。');
+        alert(`PNG 書き出しに失敗しました。\n${(e as Error)?.message ?? e}`);
       }
     });
 
-    clearBtn.addEventListener('click', () => {
-      this.renderPipeline?.clear();
-      this.activeHistory().clear();
-    });
+    clearBtn.addEventListener('click', () => this.clearActiveLayer());
 
-    // レイヤー操作
+    // レイヤー操作（選択ノード基準。フォルダ選択中はその中に追加する）
     document.getElementById('layer-add')?.addEventListener('click', () => {
-      this.renderPipeline?.addLayer();
+      this.renderPipeline?.addLayer(this.selectedFolderId());
       this.rebuildLayerPanel();
       this.refreshEffectEdit();
     });
     document.getElementById('layer-add-folder')?.addEventListener('click', () => {
-      this.renderPipeline?.addFolder();
+      this.renderPipeline?.addFolder(this.selectedFolderId());
       this.rebuildLayerPanel();
     });
-    document.getElementById('layer-del')?.addEventListener('click', () => {
-      const id = this.renderPipeline?.getActiveLayerId();
-      this.renderPipeline?.removeActiveLayer();
-      if (id) this.layerHistories.delete(id);
-      this.rebuildLayerPanel();
-      this.refreshEffectEdit();
-    });
-    document.getElementById('layer-up')?.addEventListener('click', () => {
-      this.renderPipeline?.moveActiveLayer('up');
-      this.rebuildLayerPanel();
-    });
-    document.getElementById('layer-down')?.addEventListener('click', () => {
-      this.renderPipeline?.moveActiveLayer('down');
-      this.rebuildLayerPanel();
-    });
+    document.getElementById('layer-del')?.addEventListener('click', () => this.deleteSelectedNode());
+    document.getElementById('layer-up')?.addEventListener('click', () => this.moveSelectedNode('up'));
+    document.getElementById('layer-down')?.addEventListener('click', () => this.moveSelectedNode('down'));
 
     // 効果チェーン パネル タブ（セル / 撮影スタック）
     document.getElementById('effect-tab-cell')?.addEventListener('click', () => {
@@ -2520,6 +2667,11 @@ class PhotonMixerApp {
     viewMode?.addEventListener('change', applyDisplay);
     applyDisplay(); // 初期値を反映
 
+    // 露出HUDの明示的な起動口（中クリックの無いタブレット/タッチ向け）
+    document.getElementById('view-exposure-hud')?.addEventListener('click', () => {
+      this.lightHud?.open(window.innerWidth / 2, window.innerHeight / 2);
+    });
+
     // 塗りつぶし許容値
     const tolSlider = document.getElementById('bucket-tolerance') as HTMLInputElement;
     const tolVal = document.getElementById('bucket-tolerance-val')!;
@@ -2557,6 +2709,7 @@ class PhotonMixerApp {
     // .pmx 保存 / 開く
     document.getElementById('save-pmx-btn')?.addEventListener('click', () => this.savePmxFile());
     document.getElementById('open-pmx-btn')?.addEventListener('click', () => {
+      if (!this.confirmDiscard('.pmx を開きます。')) return;
       (document.getElementById('pmx-file-input') as HTMLInputElement).click();
     });
     (document.getElementById('pmx-file-input') as HTMLInputElement)?.addEventListener('change', async (e) => {
@@ -2589,7 +2742,7 @@ class PhotonMixerApp {
         this.renderPipeline.updateBrushConfig({ useTexture: true });
       } catch (err) {
         console.error('Failed to load texture:', err);
-        alert('テクスチャの読み込みに失敗しました。');
+        alert(`テクスチャの読み込みに失敗しました。\n${(err as Error)?.message ?? err}`);
       }
       // 入力をリセット
       textureFileInput.value = '';
@@ -2641,7 +2794,7 @@ class PhotonMixerApp {
         URL.revokeObjectURL(url);
       } catch (e) {
         console.error('Failed to save preset:', e);
-        alert('プリセットの保存に失敗しました。');
+        alert(`プリセットの保存に失敗しました。\n${(e as Error)?.message ?? e}`);
       }
     });
 
@@ -2675,7 +2828,7 @@ class PhotonMixerApp {
         alert(`プリセット「${preset.name}」を読み込みました。`);
       } catch (e) {
         console.error('Failed to load preset:', e);
-        alert('プリセットの読み込みに失敗しました。');
+        alert(`プリセットの読み込みに失敗しました。\n${(e as Error)?.message ?? e}`);
       }
       // 入力をリセット
       presetFileInput.value = '';
