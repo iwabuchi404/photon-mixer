@@ -420,6 +420,12 @@ export class RenderPipeline {
     this.invalidate();
   }
 
+  /** HDR出力（extended canvas）の有効/無効。有効時はトーンマップを介さず光量直通 */
+  setHdrOutput(enabled: boolean): void {
+    this.compositeRenderer.setHdrOutput(enabled);
+    this.invalidate();
+  }
+
   /** 表示変換（ビュー露出=2^EV / トーンマップ / 表示モード）を設定 */
   setDisplayParams(exposure: number, tonemap: TonemapId, mode: DisplayModeId): void {
     this.displayExposure = exposure;

@@ -16,8 +16,9 @@ const VENDOR_PKGS = ['fflate', 'lit', 'lit-html', 'lit-element', '@lit'];
 if (existsSync(out)) rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
 
-// index.html + dist
+// index.html + hdr-test.html + dist
 cpSync(join(root, 'index.html'), join(out, 'index.html'));
+cpSync(join(root, 'hdr-test.html'), join(out, 'hdr-test.html'));
 cpSync(join(root, 'dist'), join(out, 'dist'), { recursive: true, force: true });
 // importmap の vendor のみ
 for (const pkg of VENDOR_PKGS) {

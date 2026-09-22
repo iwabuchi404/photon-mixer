@@ -16,6 +16,10 @@ struct ViewportUniforms {
   exposure: f32,    // ビュー露出 = 2^EV
   tonemap: f32,     // 0=PBR Neutral, 1=AgX, 2=Reinhard, 3=None
   display_mode: f32, // 0=表示変換, 1=リニア生(clamp), 2=クリップ警告
+  hdr_out: f32,     // 1=HDR出力（canvas toneMapping extended。トーンマップ介さず光量直通）
+  _pad0: f32,
+  _pad1: f32,
+  _pad2: f32,
 }
 
 struct VertexOutput {
@@ -124,6 +128,17 @@ fn linear_to_srgb3(c: vec3f) -> vec3f {
   return vec3f(linear_to_srgb(c.r), linear_to_srgb(c.g), linear_to_srgb(c.b));
 }
 
+// HDR出力用: 上限をクランプしない（extended canvas は >1 をそのまま受け取る）
+fn linear_to_srgb_ext(v: f32) -> f32 {
+  let c = max(v, 0.0);
+  if (c <= 0.0031308) { return c * 12.92; }
+  return 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+fn linear_to_srgb_ext3(c: vec3f) -> vec3f {
+  return vec3f(linear_to_srgb_ext(c.r), linear_to_srgb_ext(c.g), linear_to_srgb_ext(c.b));
+}
+
 // --- トーンマップ（入力: 露出適用済みリニア / 出力: 表示リニア [0,1]）---
 // display.ts と同一式。enum: 0=PBR Neutral, 1=AgX, 2=Reinhard, 3=None
 
@@ -202,13 +217,17 @@ fn fs_display(in: VertexOutput) -> @location(0) vec4f {
   }
 
   let exposed = scene * viewport.exposure;
+  let hdr = viewport.hdr_out > 0.5;
   var disp: vec3f;
-  if (mode == 1) {
+  if (hdr) {
+    disp = max(exposed, vec3f(0.0)); // HDR: トーンマップを介さず光量を直通（下側のみclamp）
+  } else if (mode == 1) {
     disp = clamp(exposed, vec3f(0.0), vec3f(1.0)); // リニア生（トーンマップ無し・clamp）
   } else {
     disp = apply_tonemap(exposed, i32(viewport.tonemap + 0.5));
   }
-  let srgb = linear_to_srgb3(disp);
+  var srgb: vec3f;
+  if (hdr) { srgb = linear_to_srgb_ext3(disp); } else { srgb = linear_to_srgb3(disp); }
   return vec4f(srgb * a, a); // over blend 用にプリマルチプライドで返す
 }
 

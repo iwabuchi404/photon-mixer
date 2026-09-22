@@ -20,8 +20,8 @@ export class CompositeRenderer {
   constructor(device: GPUDevice) {
     this.device = device;
     this.sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
-    // scale, offsetX, offsetY, rotation, cw, ch, sw, sh, flip + pad (12 floats = 48 bytes)
-    this.uniformBuffer = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    // scale, offsetX, offsetY, rotation, cw, ch, sw, sh, flip, exposure, tonemap, mode, hdr + pad (16 floats = 64 bytes)
+    this.uniformBuffer = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.dummyTexture = this.device.createTexture({ size: [1, 1], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING });
 
     this.bindGroupLayout = this.device.createBindGroupLayout({
@@ -72,26 +72,34 @@ export class CompositeRenderer {
     this.paperPipeline = make(canvasFormat, 'vs_display', 'fs_paper'); 
   }
 
-  // 表示変換パラメータ（露出=2^EV, tonemap enum, display mode enum）
+  // 表示変換パラメータ（露出=2^EV, tonemap enum, display mode enum, hdr出力フラグ）
   private dispExposure = 1;
   private dispTonemap = 0;
   private dispMode = 0;
+  private dispHdr = 0;
 
   updateViewport(scale: number, offsetX: number, offsetY: number, rotation: number, cw: number, ch: number, sw: number, sh: number, flip = 1): void {
     const data = new Float32Array([
       scale, offsetX, offsetY, rotation, cw, ch, sw, sh, flip,
-      this.dispExposure, this.dispTonemap, this.dispMode,
+      this.dispExposure, this.dispTonemap, this.dispMode, this.dispHdr,
+      0, 0, 0,
     ]);
     this.device.queue.writeBuffer(this.uniformBuffer, 0, data);
   }
 
-  /** 表示変換パラメータを更新（uniform 末尾3要素のみ書き換え） */
+  /** 表示変換パラメータを更新（uniform 末尾4要素のみ書き換え） */
   setDisplayParams(exposure: number, tonemap: number, mode: number): void {
     this.dispExposure = exposure;
     this.dispTonemap = tonemap;
     this.dispMode = mode;
     // 先頭から 9 floats(=36 bytes) 目以降に書き込む
-    this.device.queue.writeBuffer(this.uniformBuffer, 9 * 4, new Float32Array([exposure, tonemap, mode]));
+    this.device.queue.writeBuffer(this.uniformBuffer, 9 * 4, new Float32Array([exposure, tonemap, mode, this.dispHdr]));
+  }
+
+  /** HDR出力（extended canvas）の有効/無効。有効時はトーンマップを介さず光量直通。 */
+  setHdrOutput(enabled: boolean): void {
+    this.dispHdr = enabled ? 1 : 0;
+    this.device.queue.writeBuffer(this.uniformBuffer, 12 * 4, new Float32Array([this.dispHdr]));
   }
 
   draw(pass: GPURenderPassEncoder, texture: GPUTexture, eraseMode = false): void {

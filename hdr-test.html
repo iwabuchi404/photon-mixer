@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PhotonMixer HDR canvas test</title>
+<style>
+  body { margin:0; font:14px/1.5 system-ui, sans-serif; background:#111; color:#ddd; }
+  #diag { padding:10px 12px; font-size:12px; white-space:pre-wrap; word-break:break-all; }
+  #diag .ok { color:#7d7; } #diag .ng { color:#f77; }
+  canvas { display:block; width:100vw; height:55vh; touch-action:none; }
+  #ctrl { padding:10px 12px; display:flex; align-items:center; gap:10px; }
+  input[type=range] { flex:1; }
+  #note { padding:0 12px 10px; font-size:12px; color:#999; }
+</style>
+</head>
+<body>
+<div id="diag">checking…</div>
+<canvas id="c"></canvas>
+<div id="ctrl">
+  <span>HDR倍率</span>
+  <input id="gain" type="range" min="0" max="4" step="0.05" value="2">
+  <span id="gainv">x4.0</span>
+</div>
+<div id="note">
+  上半分 = SDR白(1.0)基準。下半分 = HDR出力 (スライダーで倍率変更)。<br>
+  縦帯は左から 1x / 2x / 4x / 8x / 16x の固定ステップ。<br>
+  HDRが効いていれば下半分と右側の帯が「白より明るく」見えます。
+</div>
+<script type="module">
+const diagEl = document.getElementById('diag');
+const log = [];
+const put = (k, v, ok) => log.push([k, v, ok]);
+const render = () => {
+  diagEl.innerHTML = log.map(([k, v, ok]) =>
+    `<span class="${ok === false ? 'ng' : 'ok'}">${k}: ${v}</span>`).join('\n');
+};
+
+// --- 診断 ---
+put('navigator.gpu', navigator.gpu ? 'あり' : 'なし', !!navigator.gpu);
+put('dynamic-range: high', matchMedia('(dynamic-range: high)').matches ? 'true' : 'false',
+    matchMedia('(dynamic-range: high)').matches);
+put('screen', `${screen.width}x${screen.height} @${devicePixelRatio}x`);
+put('Chrome', (navigator.userAgent.match(/Chrome\/(\d+)/) || [])[1] || '不明');
+render();
+
+const canvas = document.getElementById('c');
+const gainEl = document.getElementById('gain');
+const gainvEl = document.getElementById('gainv');
+let gain = 4.0;
+gainEl.addEventListener('input', () => {
+  gain = Math.pow(2, parseFloat(gainEl.value)); // 0..4 EV → 1..16x
+  gainvEl.textContent = 'x' + gain.toFixed(1);
+});
+
+async function main() {
+  if (!navigator.gpu) { render(); return; }
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) { put('adapter', '取得失敗', false); render(); return; }
+  const info = adapter.info || {};
+  put('adapter', `${info.vendor || '?'} ${info.architecture || ''} ${info.device || ''}`.trim());
+  const device = await adapter.requestDevice();
+  const ctx = canvas.getContext('webgpu');
+
+  let cfg;
+  try {
+    ctx.configure({
+      device, format: 'rgba16float', alphaMode: 'opaque',
+      colorSpace: 'srgb',
+      toneMapping: { mode: 'extended' },
+    });
+  } catch (e) {
+    put('configure(extended)', '例外: ' + e.message, false); render(); return;
+  }
+  if (ctx.getConfiguration) {
+    cfg = ctx.getConfiguration();
+    put('toneMapping.mode', cfg.toneMapping?.mode, cfg.toneMapping?.mode === 'extended');
+    put('format', cfg.format);
+    put('colorSpace', cfg.colorSpace);
+  } else {
+    put('getConfiguration', '未実装(Chrome<131) — configureは受理済みと推定', null);
+  }
+  render();
+
+  const shader = device.createShaderModule({ code: `
+    struct U { gain: f32, w: f32, h: f32, _pad: f32 };
+    @group(0) @binding(0) var<uniform> u: U;
+    fn srgb_encode(l: f32) -> f32 {
+      let s = sign(l); let a = abs(l);
+      return s * select(12.92 * a, 1.055 * pow(a, 1.0/2.4) - 0.055, a > 0.0031308);
+    }
+    @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+      var p = array<vec2f,3>(vec2f(-1,-1), vec2f(3,-1), vec2f(-1,3));
+      return vec4f(p[i], 0, 1);
+    }
+    @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+      let x = pos.x / u.w; let y = pos.y / u.h;
+      var v = 1.0;
+      if (y > 0.5) {
+        // 下半分: スライダー倍率のHDR白
+        v = u.gain;
+      }
+      // 下半分内の縦帯: 1/2/4/8/16x
+      if (y > 0.5 && y < 0.75) {
+        let band = floor(x * 5.0);
+        v = pow(2.0, band); // 1,2,4,8,16
+      }
+      // 帯の区切り線
+      if (abs(y - 0.5) < 0.003 || (y > 0.5 && y < 0.75 && fract(x * 5.0) < 0.01)) {
+        v = 0.0;
+      }
+      let s = srgb_encode(v);
+      return vec4f(s, s, s, 1);
+    }
+  `});
+  const ub = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const pipe = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: shader, entryPoint: 'vs' },
+    fragment: { module: shader, entryPoint: 'fs', targets: [{ format: 'rgba16float' }] },
+  });
+  const bg = device.createBindGroup({
+    layout: pipe.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: ub } }],
+  });
+
+  function frame() {
+    const dpr = Math.min(devicePixelRatio, 2);
+    const w = Math.floor(canvas.clientWidth * dpr), h = Math.floor(canvas.clientHeight * dpr);
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+    device.queue.writeBuffer(ub, 0, new Float32Array([gain, w, h, 0]));
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginRenderPass({
+      colorAttachments: [{
+        view: ctx.getCurrentTexture().createView(),
+        loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      }],
+    });
+    pass.setPipeline(pipe); pass.setBindGroup(0, bg); pass.draw(3); pass.end();
+    device.queue.submit([enc.finish()]);
+    requestAnimationFrame(frame);
+  }
+  frame();
+}
+main().catch(e => { put('error', e.message, false); render(); });
+</script>
+</body>
+</html>

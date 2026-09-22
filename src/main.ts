@@ -242,6 +242,13 @@ class PhotonMixerApp {
 
     this.renderPipeline = new RenderPipeline(this.renderer);
     await this.renderPipeline.init();
+    // HDR出力（extended canvas が受理された場合のみ ON）
+    this.renderPipeline.setHdrOutput(this.renderer.hdr);
+    if (this.renderer.hdr) {
+      const badge = document.getElementById('hdr-row');
+      if (badge) badge.style.display = 'flex';
+      console.log('HDR output enabled (rgba16float + extended tone mapping)');
+    }
     // 初期ツールはリボン筆（メインブラシ）
     this.renderPipeline.setRibbonMode(true);
     // 診断フック: タイル統計（verify 用。製品動作に影響なし）

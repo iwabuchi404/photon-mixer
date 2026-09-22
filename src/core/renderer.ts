@@ -10,6 +10,8 @@ export interface Renderer {
   format: GPUTextureFormat;
   context: GPUCanvasContext;
   canvas: HTMLCanvasElement;
+  /** HDR出力（extended tone mapping）が有効か */
+  hdr: boolean;
 }
 
 /**
@@ -24,6 +26,7 @@ export async function initRenderer(canvas: HTMLCanvasElement): Promise<Renderer>
     format: gpu.format,
     context,
     canvas,
+    hdr: gpu.hdr,
   };
 }
 

@@ -9,6 +9,7 @@ on:
       - 'src/**'
       - 'shaders/**'
       - 'index.html'
+      - 'hdr-test.html'
       - 'package.json'
       - 'package-lock.json'
       - 'scripts/build-demo.mjs'

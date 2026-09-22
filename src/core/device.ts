@@ -7,6 +7,8 @@ export interface GPUDeviceManager {
   device: GPUDevice;
   adapter: GPUAdapter;
   format: GPUTextureFormat;
+  /** HDR出力が有効ならtrue（canvas = rgba16float + toneMapping extended） */
+  hdr: boolean;
 }
 
 /**
@@ -50,13 +52,42 @@ export async function initGPUDevice(canvas: HTMLCanvasElement): Promise<GPUDevic
 
   // 推奨されるフォーマット（通常はRGBA8UnormまたはBGR8Unorm）
   const format = navigator.gpu.getPreferredCanvasFormat();
+  let hdr = false;
 
-  // コンテキスト設定
-  context.configure({
-    device,
-    format,
-    alphaMode: 'premultiplied',
-  });
+  // HDR出力の試行: ディスプレイが HDR 対応（dynamic-range: high）か ?hdr=1 強制時。
+  // extended が受理されたかは getConfiguration() で確認する（Chrome 131+）。
+  // getConfiguration が無い環境では受理確認ができないため、SDR にフォールバックする。
+  const hdrParam = new URLSearchParams(location.search).get('hdr');
+  const hdrWanted =
+    hdrParam === '1' || (hdrParam !== '0' && matchMedia('(dynamic-range: high)').matches);
 
-  return { device, adapter, format };
+  if (hdrWanted) {
+    try {
+      context.configure({
+        device,
+        format: 'rgba16float',
+        alphaMode: 'premultiplied',
+        colorSpace: 'srgb',
+        toneMapping: { mode: 'extended' },
+      });
+      const configured = context.getConfiguration?.()?.toneMapping?.mode;
+      // getConfiguration 非対応でも ?hdr=1 強制なら extended 受理とみなす
+      if (configured === 'extended' || (configured === undefined && hdrParam === '1')) {
+        hdr = true;
+      }
+    } catch (e) {
+      console.warn('HDR canvas configure failed, falling back to SDR:', e);
+    }
+  }
+
+  if (!hdr) {
+    // コンテキスト設定
+    context.configure({
+      device,
+      format,
+      alphaMode: 'premultiplied',
+    });
+  }
+
+  return { device, adapter, format: hdr ? 'rgba16float' : format, hdr };
 }
