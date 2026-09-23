@@ -9,6 +9,8 @@ export interface GPUDeviceManager {
   format: GPUTextureFormat;
   /** HDR出力が有効ならtrue（canvas = rgba16float + toneMapping extended） */
   hdr: boolean;
+  /** extended canvas が受理されたか（実行時に standard⇄extended 切替可能） */
+  hdrCapable: boolean;
 }
 
 /**
@@ -53,6 +55,7 @@ export async function initGPUDevice(canvas: HTMLCanvasElement): Promise<GPUDevic
   // 推奨されるフォーマット（通常はRGBA8UnormまたはBGR8Unorm）
   const format = navigator.gpu.getPreferredCanvasFormat();
   let hdr = false;
+  let hdrCapable = false;
 
   // HDR出力の試行: ディスプレイが HDR 対応（dynamic-range: high）か ?hdr=1 強制時。
   // extended が受理されたかは getConfiguration() で確認する（Chrome 131+）。
@@ -74,6 +77,7 @@ export async function initGPUDevice(canvas: HTMLCanvasElement): Promise<GPUDevic
       // getConfiguration 非対応でも ?hdr=1 強制なら extended 受理とみなす
       if (configured === 'extended' || (configured === undefined && hdrParam === '1')) {
         hdr = true;
+        hdrCapable = true;
       }
     } catch (e) {
       console.warn('HDR canvas configure failed, falling back to SDR:', e);
@@ -89,5 +93,5 @@ export async function initGPUDevice(canvas: HTMLCanvasElement): Promise<GPUDevic
     });
   }
 
-  return { device, adapter, format: hdr ? 'rgba16float' : format, hdr };
+  return { device, adapter, format: hdrCapable ? 'rgba16float' : format, hdr, hdrCapable };
 }

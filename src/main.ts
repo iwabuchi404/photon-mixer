@@ -242,12 +242,21 @@ class PhotonMixerApp {
 
     this.renderPipeline = new RenderPipeline(this.renderer);
     await this.renderPipeline.init();
-    // HDR出力（extended canvas が受理された場合のみ ON）
-    this.renderPipeline.setHdrOutput(this.renderer.hdr);
-    if (this.renderer.hdr) {
-      const badge = document.getElementById('hdr-row');
-      if (badge) badge.style.display = 'flex';
-      console.log('HDR output enabled (rgba16float + extended tone mapping)');
+    // HDR出力: extended canvas が受理された場合のみトグルを表示。
+    // 既定は ON（localStorage 'pm.hdrOutput' で前回値を復元）
+    if (this.renderer.hdrCapable) {
+      const row = document.getElementById('hdr-row');
+      if (row) row.style.display = 'flex';
+      const cb = document.getElementById('hdr-output') as HTMLInputElement | null;
+      const on = localStorage.getItem('pm.hdrOutput') !== '0';
+      if (cb) {
+        cb.checked = on;
+        cb.addEventListener('change', () => this.setHdrOutput(cb.checked));
+      }
+      this.setHdrOutput(on);
+      console.log('HDR output capable (rgba16float canvas, extended tone mapping)');
+    } else {
+      this.renderPipeline.setHdrOutput(false);
     }
     // 初期ツールはリボン筆（メインブラシ）
     this.renderPipeline.setRibbonMode(true);
@@ -919,6 +928,23 @@ class PhotonMixerApp {
     if (zoomVal) {
       zoomVal.textContent = Math.round(this.viewport.getTransform().scale * 100).toString();
     }
+  }
+
+  /**
+   * HDR出力の ON/OFF。canvas の format は変えず toneMapping だけ
+   * standard⇄extended を切り替える（パイプライン再生成は不要）。
+   */
+  private setHdrOutput(on: boolean): void {
+    if (!this.renderer?.hdrCapable) return;
+    this.renderer.context.configure({
+      device: this.renderer.device,
+      format: 'rgba16float',
+      alphaMode: 'premultiplied',
+      colorSpace: 'srgb',
+      toneMapping: { mode: on ? 'extended' : 'standard' },
+    });
+    this.renderPipeline?.setHdrOutput(on);
+    localStorage.setItem('pm.hdrOutput', on ? '1' : '0');
   }
 
   /** 現在のビューポート状態をパイプラインへ反映 */

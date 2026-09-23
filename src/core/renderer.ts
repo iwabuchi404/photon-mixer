@@ -12,6 +12,8 @@ export interface Renderer {
   canvas: HTMLCanvasElement;
   /** HDR出力（extended tone mapping）が有効か */
   hdr: boolean;
+  /** extended canvas が受理されたか（UI での ON/OFF 切替が可能） */
+  hdrCapable: boolean;
 }
 
 /**
@@ -27,6 +29,7 @@ export async function initRenderer(canvas: HTMLCanvasElement): Promise<Renderer>
     context,
     canvas,
     hdr: gpu.hdr,
+    hdrCapable: gpu.hdrCapable,
   };
 }
 
