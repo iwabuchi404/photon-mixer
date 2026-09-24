@@ -55,14 +55,14 @@ export class TouchGestureManager {
     if (this.penActive) return; // 描画中の手のひらは無視
     const p = this.pos(e);
     this.pointers.set(e.pointerId, p);
+    if (this.touchDrawEnabled) {
+      this.mode = 'none';
+      if (this.pointers.size > 1) this.pointers.delete(e.pointerId);
+      return;
+    }
     if (this.pointers.size === 1) {
-      if (this.touchDrawEnabled) {
-        // 描画へ譲る（PenInputManager が処理する）
-        this.mode = 'none';
-      } else {
-        this.mode = 'pan';
-        this.lastSingle = { x: p.x, y: p.y };
-      }
+      this.mode = 'pan';
+      this.lastSingle = { x: p.x, y: p.y };
     } else if (this.pointers.size === 2) {
       const pts = [...this.pointers.values()];
       this.pinchDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);

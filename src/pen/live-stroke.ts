@@ -24,6 +24,10 @@ export interface LiveStrokeWindowConfig {
   overlapRawPoints: number;
 }
 
+export interface LiveStrokeBeginOptions {
+  deferFlush: boolean;
+}
+
 export interface LiveStrokeUpdate {
   /** 今回新たに確定し、GPU accumulator と履歴へ追加できる点列。 */
   flushed: PointerPoint[];
@@ -47,6 +51,7 @@ export class LiveStrokeProcessor {
   private lastStabilized: PointerPoint | null = null;
   private tailDistance = 0;
   private active = false;
+  private deferFlush = false;
   /**
    * これまでに排出した補間点列（単調増加・不変）。
    * フラッシュで生入力窓を切り詰めても再計算で書き換えない。
@@ -65,8 +70,9 @@ export class LiveStrokeProcessor {
     this.config = { ...DEFAULT_CONFIG, ...config };
   }
 
-  begin(point: PointerPoint): LiveStrokeUpdate {
+  begin(point: PointerPoint, options: Partial<LiveStrokeBeginOptions> = {}): LiveStrokeUpdate {
     this.reset();
+    this.deferFlush = options.deferFlush ?? false;
     this.active = true;
     this.lastRaw = { ...point };
     const stabilized = this.stabilizer.stabilize(point) ?? point;
@@ -91,7 +97,7 @@ export class LiveStrokeProcessor {
     }
 
     this.emitNew(this.interpolateTail());
-    if (!this.shouldFlush() || this.rawTail.length <= this.config.overlapRawPoints) {
+    if (this.deferFlush || !this.shouldFlush() || this.rawTail.length <= this.config.overlapRawPoints) {
       return { flushed: [], tail: this.displayTail() };
     }
 
@@ -179,6 +185,7 @@ export class LiveStrokeProcessor {
     this.lastRaw = null;
     this.lastStabilized = null;
     this.tailDistance = 0;
+    this.deferFlush = false;
     this.active = false;
     this.emitted = [];
     this.emittedFlushedCount = 0;

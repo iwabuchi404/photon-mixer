@@ -13,14 +13,16 @@ export interface PointerPoint {
   tiltX: number;    // -90 to 90
   tiltY: number;    // -90 to 90
   timestamp: number; // ミリ秒
+  pointerId?: number;
 }
 
 /**
  * ペン入力イベント
  */
 export interface PenInputEvent {
-  type: 'down' | 'move' | 'up';
+  type: 'down' | 'move' | 'up' | 'cancel';
   point: PointerPoint;
+  pointerId: number;
 }
 
 /**
@@ -33,6 +35,7 @@ export type PenInputHandler = (event: PenInputEvent) => void;
  */
 export class PenInputManager {
   private handlers: PenInputHandler[] = [];
+  private activePointerId: number | null = null;
   /** true のときタッチも描画入力として受け付ける（既定 false: 誤操作防止） */
   private touchDrawEnabled = false;
 
@@ -48,29 +51,33 @@ export class PenInputManager {
    * イベントリスナーを設定
    */
   private setupEventListeners(): void {
-    // pointerdown: ペンが触れた
     this.canvas.addEventListener('pointerdown', (e) => {
+      if (e.pointerType === 'touch' && !this.touchDrawEnabled) return;
+      if (this.activePointerId !== null && this.activePointerId !== e.pointerId) return;
+      if (this.activePointerId === null) {
+        this.activePointerId = e.pointerId;
+        try { this.canvas.setPointerCapture(e.pointerId); } catch {}
+      }
       this.handlePointerEvent(e, 'down');
     });
 
-    // pointermove: ペンが動いた
     this.canvas.addEventListener('pointermove', (e) => {
+      if (this.activePointerId !== null && this.activePointerId !== e.pointerId) return;
       this.handlePointerMove(e);
     });
 
-    // pointerup: ペンが離れた
     this.canvas.addEventListener('pointerup', (e) => {
+      if (this.activePointerId !== null && this.activePointerId !== e.pointerId) return;
       this.handlePointerEvent(e, 'up');
+      this.activePointerId = null;
+      try { this.canvas.releasePointerCapture(e.pointerId); } catch {}
     });
 
-    // pointerleave: ペンがキャンバス外に出た
-    this.canvas.addEventListener('pointerleave', (e) => {
-      this.handlePointerEvent(e, 'up');
-    });
-
-    // pointer cancel: 入力がキャンセルされた
     this.canvas.addEventListener('pointercancel', (e) => {
-      this.handlePointerEvent(e, 'up');
+      if (this.activePointerId !== null && this.activePointerId !== e.pointerId) return;
+      this.handlePointerEvent(e, 'cancel');
+      this.activePointerId = null;
+      try { this.canvas.releasePointerCapture(e.pointerId); } catch {}
     });
   }
 
@@ -94,11 +101,8 @@ export class PenInputManager {
   /**
    * ポインターイベントを処理
    */
-  private handlePointerEvent(e: PointerEvent, type: 'down' | 'move' | 'up'): void {
-    // タッチは「タッチで描画」ON のときのみ受け付ける（タブレットでの誤操作防止）
-    if (e.pointerType === 'touch' && !this.touchDrawEnabled) {
-      return;
-    }
+  private handlePointerEvent(e: PointerEvent, type: 'down' | 'move' | 'up' | 'cancel'): void {
+    if (e.pointerType === 'touch' && !this.touchDrawEnabled) return;
 
     // キャンバス上の座標を取得
     const rect = this.canvas.getBoundingClientRect();
@@ -120,14 +124,12 @@ export class PenInputManager {
       pressure,
       tiltX,
       tiltY,
-      // performance.now() で受信時刻を付け直すと、coalesced event が全て同時刻に
-      // なって速度計算が壊れる。ブラウザが各サンプルへ付けた時刻を保持する。
       timestamp: Number.isFinite(e.timeStamp) ? e.timeStamp : performance.now(),
+      pointerId: e.pointerId,
     };
 
-    // ハンドラーを呼び出し
     for (const handler of this.handlers) {
-      handler({ type, point });
+      handler({ type, point, pointerId: e.pointerId });
     }
   }
 

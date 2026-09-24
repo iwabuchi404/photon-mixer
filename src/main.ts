@@ -20,7 +20,7 @@ import { linearToOklab, oklabToLinear, mixOklab } from './color/oklab.js';
 import { BrushPresetManager } from './brush-preset.js';
 import { savePmx, loadPmx } from './pmx.js';
 import { TILE_SIZE } from './render/tile-store.js';
-import { saveAutosave, loadAutosave } from './autosave.js';
+import { saveAutosave, loadAutosave, clearAutosave } from './autosave.js';
 import { ColorPicker } from './ui/color-picker.js';
 import { buildMaskContour } from './selection/mask.js';
 import { createEngineCtx, type EngineCtx } from './ui/engine-ctx.js';
@@ -41,7 +41,21 @@ import type { BrushConfig } from './render/brush.js';
 import type { BrushMixMode } from './render/brush.js';
 import { linearToSrgb } from './color/linear.js';
 
-// Float32 → Float16 (Uint16) 変換
+interface DocumentSnapshot {
+  width: number;
+  height: number;
+  rootNodes: LayerNode[];
+  rootEffects: EffectChainItem[];
+  activeCellId: string;
+  cellData: { cellId: string; tiles: { tx: number; ty: number; data: Uint16Array }[] }[];
+  documentSettings: {
+    view: { viewEV: number; tonemap: TonemapId; viewMode: DisplayModeId };
+    swatches: { r: number; g: number; b: number; a: number }[];
+  };
+}
+
+const MAX_CANVAS_DIMENSION = 8192;
+
 function float32ToFloat16(f: number): number {
   const buf = new ArrayBuffer(4);
   const f32 = new Float32Array(buf);
@@ -192,6 +206,8 @@ class PhotonMixerApp {
 
   // 引きずり混色（progressive）用: pen-down 時の committed スナップショット
   private committedSnapshot: { data: Uint16Array; bytesPerRow: number } | null = null;
+  private operationGeneration = 0;
+  private pmxLoadInProgress = false;
 
   constructor() {
     this.stabilizer = new StabilizationController({
@@ -297,12 +313,16 @@ class PhotonMixerApp {
     const inputH = document.getElementById('canvas-h') as HTMLInputElement;
 
     createBtn.addEventListener('click', () => {
-      const w = parseInt(inputW.value) || 2000;
-      const h = parseInt(inputH.value) || 2000;
-      this.createNewCanvas(w, h);
-      modal.style.display = 'none';
-      this.startRenderLoop();
-      this.startAutosave();
+      try {
+        const w = this.parseCanvasDimension(inputW.value);
+        const h = this.parseCanvasDimension(inputH.value);
+        this.createNewCanvas(w, h);
+        modal.style.display = 'none';
+        this.startRenderLoop();
+        this.startAutosave();
+      } catch (e) {
+        alert((e as Error)?.message ?? 'キャンバスサイズが無効です');
+      }
     });
 
     // Webデモは確認なしで既定キャンバスを開始する（非力環境向けに軽量サイズ）
@@ -325,10 +345,14 @@ class PhotonMixerApp {
           const when = new Date(auto.savedAt).toLocaleString();
           if (confirm(`前回の作業（${when}）が見つかりました。復元しますか？`)) {
             const file = new File([auto.blob], 'autosave.pmx');
-            await this.openPmxFile(file);
-            this.startRenderLoop();
-            this.startAutosave();
-            restored = true;
+            const opened = await this.openPmxFile(file);
+            if (opened) {
+              this.startRenderLoop();
+              this.startAutosave();
+              restored = true;
+            } else {
+              await clearAutosave().catch(() => undefined);
+            }
           }
         }
       } catch (e) {
@@ -376,9 +400,11 @@ class PhotonMixerApp {
 
       // ---- 編集 ----
       case 'edit:undo':
+        this.cancelCurrentInteraction();
         if (this.activeHistory().undo()) this.renderPipeline?.rebakeFromRecords(this.activeHistory().getAllRecords());
         break;
       case 'edit:redo':
+        this.cancelCurrentInteraction();
         if (this.activeHistory().redo()) this.renderPipeline?.rebakeFromRecords(this.activeHistory().getAllRecords());
         break;
       case 'edit:clear-canvas':
@@ -594,8 +620,18 @@ class PhotonMixerApp {
     }, INTERVAL);
   }
 
+  private parseCanvasDimension(value: string): number {
+    const raw = value.trim();
+    const size = raw ? Number(raw) : 2000;
+    if (!Number.isInteger(size) || size < 1 || size > MAX_CANVAS_DIMENSION) {
+      throw new Error(`キャンバスサイズは1〜${MAX_CANVAS_DIMENSION}pxの整数で指定してください`);
+    }
+    return size;
+  }
+
   private createNewCanvas(width: number, height: number): void {
     if (!this.renderPipeline) return;
+    this.cancelCurrentInteraction();
     this.renderPipeline.resizeCanvasSize(width, height);
     this.viewport.reset(width, height, window.innerWidth, window.innerHeight);
     const transform = this.viewport.getTransform();
@@ -741,6 +777,7 @@ class PhotonMixerApp {
           row.appendChild(nameEl);
           row.appendChild(lock);
           row.addEventListener('click', () => {
+            this.cancelCurrentInteraction();
             this.selectedNodeId = node.id;
             this.renderPipeline?.setActiveLayer(node.id);
             this.rebuildLayerPanel();
@@ -891,35 +928,90 @@ class PhotonMixerApp {
     }
   }
 
-  /**
-   * .pmx を読み込んで全レイヤーを復元
-   */
-  private async openPmxFile(file: File): Promise<void> {
-    if (!this.renderPipeline) return;
+  private async captureDocumentSnapshot(): Promise<DocumentSnapshot> {
+    if (!this.renderPipeline) throw new Error('Render pipeline is not initialized');
+    const { width, height } = this.renderPipeline.getCanvasSize();
+    const cellData = await this.renderPipeline.readCellTiles();
+    return {
+      width,
+      height,
+      rootNodes: JSON.parse(JSON.stringify(this.renderPipeline.getRootNodes())) as LayerNode[],
+      rootEffects: JSON.parse(JSON.stringify(this.renderPipeline.getRootEffects())) as EffectChainItem[],
+      activeCellId: this.renderPipeline.getActiveLayerId(),
+      cellData: cellData.map(({ cell, tiles }) => ({
+        cellId: cell.id,
+        tiles: tiles.map((tile) => ({ ...tile, data: tile.data.slice() })),
+      })),
+      documentSettings: {
+        view: this.currentViewSettings(),
+        swatches: this.colorPicker?.getSwatches() ?? [],
+      },
+    };
+  }
+
+  private async restoreDocumentSnapshot(snapshot: DocumentSnapshot): Promise<void> {
+    if (!this.renderPipeline) throw new Error('Render pipeline is not initialized');
+    this.renderPipeline.loadDocument(
+      snapshot.width,
+      snapshot.height,
+      snapshot.rootNodes,
+      snapshot.rootEffects,
+      snapshot.activeCellId,
+    );
+    for (const { cellId, tiles } of snapshot.cellData) {
+      this.renderPipeline.writeCellTiles(cellId, tiles);
+    }
+    this.clearSelectionUI();
+    this.applyViewSettings(snapshot.documentSettings.view);
+    this.colorPicker?.setSwatches(snapshot.documentSettings.swatches as any);
+    this.viewport.reset(snapshot.width, snapshot.height, window.innerWidth, window.innerHeight);
+    const transform = this.viewport.getTransform();
+    this.renderPipeline.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation, transform.flip);
+    this.layerHistories.clear();
+    this.rebuildLayerPanel();
+    this.refreshEffectEdit();
+    this.updateZoomDisplay();
+  }
+
+  private async openPmxFile(file: File): Promise<boolean> {
+    if (!this.renderPipeline || this.pmxLoadInProgress) return false;
+    this.pmxLoadInProgress = true;
+    let previous: DocumentSnapshot | null = null;
     try {
-      const { width, height, activeCellId, rootNodes, rootEffects, cellData, documentSettings } = await loadPmx(file);
+      const loaded = await loadPmx(file);
+      this.cancelCurrentInteraction();
+      previous = await this.captureDocumentSnapshot();
+      const { width, height, activeCellId, rootNodes, rootEffects, cellData, documentSettings } = loaded;
       this.renderPipeline.loadDocument(width, height, rootNodes, rootEffects, activeCellId);
-      // セルのタイルデータを書き込む（v3）
       for (const { cellId, tiles } of cellData) {
         this.renderPipeline.writeCellTiles(cellId, tiles);
       }
-      // View 設定・スウォッチを復元
+      this.clearSelectionUI();
       if (documentSettings) {
         this.applyViewSettings(documentSettings.view);
         this.colorPicker?.setSwatches(documentSettings.swatches as any);
       }
-      // ビューポートを作り直したキャンバスに合わせて再配置
       this.viewport.reset(width, height, window.innerWidth, window.innerHeight);
-      const t = this.viewport.getTransform();
-      this.renderPipeline.updateViewport(t.scale, t.offsetX, t.offsetY, t.rotation, t.flip);
-      // 履歴はピクセルから復元できないためクリア（読込後の Undo は不可）
+      const transform = this.viewport.getTransform();
+      this.renderPipeline.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation, transform.flip);
       this.layerHistories.clear();
       this.rebuildLayerPanel();
       this.refreshEffectEdit();
       this.updateZoomDisplay();
+      return true;
     } catch (e) {
+      if (previous) {
+        try {
+          await this.restoreDocumentSnapshot(previous);
+        } catch (restoreError) {
+          console.error('Failed to restore document after .pmx error:', restoreError);
+        }
+      }
       console.error('Failed to open .pmx:', e);
       alert(`.pmx の読み込みに失敗しました。\n${(e as Error)?.message ?? e}`);
+      return false;
+    } finally {
+      this.pmxLoadInProgress = false;
     }
   }
 
@@ -1010,9 +1102,39 @@ class PhotonMixerApp {
     this.rebuildLayerPanel();
   }
 
+  private cancelCurrentInteraction(): void {
+    this.operationGeneration++;
+    if (this.state.currentTool === 'transform' || this.txStarting || this.txActive) {
+      this.cancelTransformUI();
+    }
+    if (this.state.isDrawing) {
+      this.liveStrokeProcessor.reset();
+      this.renderPipeline?.cancelIncrementalStroke();
+      this.liveStrokePoints = [];
+      this.committedSnapshot = null;
+      this.progressiveStrokeState = null;
+      this.state.isDrawing = false;
+    }
+    this.lineStart = null;
+    this.isSelecting = false;
+    this.selectAnchor = null;
+    this.selectCurrent = null;
+    this.lassoPoints = null;
+    if (this.moveStarting) {
+      this.moveStarting = false;
+      this.renderPipeline?.cancelMove();
+    }
+    if (this.isMoveActive) {
+      this.renderPipeline?.cancelMove();
+      this.isMoveActive = false;
+      this.moveOrigin = null;
+    }
+  }
+
   /** アクティブレイヤーの消去（パネル・メニュー共通。破壊的なので確認する） */
   private clearActiveLayer(): void {
     if (!confirm('アクティブレイヤーの内容をすべて消去します。\n元に戻せません。')) return;
+    this.cancelCurrentInteraction();
     this.renderPipeline?.clear();
     this.activeHistory().clear();
   }
@@ -1106,7 +1228,7 @@ class PhotonMixerApp {
 
     // 筆圧下限：ホバー等の筆圧0（未満）イベントは描画・操作の対象外
     // （マウス/タッチは常に0.5なので影響なし。up は必ず通して終端処理する）
-    if (type !== 'up' && point.pressure < this.minPressure) return;
+    if (type !== 'up' && type !== 'cancel' && point.pressure < this.minPressure) return;
 
     // スクリーン座標 -> キャンバス座標
     const { x, y } = this.viewport.toCanvas(point.x, point.y);
@@ -1114,6 +1236,7 @@ class PhotonMixerApp {
 
     switch (type) {
       case 'down': {
+        this.operationGeneration++;
         if (this.state.currentTool === 'transform') {
           if (this.txStarting || !this.txActive) return; // beginTransform 待ち or 未開始
           const handles = this.getTransformHandles();
@@ -1153,9 +1276,11 @@ class PhotonMixerApp {
         }
         if (this.state.currentTool === 'select') {
           if (this.state.selectMode === 'wand') {
-            // 自動選択：クリック地点の連結同色領域を選択（非同期）
+            const generation = this.operationGeneration;
             this.renderPipeline?.setMagicWandSelection(transformedPoint.x, transformedPoint.y, this.state.bucketTolerance)
-              .then(() => this.refreshSelectionContour());
+              .then(() => {
+                if (generation === this.operationGeneration) this.refreshSelectionContour();
+              });
             return;
           }
           if (this.state.selectMode === 'lasso') {
@@ -1185,7 +1310,8 @@ class PhotonMixerApp {
 
         this.state.isDrawing = true;
         this.liveStrokePoints = [];
-        const initialUpdate = this.liveStrokeProcessor.begin(transformedPoint);
+        const deferFlush = this.postCorrector.getConfig().enabled && !this.usesSmudge();
+        const initialUpdate = this.liveStrokeProcessor.begin(transformedPoint, { deferFlush });
         this.renderPipeline?.beginIncrementalStroke();
 
         // 消しゴムモードならパイプライン切り替え
@@ -1201,7 +1327,9 @@ class PhotonMixerApp {
             prevY: null,
           };
           this.committedSnapshot = null;
+          const generation = this.operationGeneration;
           this.renderPipeline?.requestCommittedSnapshot().then(snap => {
+            if (generation !== this.operationGeneration || !this.state.isDrawing) return;
             this.committedSnapshot = snap;
           });
           this.handleProgressiveUpdate(initialUpdate);
@@ -1290,6 +1418,15 @@ class PhotonMixerApp {
         break;
       }
 
+      case 'cancel': {
+        if (this.state.currentTool === 'transform') {
+          this.cancelTransformUI();
+        } else {
+          this.cancelCurrentInteraction();
+        }
+        return;
+      }
+
       case 'up': {
         if (this.state.currentTool === 'transform') {
           this.txHandleIndex = -1;
@@ -1372,7 +1509,7 @@ class PhotonMixerApp {
         }
 
         const erase = this.state.currentTool === 'eraser';
-        const finishTransform = this.postCorrector.getConfig().enabled
+        const finishTransform = this.postCorrector.getConfig().enabled && !this.usesSmudge()
           ? (points: PointerPoint[]) => this.postCorrector.correct(points)
           : undefined;
         const remaining = this.liveStrokeProcessor.finish(finishTransform);
@@ -1914,17 +2051,9 @@ class PhotonMixerApp {
 
   private setTool(tool: Tool): void {
     const prev = this.state.currentTool;
-    // move ツールから離脱時: キャンセル
-    if (prev === 'move' && tool !== 'move') {
-      if (this.isMoveActive) { this.renderPipeline?.cancelMove(); this.isMoveActive = false; this.moveOrigin = null; }
-      this.moveStarting = false;
-    }
-    // transform ツールから離脱時: キャンセル
-    if (prev === 'transform' && tool !== 'transform') {
-      this.cancelTransformUI();
-    }
-
-    // 離脱するツールの現在値を保存（個別状態の保持）
+    if (prev === tool) return;
+    if (prev === 'transform') this.cancelTransformUI();
+    this.cancelCurrentInteraction();
     this.saveToolSettings(prev);
 
     this.state.currentTool = tool;
@@ -2156,8 +2285,9 @@ class PhotonMixerApp {
 
   private async handleSpoit(x: number, y: number): Promise<void> {
     if (!this.renderPipeline) return;
-    // 仕様: 全レイヤー合成結果の内部リニア値を拾う（表示変換後の色ではない）
+    const generation = this.operationGeneration;
     const snap = await this.renderPipeline.requestCompositeSnapshot();
+    if (generation !== this.operationGeneration) return;
     const { width, height } = this.viewport.getCanvasSize();
     const c = sampleSnapshot(snap.data, x, y, width, height, snap.bytesPerRow);
     // committed はプリマルチプライドαなので straight color に戻す（α=0 は透明＝拾わない）
@@ -2212,9 +2342,11 @@ class PhotonMixerApp {
 
   private async handleBucketFill(x: number, y: number): Promise<void> {
     if (!this.renderPipeline) return;
+    const generation = this.operationGeneration;
+    const snap = await this.renderPipeline.requestCommittedSnapshot();
+    if (generation !== this.operationGeneration) return;
 
     const { width, height } = this.viewport.getCanvasSize();
-    const snap = await this.renderPipeline.requestCommittedSnapshot();
     const data = snap.data;
     const uint16sPerRow = snap.bytesPerRow / 2;
 
@@ -3036,7 +3168,11 @@ class PhotonMixerApp {
     this.drawSelectionOverlay();
   }
 
+  private renderLoopStarted = false;
+
   private startRenderLoop(): void {
+    if (this.renderLoopStarted) return;
+    this.renderLoopStarted = true;
     let lastCleanup = 0;
 
     const frame = (timestamp: number) => {

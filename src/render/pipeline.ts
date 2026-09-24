@@ -279,6 +279,11 @@ export class RenderPipeline {
     }
   }
 
+  private markAllDisplayDirty(): void {
+    const n = this.tileStore.tilesX * this.tileStore.tilesY;
+    for (let i = 0; i < n; i++) this.dirtyDisplay.add(i);
+  }
+
   /** 指定タイルがいずれかのセルに占有されているか */
   private isTileOccupied(index: number): boolean {
     for (const cell of flattenCells(this.rootNodes)) {
@@ -475,6 +480,13 @@ export class RenderPipeline {
     this.invalidate();
   }
 
+  cancelIncrementalStroke(): void {
+    this.currentStroke = [];
+    this.hasStrokeAccum = false;
+    this.strokeAccumBBox = null;
+    this.invalidate();
+  }
+
   /** 残りの末尾を追加し、一筆として committed へ一度だけ合成する。 */
   finishIncrementalStroke(points: StrokePoint[], eraseMode = this.eraseMode): void {
     this.finishIncrementalStrokeToOwner(points, eraseMode, this.activeCellId);
@@ -665,52 +677,63 @@ export class RenderPipeline {
     return this.tilesForBounds(union);
   }
 
-  /**
-   * T2: 層スタックのブレンド op 列を構築する（scissor タイル単位・1submit）。
-   * override 指定時はそのセルのソースを fullscreen テクスチャに差し替える。
-   * 戻り値は op 列とタイル毎の最終バッファ。
-   */
-  private buildStackOps(
+  private composeStackTiles(
     tiles: Set<number>,
     override?: { cellId: string; tex: GPUTexture; tiles: Set<number> },
-  ): { ops: TileBlendOp[]; endsIn: Map<number, GPUTexture>; empty: Set<number> } {
-    const ops: TileBlendOp[] = [];
+  ): { endsIn: Map<number, GPUTexture>; empty: Set<number> } {
     const endsIn = new Map<number, GPUTexture>();
     const empty = new Set<number>();
-    const cells = visibleCells(this.rootNodes);
-    for (const t of tiles) {
-      const r = this.tileStore.tileRect(
-        TileStore.txOf(t, this.tileStore.tilesX), TileStore.tyOf(t, this.tileStore.tilesX),
-      );
-      const scissor = { x: r.x, y: r.y, w: r.w, h: r.h };
-      let dst = this.compA, other = this.compB;
-      let count = 0;
-      for (const cell of cells) {
-        if (cell.opacity <= 0) continue;
-        // override（ライブ・modal プレビュー）は指定タイルだけ fullscreen 差替
-        if (override && cell.id === override.cellId && override.tiles.has(t)) {
-          ops.push({
-            dst, target: other, mode: cell.blendMode, opacity: cell.opacity,
-            tileOx: 0, tileOy: 0, scissor, srcFull: override.tex,
-          });
-          const tmp = dst; dst = other; other = tmp;
-          count++;
-          continue;
-        }
-        if (!this.tileStore.getOccupancy(cell.id).has(t)) continue;
-        const tex = this.tileStore.ensureResidentTile(cell.id, t);
-        if (!tex) continue;
-        ops.push({
-          dst, srcTile: tex, target: other, mode: cell.blendMode, opacity: cell.opacity,
-          tileOx: r.x, tileOy: r.y, scissor,
-        });
-        const tmp = dst; dst = other; other = tmp;
-        count++;
+    const destinations = new Map<number, GPUTexture>();
+    const touched = new Set<number>();
+    for (const t of tiles) destinations.set(t, this.compA);
+    this.clearToBackground(this.compA);
+
+    for (const cell of visibleCells(this.rootNodes)) {
+      if (cell.opacity <= 0) continue;
+      const occupancy = this.tileStore.getOccupancy(cell.id);
+      const hasVisibleEffects = cell.effects.some((effect) => effect.visible);
+      const eligible = new Set<number>(occupancy);
+      if (hasVisibleEffects) {
+        for (const t of this.dilatedTiles(cell.id, this.effectSpreadPx(cell))) eligible.add(t);
       }
-      if (count === 0) { empty.add(t); continue; }
-      endsIn.set(t, count % 2 === 1 ? this.compB : this.compA);
+      if (override && override.cellId === cell.id) {
+        for (const t of override.tiles) eligible.add(t);
+      }
+      const cellTiles = [...eligible].filter((t) => tiles.has(t));
+      if (cellTiles.length === 0) continue;
+
+      const base = override && override.cellId === cell.id
+        ? override.tex
+        : this.ensureComposed(cell.id);
+      const srcFull = hasVisibleEffects
+        ? this.applyCellEffects(cell, base, null)
+        : null;
+      const ops: TileBlendOp[] = [];
+      const next = new Map<number, GPUTexture>();
+      for (const t of cellTiles) {
+        const r = this.tileStore.tileRect(
+          TileStore.txOf(t, this.tileStore.tilesX), TileStore.tyOf(t, this.tileStore.tilesX),
+        );
+        const dst = destinations.get(t)!;
+        const target = dst === this.compA ? this.compB : this.compA;
+        ops.push({
+          dst, target, mode: cell.blendMode, opacity: cell.opacity,
+          tileOx: r.x, tileOy: r.y,
+          scissor: { x: r.x, y: r.y, w: r.w, h: r.h },
+          ...(srcFull ? { srcFull } : { srcTile: this.tileStore.ensureResidentTile(cell.id, t)! }),
+        });
+        next.set(t, target);
+        touched.add(t);
+      }
+      this.blendRenderer.blendTiles(ops);
+      for (const [t, target] of next) destinations.set(t, target);
     }
-    return { ops, endsIn, empty };
+
+    for (const t of tiles) {
+      if (touched.has(t)) endsIn.set(t, destinations.get(t)!);
+      else empty.add(t);
+    }
+    return { endsIn, empty };
   }
 
   /** T2: ダーティタイルの層スタックを baseCache へ再計算する */
@@ -725,10 +748,7 @@ export class RenderPipeline {
     }
     if (tiles.size === 0) return;
     const { device } = this.renderer;
-    this.clearToBackground(this.compA);
-    const { ops, endsIn, empty } = this.buildStackOps(tiles);
-    this.blendRenderer.blendTiles(ops);
-    // 結果を baseCache へ。空タイルは下地コピー
+    const { endsIn, empty } = this.composeStackTiles(tiles);
     const enc = device.createCommandEncoder();
     for (const t of tiles) {
       const r = this.tileStore.tileRect(
@@ -768,46 +788,68 @@ export class RenderPipeline {
     if (tiles.size === 0) return;
     const { device } = this.renderer;
     const chain = this.rootEffects.filter(e => e.visible && e.opacity > 0);
-    // 層スタック（override があれば差替）→ compA/B
-    const { ops, endsIn } = this.buildStackOps(tiles, override);
-    this.blendRenderer.blendTiles(ops);
-    const enc = device.createCommandEncoder();
+    if (!override) {
+      if (chain.length === 0) {
+        const enc = device.createCommandEncoder();
+        for (const t of tiles) {
+          const r = this.tileStore.tileRect(
+            TileStore.txOf(t, this.tileStore.tilesX), TileStore.tyOf(t, this.tileStore.tilesX),
+          );
+          enc.copyTextureToTexture(
+            { texture: this.baseCache, origin: { x: r.x, y: r.y } },
+            { texture: this.displayCache, origin: { x: r.x, y: r.y } },
+            [r.w, r.h],
+          );
+        }
+        device.queue.submit([enc.finish()]);
+      } else {
+        for (const t of tiles) {
+          const r = this.tileStore.tileRect(
+            TileStore.txOf(t, this.tileStore.tilesX), TileStore.tyOf(t, this.tileStore.tilesX),
+          );
+          this.runChainToDisplay(this.baseCache, { x: r.x, y: r.y, w: r.w, h: r.h }, chain);
+        }
+      }
+      return;
+    }
+
+    const { endsIn } = this.composeStackTiles(tiles, override);
+    if (chain.length === 0) {
+      const enc = device.createCommandEncoder();
+      for (const t of tiles) {
+        const r = this.tileStore.tileRect(
+          TileStore.txOf(t, this.tileStore.tilesX), TileStore.tyOf(t, this.tileStore.tilesX),
+        );
+        const stacked = endsIn.get(t);
+        enc.copyTextureToTexture(
+          { texture: stacked ?? this.blankTile, origin: stacked ? { x: r.x, y: r.y } : { x: 0, y: 0 } },
+          { texture: this.displayCache, origin: { x: r.x, y: r.y } },
+          [r.w, r.h],
+        );
+      }
+      device.queue.submit([enc.finish()]);
+      return;
+    }
+
     for (const t of tiles) {
       const r = this.tileStore.tileRect(
         TileStore.txOf(t, this.tileStore.tilesX), TileStore.tyOf(t, this.tileStore.tilesX),
       );
       const scissor = { x: r.x, y: r.y, w: r.w, h: r.h };
-      // override タイルは endsIn がなければ空（override テクスチャ自体が透明）
       const stacked = endsIn.get(t);
       if (!stacked) {
-        if (chain.length === 0) {
-          enc.copyTextureToTexture(
-            { texture: this.blankTile, origin: { x: 0, y: 0 } },
-            { texture: this.displayCache, origin: { x: r.x, y: r.y } },
-            [r.w, r.h],
-          );
-          continue;
-        }
-        // chain 入力は下地。compA の当該矩形へ用意する
-        enc.copyTextureToTexture(
+        const copyEnc = device.createCommandEncoder();
+        copyEnc.copyTextureToTexture(
           { texture: this.blankTile, origin: { x: 0, y: 0 } },
           { texture: this.compA, origin: { x: r.x, y: r.y } },
           [r.w, r.h],
         );
+        device.queue.submit([copyEnc.finish()]);
         this.runChainToDisplay(this.compA, scissor, chain);
-        continue;
-      }
-      if (chain.length === 0) {
-        enc.copyTextureToTexture(
-          { texture: stacked, origin: { x: r.x, y: r.y } },
-          { texture: this.displayCache, origin: { x: r.x, y: r.y } },
-          [r.w, r.h],
-        );
       } else {
         this.runChainToDisplay(stacked, scissor, chain);
       }
     }
-    device.queue.submit([enc.finish()]);
   }
 
   /** 撮影チェーンを baseCache 由来で displayCache の scissor へ流す */
@@ -824,7 +866,7 @@ export class RenderPipeline {
       }
       const dst = i === chain.length - 1 ? this.displayCache : write;
       this.filterRenderer.apply(eff.filterType, eff.params, read, null, dst, eff.opacity, scissor);
-      read = dst === this.displayCache ? dst : write;
+      read = dst;
       if (dst !== this.displayCache) write = write === this.compA ? this.compB : this.compA;
     });
   }
@@ -938,9 +980,10 @@ export class RenderPipeline {
   /** 効果構造変化時の display 汚し（はみ出しを見込んで広めに取る） */
   private markEffectStructureDirty(owner: { kind: 'cell'; cellId: string } | { kind: 'root' }): void {
     if (owner.kind === 'root') {
-      this.markAllOccupiedDisplayDirty();
+      this.markAllDisplayDirty();
     } else {
-      this.markDisplayDirty(this.dilatedTiles(owner.cellId, 128));
+      const cell = findCell(this.rootNodes, owner.cellId);
+      this.markTilesDirty(this.dilatedTiles(owner.cellId, cell ? this.effectSpreadPx(cell) : 0));
     }
   }
 
@@ -970,11 +1013,11 @@ export class RenderPipeline {
     if (found) {
       found.effect.params = { ...found.effect.params, ...params };
       if (found.owner.kind === 'root') {
-        this.markAllOccupiedDisplayDirty();
+        this.markAllDisplayDirty();
       } else {
         const cell = findCell(this.rootNodes, found.owner.cellId);
         const spread = cell ? this.effectSpreadPx(cell) : 0;
-        this.markDisplayDirty(this.dilatedTiles(found.owner.cellId, spread));
+        this.markTilesDirty(this.dilatedTiles(found.owner.cellId, spread));
       }
       this.invalidate();
     }
@@ -986,9 +1029,9 @@ export class RenderPipeline {
     if (found) {
       found.effect.curvePoints = points.map(p => ({ ...p }));
       if (found.owner.kind === 'root') {
-        this.markAllOccupiedDisplayDirty();
+        this.markAllDisplayDirty();
       } else {
-        this.markDisplayDirty(this.dilatedTiles(found.owner.cellId, 0));
+        this.markTilesDirty(this.dilatedTiles(found.owner.cellId, 0));
       }
       this.invalidate();
     }
@@ -1122,10 +1165,12 @@ export class RenderPipeline {
     this.invalidate();
   }
 
+  private modalGeneration = 0;
   // --- 選択範囲（任意形状マスク）---
   private selectionMask: GPUTexture | null = null;
   // 選択マスクの実データ（tight w*h, 0 or 255）。move/transform と輪郭表示が参照する
   private selectionMaskData: Uint8Array | null = null;
+  private selectionGeneration = 0;
   // 選択範囲の bounds（キャンバスピクセル座標）。beginMove/beginTransform が参照する
   private selectionBounds: { lx: number; ty: number; rx: number; by: number } | null = null;
 
@@ -1186,10 +1231,12 @@ export class RenderPipeline {
 
   /** 自動選択（committed の連結同色領域）。tolerance: 0..1（straight color 差） */
   async setMagicWandSelection(x: number, y: number, tolerance: number): Promise<void> {
+    const generation = this.selectionGeneration;
     const w = this.canvasWidth, h = this.canvasHeight;
     const ix = Math.round(x), iy = Math.round(y);
     if (ix < 0 || ix >= w || iy < 0 || iy >= h) return;
     const snap = await this.requestCommittedSnapshot();
+    if (generation !== this.selectionGeneration) return;
     const u16pr = snap.bytesPerRow / 2;
     // committed はプリマルチプライド float16。straight 色に戻してサンプリングする
     const sample = (px: number, py: number) => {
@@ -1212,6 +1259,7 @@ export class RenderPipeline {
   }
 
   clearSelection(): void {
+    this.selectionGeneration++;
     if (this.selectionMask) { this.selectionMask.destroy(); this.selectionMask = null; }
     this.brushRenderer.setSelectionTexture(null);
     this.ribbonRenderer.setSelectionTexture(null);
@@ -1234,8 +1282,9 @@ export class RenderPipeline {
    */
   async beginTransform(): Promise<{ lx: number; ty: number; rx: number; by: number } | null> {
     if (this.txActive) return null;
-
+    const generation = this.modalGeneration;
     const snap = await this.requestCommittedSnapshot();
+    if (generation !== this.modalGeneration) return null;
     this.txSnapshot = snap.data.slice(0);
     const w = this.canvasWidth, h = this.canvasHeight;
     const u16pr = snap.bytesPerRow / 2;
@@ -1376,6 +1425,7 @@ export class RenderPipeline {
 
   /** 変形キャンセル: タイルは触っていないのでプレビューを捨てるだけ */
   cancelTransform(): void {
+    this.modalGeneration++;
     if (!this.txActive || !this.txSnapshot) return;
     this.endPreview();
     // ドラッグ中に preview 由来で再計算した display を戻す
@@ -1413,7 +1463,9 @@ export class RenderPipeline {
   /** 移動開始: アクティブレイヤーの対象領域を切り出し、穴あき版を committed に書き込む */
   async beginMove(): Promise<void> {
     if (this.moveActive) return;
+    const generation = this.modalGeneration;
     const snap = await this.requestCommittedSnapshot();
+    if (generation !== this.modalGeneration) return;
     const w = this.canvasWidth, h = this.canvasHeight;
     const u16pr = snap.bytesPerRow / 2;
 
@@ -1540,6 +1592,7 @@ export class RenderPipeline {
 
   /** 移動キャンセル: タイルは触っていないのでプレビューを捨てるだけ */
   cancelMove(): void {
+    this.modalGeneration++;
     if (!this.moveActive || !this.moveSnapshot) return;
     this.endPreview();
     this.markAllOccupiedDisplayDirty();
@@ -1565,6 +1618,7 @@ export class RenderPipeline {
     const cell = findCell(this.rootNodes, id);
     if (cell) {
       const prev = this.activeCellId;
+      if (prev !== id) this.selectionGeneration++;
       this.activeCellId = id;
       this.repinActive(prev);
     }
@@ -2027,9 +2081,11 @@ export class RenderPipeline {
   }
 
   resizeCanvasSize(w: number, h: number) {
+    this.modalGeneration++;
     // リサイズ前に変形・移動操作があればキャンセル
     if (this.txActive) this.cancelTransform();
     if (this.moveActive) this.cancelMove();
+    this.clearSelection();
     this.brushRenderer.resize(w * 4, h * 4);
     this.ribbonRenderer.resize(w, h);
     this.brushBboxTexture?.destroy();
@@ -2101,7 +2157,15 @@ export class RenderPipeline {
           imageData.data[pxIdx] = 0; imageData.data[pxIdx + 1] = 0;
           imageData.data[pxIdx + 2] = 0; imageData.data[pxIdx + 3] = 0;
         } else {
-          const disp = linearToDisplaySrgb([r / a, g / a, b / a], this.displayExposure, exportTonemap);
+          const straight: [number, number, number] = [r / a, g / a, b / a];
+          let disp: [number, number, number];
+          if (this.displayMode === 'clip') {
+            if (Math.max(straight[0], straight[1], straight[2]) > 1) disp = [1, 0, 0];
+            else if (Math.min(straight[0], straight[1], straight[2]) < 0) disp = [0, 0.3, 1];
+            else disp = linearToDisplaySrgb(straight, this.displayExposure, exportTonemap);
+          } else {
+            disp = linearToDisplaySrgb(straight, this.displayExposure, exportTonemap);
+          }
           imageData.data[pxIdx] = Math.round(disp[0] * 255);
           imageData.data[pxIdx + 1] = Math.round(disp[1] * 255);
           imageData.data[pxIdx + 2] = Math.round(disp[2] * 255);

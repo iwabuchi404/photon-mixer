@@ -153,6 +153,32 @@ describe('ペン入力統合テスト', () => {
       assert.strictEqual(receivedEvent?.point.tiltY, 0);
     });
 
+    test('別pointerIdの同時入力を1ストロークに混在させない', () => {
+      const manager = new PenInputManager(mockCanvas as any);
+      manager.setTouchDrawEnabled(true);
+      const events: any[] = [];
+      manager.onPenInput((event) => events.push(event));
+
+      mockCanvas.emitEvent('pointerdown', new MockPointerEvent('pointerdown', { pointerType: 'touch', pointerId: 1 }));
+      mockCanvas.emitEvent('pointerdown', new MockPointerEvent('pointerdown', { pointerType: 'touch', pointerId: 2 }));
+      mockCanvas.emitEvent('pointerup', new MockPointerEvent('pointerup', { pointerType: 'touch', pointerId: 2 }));
+      mockCanvas.emitEvent('pointerup', new MockPointerEvent('pointerup', { pointerType: 'touch', pointerId: 1 }));
+
+      assert.deepStrictEqual(events.map((event) => event.type), ['down', 'up']);
+      assert.deepStrictEqual(events.map((event) => event.pointerId), [1, 1]);
+    });
+
+    test('pointercancelをupとして確定しない', () => {
+      const manager = new PenInputManager(mockCanvas as any);
+      const events: any[] = [];
+      manager.onPenInput((event) => events.push(event));
+
+      mockCanvas.emitEvent('pointerdown', new MockPointerEvent('pointerdown'));
+      mockCanvas.emitEvent('pointercancel', new MockPointerEvent('pointercancel'));
+
+      assert.deepStrictEqual(events.map((event) => event.type), ['down', 'cancel']);
+    });
+
     test('タッチ入力を除外できる', (t) => {
       const manager = new PenInputManager(mockCanvas as any);
 
@@ -1276,6 +1302,24 @@ describe('ペン入力統合テスト', () => {
       assert.ok(maxBuffered <= 32, `生入力窓が上限を超えない: ${maxBuffered}`);
       assert.ok(tail.length > 0);
       assert.ok(Math.abs(tail[tail.length - 1].x - 10_000) < 0.01, '終端は最後の生入力へ収束する');
+    });
+
+    test('deferFlush時は pen up まで全点保持して後補正できる', () => {
+      const processor = new LiveStrokeProcessor(
+        new Stabilizer({ minAlpha: 1, maxAlpha: 1 }),
+        new Interpolator({ spacing: 1 }),
+        { maxRawPoints: 4, maxDurationMs: 1, maxDistancePx: 1, overlapRawPoints: 1 },
+      );
+
+      processor.begin(point(0, 0), { deferFlush: true });
+      let flushed = 0;
+      for (let i = 1; i <= 100; i++) flushed += processor.add(point(i, i)).flushed.length;
+      const tail = processor.finish();
+
+      assert.strictEqual(flushed, 0);
+      assert.ok(tail.length > 0);
+      assert.ok(Math.abs(tail[0].x) < 0.01);
+      assert.ok(Math.abs(tail[tail.length - 1].x - 100) < 0.01);
     });
 
     test('点数が少なくても時間または距離でフラッシュする', () => {
