@@ -3016,13 +3016,14 @@ class PhotonMixerApp {
       this.setTouchDraw(saved === '1', false);
       return;
     }
-    // 未指定時の既定：精密ポインタ（ペン/マウス）環境はパン、指専用端末は描画
-    let coarseOnly = false;
+    // 未指定時の既定：タッチ可能端末は描画ON。
+    // （スタイラス対応機は pointer:fine も真になり得るため !fine 条件は使わない。
+    //   ペン検出時の自動OFFがあるため、ペン運用への影響は最小）
+    let coarse = false;
     try {
-      coarseOnly = window.matchMedia?.('(pointer: coarse)').matches === true
-        && window.matchMedia?.('(pointer: fine)').matches === false;
+      coarse = window.matchMedia?.('(pointer: coarse)').matches === true;
     } catch { /* ignore */ }
-    this.setTouchDraw(coarseOnly, false);
+    this.setTouchDraw(coarse, false);
   }
 
   /** タッチ描画設定を適用＋チェックボックス反映＋保存 */

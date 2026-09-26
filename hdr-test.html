@@ -41,6 +41,9 @@ put('navigator.gpu', navigator.gpu ? 'あり' : 'なし', !!navigator.gpu);
 put('dynamic-range: high', matchMedia('(dynamic-range: high)').matches ? 'true' : 'false',
     matchMedia('(dynamic-range: high)').matches);
 put('screen', `${screen.width}x${screen.height} @${devicePixelRatio}x`);
+put('pointer: coarse', String(matchMedia('(pointer: coarse)').matches));
+put('pointer: fine', String(matchMedia('(pointer: fine)').matches));
+put('maxTouchPoints', String(navigator.maxTouchPoints));
 put('Chrome', (navigator.userAgent.match(/Chrome\/(\d+)/) || [])[1] || '不明');
 render();
 
