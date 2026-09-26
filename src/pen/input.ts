@@ -39,6 +39,8 @@ export type PenInputHandler = (event: PenInputEvent) => void;
 export class PenInputManager {
   private handlers: PenInputHandler[] = [];
   private activePointerId: number | null = null;
+  /** アクティブストロークの pointerType（ストローク中の touchDraw 切替判定用） */
+  private activePointerType: string | null = null;
   /** true のときタッチも描画入力として受け付ける（既定 false: 誤操作防止） */
   private touchDrawEnabled = false;
   /** 消しゴムスイッチで開始したストローク（up まで有効） */
@@ -53,6 +55,25 @@ export class PenInputManager {
   }
 
   setTouchDrawEnabled(enabled: boolean): void {
+    // OFF 化で進行中のタッチストロークを宙に浮かせない。
+    // そのまま捨てると move/up がフィルタされて isDrawing が残り、
+    // 以後のタッチ入力が一切描けなくなる。直前の位置で 'up' 確定する。
+    if (!enabled && this.activePointerId !== null && this.activePointerType === 'touch') {
+      const pointerId = this.activePointerId;
+      const point = this.lastPoint ?? {
+        x: 0, y: 0, pressure: 0, tiltX: 0, tiltY: 0,
+        timestamp: typeof performance !== 'undefined' ? performance.now() : 0,
+        pointerId,
+      };
+      const eraser = this.strokeEraser;
+      for (const handler of this.handlers) {
+        handler({ type: 'up', point, pointerId, pointerType: 'touch', eraser });
+      }
+      this.activePointerId = null;
+      this.activePointerType = null;
+      this.strokeEraser = false;
+      this.lastPoint = null;
+    }
     this.touchDrawEnabled = enabled;
   }
 
@@ -73,6 +94,7 @@ export class PenInputManager {
       if (this.activePointerId !== null && this.activePointerId !== e.pointerId) return;
       if (this.activePointerId === null) {
         this.activePointerId = e.pointerId;
+        this.activePointerType = e.pointerType;
         this.strokeEraser = e.button === 5;
         try { this.canvas.setPointerCapture(e.pointerId); } catch {}
       }
@@ -91,6 +113,7 @@ export class PenInputManager {
       if (this.activePointerId === null || this.activePointerId !== e.pointerId) return;
       this.handlePointerEvent(e, 'up');
       this.activePointerId = null;
+      this.activePointerType = null;
       this.strokeEraser = false;
       this.lastPoint = null;
       try { this.canvas.releasePointerCapture(e.pointerId); } catch {}
@@ -100,6 +123,7 @@ export class PenInputManager {
       if (this.activePointerId === null || this.activePointerId !== e.pointerId) return;
       this.handlePointerEvent(e, 'cancel');
       this.activePointerId = null;
+      this.activePointerType = null;
       this.strokeEraser = false;
       this.lastPoint = null;
       try { this.canvas.releasePointerCapture(e.pointerId); } catch {}
@@ -111,6 +135,7 @@ export class PenInputManager {
       if (this.activePointerId === null || this.activePointerId !== e.pointerId) return;
       this.handlePointerEvent(e, 'up');
       this.activePointerId = null;
+      this.activePointerType = null;
       this.strokeEraser = false;
       this.lastPoint = null;
     });
@@ -147,6 +172,7 @@ export class PenInputManager {
       handler({ type: 'up', point, pointerId, pointerType: 'pen', eraser });
     }
     this.activePointerId = null;
+    this.activePointerType = null;
     this.strokeEraser = false;
     this.lastPoint = null;
   }

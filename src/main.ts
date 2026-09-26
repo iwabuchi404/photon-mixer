@@ -315,8 +315,10 @@ class PhotonMixerApp {
       zoom: (factor, cx, cy) => this.viewport.zoom(factor, cx, cy),
       sync: () => { this.applyViewport(); this.updateZoomDisplay(); },
       onPenDetected: () => {
-        // ペン初検出でタッチをパンへ自動切替（ユーザーが明示指定済みなら尊重）
-        if (!this.touchDrawExplicit) this.setTouchDraw(false);
+        // ペン初検出でタッチをパンへ自動切替（ユーザーが明示指定済みなら尊重）。
+        // persist=false: 自動切替を保存しない。保存すると一度ペンが触れただけで
+        // 指での描画が恒久的に無効化されてしまう。
+        if (!this.touchDrawExplicit) this.setTouchDraw(false, false);
       },
     });
     this.applyTouchDrawSetting();

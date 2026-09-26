@@ -377,6 +377,31 @@ describe('ペン入力統合テスト', () => {
       assert.strictEqual(calls, 2, 'invalidate後のみ再取得');
     });
 
+    test('ストローク中の touchDraw OFF でタッチストロークが up 確定する', () => {
+      const manager = new PenInputManager(mockCanvas as any);
+      const events: any[] = [];
+      manager.onPenInput((e) => events.push(e));
+      manager.setTouchDrawEnabled(true);
+
+      mockCanvas.emitEvent('pointerdown', new MockPointerEvent('pointerdown', { pointerType: 'touch', pointerId: 11 }));
+      mockCanvas.emitEvent('pointermove', new MockPointerEvent('pointermove', { pointerType: 'touch', pointerId: 11, clientX: 120 }));
+
+      // ストローク中に OFF（ペン検出の自動切替など）→ 直前位置で up 確定し、以後のタッチを捨てる
+      manager.setTouchDrawEnabled(false);
+      mockCanvas.emitEvent('pointermove', new MockPointerEvent('pointermove', { pointerType: 'touch', pointerId: 11, clientX: 130 }));
+      mockCanvas.emitEvent('pointerup', new MockPointerEvent('pointerup', { pointerType: 'touch', pointerId: 11 }));
+
+      assert.deepStrictEqual(events.map((e) => e.type), ['down', 'move', 'up']);
+      assert.strictEqual(events[2].pointerType, 'touch');
+      assert.strictEqual(events[2].point.x, 120, 'up は直前位置で確定');
+
+      // 以後のタッチ pointerdown は描画を開始しない（パン扱い）
+      events.length = 0;
+      mockCanvas.emitEvent('pointerdown', new MockPointerEvent('pointerdown', { pointerType: 'touch', pointerId: 12 }));
+      mockCanvas.emitEvent('pointermove', new MockPointerEvent('pointermove', { pointerType: 'touch', pointerId: 12 }));
+      assert.deepStrictEqual(events.length, 0);
+    });
+
     test('D7: 記録→再生でイベント列が往復する', () => {
       const recorder = new InputRecorder();
       recorder.start();
