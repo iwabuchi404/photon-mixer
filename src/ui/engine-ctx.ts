@@ -15,6 +15,7 @@ import type { Interpolator } from '../pen/interpolation.js';
 import type { RenderPipeline } from '../render/pipeline.js';
 import type { BrushMixMode } from '../render/brush.js';
 import type { LinearColor } from '../color/types.js';
+import type { CurvePoint } from '../color/curve.js';
 
 export type PressureCurve = PressureSizeConfig['curve'];
 
@@ -44,8 +45,10 @@ export interface EngineDeps {
 
 /** パラメータごとの反映メソッド。値域は呼び出し側で正規化済みを前提とする */
 export interface EngineCtx {
-  /** ブラシ径(px)。base は max の約10% */
+  /** ブラシ径(px)。base は maxSize × 最小サイズ比 */
   setSize(px: number): void;
+  /** 最小サイズ（最大径に対する %）。0 で筆圧ゼロ時に線幅ゼロまで落ちる */
+  setMinSize(pct: number): void;
   /** 不透明度 0..1（描画色のα。色自体は共有） */
   setOpacity(a01: number): void;
   /** 筆圧を不透明度へ反映する */
@@ -64,6 +67,8 @@ export interface EngineCtx {
   setMixMode(mode: BrushMixMode): void;
   /** 筆圧カーブ */
   setPressureCurve(curve: PressureCurve): void;
+  /** カスタム筆圧カーブの制御点列 */
+  setCustomPressureCurve(points: CurvePoint[]): void;
   /** テクスチャ繰り返しスケール */
   setTextureScale(x: number): void;
   /** 塗り/自動選択の許容値 0..1 */
@@ -87,9 +92,15 @@ export function createEngineCtx(deps: EngineDeps): EngineCtx {
   return {
     setSize(px) {
       const maxSize = Math.max(1, Math.min(100, Math.round(px)));
-      const baseSize = Math.max(1, Math.round(maxSize * 0.1));
+      // 最小サイズ比（既定10%）をかけて baseSize を求める。0% で完全ヘアライン可
+      const ratio = strokeManager.getPressureConfig().minSizeRatio;
+      const baseSize = Math.max(0, maxSize * ratio);
       strokeManager.updatePressureConfig({ maxSize, baseSize });
       refreshSpacing();
+    },
+    setMinSize(pct) {
+      const ratio = Math.max(0, Math.min(0.5, pct / 100));
+      strokeManager.updatePressureConfig({ minSizeRatio: ratio });
     },
     setOpacity(a01) {
       state.currentColor.a = a01;
@@ -128,6 +139,9 @@ export function createEngineCtx(deps: EngineDeps): EngineCtx {
     },
     setPressureCurve(curve) {
       strokeManager.updatePressureConfig({ curve });
+    },
+    setCustomPressureCurve(points) {
+      strokeManager.updatePressureConfig({ customCurve: points.map(p => ({ ...p })) });
     },
     setTextureScale(x) {
       state.textureScale = x;

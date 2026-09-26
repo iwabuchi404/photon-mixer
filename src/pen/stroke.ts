@@ -4,6 +4,7 @@
  */
 
 import type { PointerPoint } from './input.js';
+import { sampleCurve, type CurvePoint } from '../color/curve.js';
 
 /**
  * ストロークの点（筆圧→サイズ変換済み）
@@ -20,7 +21,14 @@ export interface StrokePoint extends PointerPoint {
 export interface PressureSizeConfig {
   baseSize: number;      // 基本サイズ（pressure=0）
   maxSize: number;       // 最大サイズ（pressure=1）
-  curve: 'linear' | 'ease-in' | 'ease-out' | 'smooth'; // カーブタイプ
+  curve: 'linear' | 'ease-in' | 'ease-out' | 'smooth' | 'custom'; // カーブタイプ
+  /**
+   * 最小サイズ比（0..1）。UI の「最小サイズ %」が maxSize から baseSize を
+   * 求める際の換算率。0 で筆圧ゼロ時に線幅ゼロ（ヘアライン化）まで落ちる。
+   */
+  minSizeRatio: number;
+  /** curve='custom' 時の制御点列（[0,1]²、x昇順）。LUT 化して評価する */
+  customCurve: CurvePoint[];
 }
 
 /**
@@ -30,6 +38,8 @@ const DEFAULT_PRESSURE_CONFIG: PressureSizeConfig = {
   baseSize: 2,      // 最低2px
   maxSize: 20,     // 最大20px
   curve: 'smooth',  // 滑らかなカーブ
+  minSizeRatio: 0.1,
+  customCurve: [{ x: 0, y: 0 }, { x: 1, y: 1 }],
 };
 
 /**
@@ -120,6 +130,16 @@ export class StrokeManager {
         t = pressure * pressure * (3 - 2 * pressure);
         break;
 
+      case 'custom': {
+        // ユーザー編集カーブ。256エントリLUTを線形補間で参照する。
+        const lut = this.getCustomLut();
+        const x = Math.max(0, Math.min(1, pressure)) * 255;
+        const i = Math.floor(x);
+        const f = x - i;
+        t = lut[i] + (lut[Math.min(255, i + 1)] - lut[i]) * f;
+        break;
+      }
+
       default:
         t = pressure;
     }
@@ -132,6 +152,22 @@ export class StrokeManager {
    */
   updatePressureConfig(config: Partial<PressureSizeConfig>): void {
     this.pressureConfig = { ...this.pressureConfig, ...config };
+    // 最小サイズ比の更新だけの場合は baseSize を換算し直す
+    // （baseSize を個別指定した場合はそちらを優先＝従来互換）
+    if (config.minSizeRatio !== undefined && config.baseSize === undefined) {
+      this.pressureConfig.baseSize = this.pressureConfig.maxSize * this.pressureConfig.minSizeRatio;
+    }
+    if (config.customCurve !== undefined) this.customLut = null;
+  }
+
+  /** カスタムカーブ LUT（遅延生成してキャッシュ） */
+  private customLut: number[] | null = null;
+  private getCustomLut(): number[] {
+    if (!this.customLut) {
+      const pts = this.pressureConfig.customCurve;
+      this.customLut = sampleCurve(pts.length >= 2 ? pts : [{ x: 0, y: 0 }, { x: 1, y: 1 }]);
+    }
+    return this.customLut;
   }
 
   /**

@@ -66,6 +66,9 @@ var selection_texture: texture_2d<f32>;
 @group(0) @binding(5)
 var selection_sampler: sampler;
 
+// 幾何を外側へ広げた AA 遷移域（キャンバスpx）。ribbon.ts の RIBBON_AA_PAD と一致させる。
+const AA_PAD_PX = 0.75;
+
 // --- Color Conversion (from color.wgsl / brush.wgsl) ---
 fn linear_to_oklab(c: vec3f) -> vec3f {
   let l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
@@ -122,10 +125,20 @@ fn fragment_main(input: FragmentInput) -> @location(0) vec4<f32> {
 
   let pressure_alpha = select(base_color.a, base_color.a * input.pressure, uniforms.use_pressure_opacity != 0u);
 
-  // SDF カバレッジ: |across| 0=中心 1=輪郭。fwidth で 1px 未満の輪郭も潰れない。
-  let d = abs(input.across);
-  let w = max(fwidth(d) * 1.2, 0.004);
-  let coverage = 1.0 - smoothstep(1.0 - w, 1.0, d);
+  // ピクセル空間 SDF: across は幾何半幅で正規化済み（±1 = 幾何の外縁）。
+  // fwidth(across) = 1px あたりの across 変化量 → 逆数がピクセル単位の幾何半幅。
+  // 幾何は CPU 側で AA_PAD_PX だけ外へ広げてあるので差し引いて実半径を復元する。
+  // 1px 未満の線は幅を 1px に固定し、強度を実線幅比例に下げる（ヘアライン化）。
+  // こうしないとサブピクセル線がフレームごとに点滅・太さムラになる。
+  let fwd = fwidth(input.across);            // 符号付きで取る（abs は中心でカスプを作る）
+  let hw_geom = 1.0 / max(fwd, 1e-4);        // 幾何半幅（px）
+  let dist = abs(input.across) * hw_geom;    // 中心からの距離（px）
+  let hw_draw = hw_geom - AA_PAD_PX;         // 実半径（pad 除去）
+  let edge = max(hw_draw, 0.5);              // 1px 未満は 1px 線として張る
+  var coverage = clamp(edge + 0.5 - dist, 0.0, 1.0);
+  if (hw_draw < 0.5) {
+    coverage *= clamp(hw_draw * 2.0, 0.0, 1.0); // 実線幅（直径）に比例して減光
+  }
   if (coverage <= 0.0005) {
     discard;
   }

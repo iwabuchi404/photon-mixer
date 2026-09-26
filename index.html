@@ -503,6 +503,11 @@
         <input type="number" id="brush-size-num" min="1" max="100" value="20" class="ctrl-num">
         <span class="ctrl-unit">px</span>
       </div>
+      <div class="ctrl-row" data-param="minSize">
+        <span class="ctrl-label">最小サイズ</span>
+        <input type="range" id="brush-min-size" min="0" max="50" value="10">
+        <span id="brush-min-size-val" class="ctrl-val">10</span><span class="ctrl-unit">%</span>
+      </div>
       <div class="ctrl-row" data-param="opacity">
         <span class="ctrl-label">不透明度</span>
         <input type="range" id="brush-alpha" min="1" max="100" value="100">
@@ -543,7 +548,11 @@
           <option value="smooth">標準</option>
           <option value="ease-in">入り遅</option>
           <option value="ease-out">入り早</option>
+          <option value="custom">カスタム</option>
         </select>
+      </div>
+      <div class="ctrl-row" data-param="curve" id="pressure-curve-editor-row" style="display:none;">
+        <div id="pressure-curve-editor" style="flex:1;"></div>
       </div>
       <div class="ctrl-row" data-param="mixMode">
         <span class="ctrl-label">方式</span>

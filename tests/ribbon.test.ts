@@ -5,7 +5,7 @@
 
 import assert from 'node:assert';
 import { test, describe } from 'node:test';
-import { tessellateRibbon } from '../src/render/ribbon.js';
+import { tessellateRibbon, RIBBON_AA_PAD } from '../src/render/ribbon.js';
 import type { StrokePoint } from '../src/pen/stroke.js';
 
 const WHITE = { r: 1, g: 1, b: 1, a: 1 };
@@ -52,10 +52,18 @@ describe('tessellateRibbon', () => {
   test('単点は円盤になる', () => {
     const { data, vertCount } = tessellateRibbon([pt(10, 10), pt(10, 10)], WHITE);
     assert.ok(vertCount > 0 && vertCount % 3 === 0);
-    // 全頂点が半径以内の円盤
+    // 全頂点が半径+AA遷移域以内の円盤（幾何は 0.75px 外側に拡張される）
     for (let i = 0; i < vertCount; i++) {
-      assert.ok(Math.hypot(data[i * 8] - 10, data[i * 8 + 1] - 10) <= 10 + 1e-6);
+      assert.ok(Math.hypot(data[i * 8] - 10, data[i * 8 + 1] - 10) <= 10 + RIBBON_AA_PAD + 1e-6);
     }
+  });
+
+  test('A6: 幾何は AA 遷移域ぶんだけ外側へ拡張される', () => {
+    const { data, vertCount } = tessellateRibbon([pt(0, 0), pt(100, 0)], WHITE);
+    // 上下端は size(=10)+pad まで届く（シェーダー側で pad を引いて実半径に戻す）
+    let maxY = -Infinity;
+    for (let i = 0; i < vertCount; i++) maxY = Math.max(maxY, Math.abs(data[i * 8 + 1]));
+    assert.ok(Math.abs(maxY - (10 + RIBBON_AA_PAD)) < 1e-6, `拡張後の外縁: ${maxY}`);
   });
 
   test('ゆっくり方向転換（密な点列の急旋回）でも筆幅以上に飛び出さない', () => {

@@ -230,6 +230,12 @@ export interface TessellatedStroke {
 
 const RIBBON_CAP_SEGS = 6;
 const RIBBON_JOIN_STEP = Math.PI / 10; // ファン1分割あたり18°
+/**
+ * AA 用にジオメトリを外側へ広げる量（キャンバスpx）。
+ * シェーダーが pad 分を差し引いて実半径を復元し、その内側にソフトエッジを敷く。
+ * ribbon.wgsl の AA_PAD_PX と一致させること。
+ */
+export const RIBBON_AA_PAD = 0.75;
 
 /**
  * 正確サイズ確保済みバッファへの書き込み器。
@@ -286,7 +292,9 @@ export function tessellateRibbon(
     }
     spine.push({
       x: p.x, y: p.y,
-      w: Math.max(p.size, 0.001),
+      // 幾何は AA の遷移域ぶん外側へ広げる。シェーダー側で pad を引いて
+      // 実半径を復元するため、描画される太さは変わらない。
+      w: Math.max(p.size, 0.001) + RIBBON_AA_PAD,
       pressure: p.pressure,
       color: p.color ?? fallbackColor,
     });

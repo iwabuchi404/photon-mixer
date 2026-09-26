@@ -130,6 +130,7 @@ interface ProgressiveStrokeState {
 /** パラメータ → 対応するDOMコントロールのID（値の保存/復元に使う） */
 const PARAM_CONTROLS: Record<ParamKey, { id: string; num?: string; val?: string }> = {
   size:         { id: 'brush-size', num: 'brush-size-num' },
+  minSize:      { id: 'brush-min-size', val: 'brush-min-size-val' },
   opacity:      { id: 'brush-alpha', val: 'brush-alpha-val' },
   pressureOpacity: { id: 'brush-pressure-opacity' },
   wet:          { id: 'brush-wet', val: 'brush-wet-val' },
@@ -175,6 +176,7 @@ class PhotonMixerApp {
   private selectedNodeId: string | null = null;
   // トーンカーブエディタ
   private curveEditor: CurveEditor | null = null;
+  private pressureCurveEditor: CurveEditor | null = null;
   // K3: 表示露出のペン位置 HUD
   private lightHud: LightHud | null = null;
   // K1: 色の光量ウィジェット（描画エリア内）
@@ -1197,8 +1199,8 @@ class PhotonMixerApp {
     const next = Math.max(1, Math.min(100, parseInt(slider.value) + delta));
     slider.value = next.toString();
     num.value = next.toString();
-    const baseSize = Math.max(1, Math.round(next * 0.1));
-    this.strokeManager.updatePressureConfig({ maxSize: next, baseSize });
+    // baseSize は最小サイズ比から engineCtx 側で換算される
+    this.engineCtx.setSize(next);
   }
 
   private isProgressiveMixing(): boolean {
@@ -2196,6 +2198,7 @@ class PhotonMixerApp {
     document.querySelectorAll<HTMLElement>('#tool-panel [data-param]').forEach(row => {
       row.style.display = params.has(row.dataset.param!) ? '' : 'none';
     });
+    this.updatePressureCurveEditorVisibility();
     // テクスチャ操作はブラシのみ
     const tex = document.getElementById('texture-controls');
     if (tex) tex.style.display = tool === 'brush' ? '' : 'none';
@@ -2206,6 +2209,15 @@ class PhotonMixerApp {
       hint.textContent = text ?? '';
       hint.style.display = text ? '' : 'none';
     }
+  }
+
+  /** カスタム筆圧カーブ選択中のみエディタ行を表示する */
+  private updatePressureCurveEditorVisibility(): void {
+    const row = document.getElementById('pressure-curve-editor-row');
+    const sel = document.getElementById('pressure-curve') as HTMLSelectElement | null;
+    if (!row || !sel) return;
+    const toolHasCurve = getToolDef(this.state.currentTool).params.includes('curve');
+    row.style.display = toolHasCurve && sel.value === 'custom' ? '' : 'none';
   }
 
   // ─────────────────────────────── フィルター ───────────────────────────────
@@ -2840,11 +2852,36 @@ class PhotonMixerApp {
     postCorrectSlider?.addEventListener('input', applyPostCorrect);
     applyPostCorrect();
 
-    // 筆圧カーブ
+    // 最小サイズ（筆圧ゼロ時の線幅。0% で完全なヘアラインまで落ちる）
+    const minSizeSlider = document.getElementById('brush-min-size') as HTMLInputElement;
+    const minSizeVal = document.getElementById('brush-min-size-val')!;
+    minSizeSlider?.addEventListener('input', () => {
+      minSizeVal.textContent = minSizeSlider.value;
+      this.engineCtx.setMinSize(parseInt(minSizeSlider.value));
+    });
+
+    // 筆圧カーブ（'custom' 選択時は編集可能なカーブエディタを表示）
     const curveSel = document.getElementById('pressure-curve') as HTMLSelectElement;
     curveSel?.addEventListener('change', () => {
       this.engineCtx.setPressureCurve(curveSel.value as any);
+      this.updatePressureCurveEditorVisibility();
     });
+    const pressureCurveContainer = document.getElementById('pressure-curve-editor');
+    if (pressureCurveContainer) {
+      this.pressureCurveEditor = new CurveEditor(pressureCurveContainer, () => {
+        if (!this.pressureCurveEditor) return;
+        const pts = this.pressureCurveEditor.getPoints();
+        this.engineCtx.setCustomPressureCurve(pts);
+        try { localStorage.setItem('pm-pressure-curve', JSON.stringify(pts)); } catch { /* ignore */ }
+      });
+      // 前回編集したカスタムカーブを復元
+      try {
+        const saved = localStorage.getItem('pm-pressure-curve');
+        if (saved) this.pressureCurveEditor.setPoints(JSON.parse(saved));
+      } catch { /* ignore */ }
+      // エンジン側にも現在のエディタ内容を反映（custom 未選択でも保持しておく）
+      this.engineCtx.setCustomPressureCurve(this.pressureCurveEditor.getPoints());
+    }
 
     // 効果（非破壊エフェクト）を追加するボタン
     document.getElementById('filter-blur')?.addEventListener('click', () => this.addEffect('blur'));

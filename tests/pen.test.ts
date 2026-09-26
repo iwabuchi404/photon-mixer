@@ -1437,6 +1437,53 @@ describe('ペン入力統合テスト', () => {
       manager.clear();
       assert.strictEqual(manager.hasActiveStroke(), false);
     });
+
+    test('A7: 最小サイズ比 0% で筆圧ゼロ時に線幅ゼロになる', () => {
+      const manager = new StrokeManager({ curve: 'linear', maxSize: 20 });
+      manager.updatePressureConfig({ minSizeRatio: 0 });
+      assert.strictEqual(manager.getPressureConfig().baseSize, 0, 'baseSize が 0 に換算される');
+
+      manager.beginStroke();
+      manager.addPoint({ x: 0, y: 0, pressure: 0, tiltX: 0, tiltY: 0, timestamp: 0 });
+      manager.addPoint({ x: 10, y: 0, pressure: 1, tiltX: 0, tiltY: 0, timestamp: 10 });
+      const stroke = manager.getCurrentStroke();
+      assert.strictEqual(stroke[0].size, 0, 'pressure=0 → size 0');
+      assert.strictEqual(stroke[1].size, 20, 'pressure=1 → maxSize');
+    });
+
+    test('A7: 最小サイズ比は最大径に比例する', () => {
+      const manager = new StrokeManager({ curve: 'linear', minSizeRatio: 0.25, maxSize: 40 });
+      manager.updatePressureConfig({ minSizeRatio: 0.25 });
+      assert.strictEqual(manager.getPressureConfig().baseSize, 10);
+      manager.updatePressureConfig({ maxSize: 40 }); // minSizeRatio 未指定 → baseSize 維持
+      assert.strictEqual(manager.getPressureConfig().baseSize, 10);
+    });
+
+    test('A7: カスタムカーブが LUT 評価される', () => {
+      const manager = new StrokeManager({
+        curve: 'custom', baseSize: 0, maxSize: 100,
+        customCurve: [{ x: 0, y: 0 }, { x: 0.5, y: 0.8 }, { x: 1, y: 1 }],
+      });
+      manager.beginStroke();
+      manager.addPoint({ x: 0, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 0 });
+      const stroke = manager.getCurrentStroke();
+      // 制御点 (0.5, 0.8) を通るカーブ → pressure 0.5 で size ≈ 80
+      assert.ok(stroke[0].size > 70 && stroke[0].size < 90, `custom curve: ${stroke[0].size}`);
+    });
+
+    test('A7: カスタムカーブ更新で LUT が再生成される', () => {
+      const manager = new StrokeManager({
+        curve: 'custom', baseSize: 0, maxSize: 100,
+        customCurve: [{ x: 0, y: 0 }, { x: 0.5, y: 0.2 }, { x: 1, y: 1 }],
+      });
+      manager.beginStroke();
+      manager.addPoint({ x: 0, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 0 });
+      const before = manager.getCurrentStroke()[0].size;
+      manager.updatePressureConfig({ customCurve: [{ x: 0, y: 0 }, { x: 0.5, y: 0.9 }, { x: 1, y: 1 }] });
+      manager.addPoint({ x: 0, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 10 });
+      const after = manager.getCurrentStroke()[1].size;
+      assert.ok(after > before + 20, `LUT が更新されるはず: ${before} → ${after}`);
+    });
   });
 
   describe('StrokeHistory', async () => {
