@@ -1123,8 +1123,98 @@ describe('ペン入力統合テスト', () => {
         { x: 40, y: 20, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 60 },
       ];
       const result = interpolator.interpolate(points);
-      assert.ok(result.every(p => p.x >= -0.01 && p.x <= 40.01));
-      assert.ok(result.every(p => p.y >= -0.5 && p.y <= 20.5));
+      // centripetal Catmull-Rom は鋭角で適度に張り出す（〜2px 程度）が
+      // uniform 型のような暴走はしない。発散レベルのオーバーシュートのみ検査。
+      assert.ok(result.every(p => p.x >= -3 && p.x <= 43));
+      assert.ok(result.every(p => p.y >= -2.5 && p.y <= 22.5));
+    });
+
+    // --- A5: 事前折れ線化をやめた補間の回帰テスト ---
+
+    const mkPt = (x: number, y: number, ts: number, pressure = 0.5) =>
+      ({ x, y, pressure, tiltX: 0, tiltY: 0, timestamp: ts });
+
+    test('A5: 排出点間隔は弧長 spacing にほぼ一致する', () => {
+      const interpolator = new Interpolator({ spacing: 2 });
+      const points: any[] = [];
+      for (let i = 0; i <= 20; i++) {
+        points.push(mkPt(i * 10, 50 + Math.sin(i * 0.5) * 15, i * 10));
+      }
+      const out = interpolator.interpolate(points);
+      assert.ok(out.length > 10);
+      const gaps = out.slice(1).map((p, i) =>
+        Math.hypot(p.x - out[i].x, p.y - out[i].y));
+      // 内部の間隔は spacing にほぼ一致（終端は余りなので除外）
+      for (const g of gaps.slice(0, -1)) {
+        assert.ok(g > 1.6 && g < 2.05, `gap should be ~2: ${g}`);
+      }
+    });
+
+    test('A5: 疎な曲線入力は入力折れ線ではなく曲線を描く', () => {
+      const interpolator = new Interpolator({ spacing: 1 });
+      // 半円弧を8分割した疎な入力
+      const points: any[] = [];
+      for (let i = 0; i <= 8; i++) {
+        const a = Math.PI * (i / 8);
+        points.push(mkPt(50 + Math.cos(a) * 40, 50 - Math.sin(a) * 25, i * 20));
+      }
+      const out = interpolator.interpolate(points);
+      // 出力点の入力折れ線からの最大変位 > 0 = 曲線になっている
+      let maxOff = 0;
+      for (const p of out) {
+        let minD = Infinity;
+        for (let i = 1; i < points.length; i++) {
+          const a = points[i - 1], b = points[i];
+          const dx = b.x - a.x, dy = b.y - a.y;
+          const len2 = dx * dx + dy * dy;
+          const t = len2 > 0 ? Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2)) : 0;
+          minD = Math.min(minD, Math.hypot(p.x - (a.x + dx * t), p.y - (a.y + dy * t)));
+        }
+        maxOff = Math.max(maxOff, minD);
+      }
+      assert.ok(maxOff > 0.5, `曲線が折れ線から逸脱する: ${maxOff.toFixed(2)}px`);
+    });
+
+    test('A5: 高密度ノイズ入力でも偏差を増幅しない', () => {
+      const interpolator = new Interpolator({ spacing: 1 });
+      // 240Hz 相当の密入力に ±0.3px の決定論的ノイズ
+      const points: any[] = [];
+      for (let i = 0; i <= 200; i++) {
+        const noise = (((i * 7919) % 13) - 6) / 6 * 0.3;
+        points.push(mkPt(i * 1.5, 200 + noise, i * 4));
+      }
+      const out = interpolator.interpolate(points);
+      // 補間はノイズ除去ではなく滑らかな曲線化なので、
+      // 偏差が生入力の振幅を大きく超えないことを確認する
+      const outMax = Math.max(...out.map((p) => Math.abs(p.y - 200)));
+      const outMean = out.reduce((a, p) => a + Math.abs(p.y - 200), 0) / out.length;
+      const rawMax = Math.max(...points.map((p) => Math.abs(p.y - 200)));
+      const rawMean = points.reduce((a, p) => a + Math.abs(p.y - 200), 0) / points.length;
+      assert.ok(outMax <= rawMax + 0.15, `最大偏差が入力を超えない: ${outMax.toFixed(2)} vs ${rawMax}`);
+      assert.ok(outMean <= rawMean + 0.1, `平均偏差が入力を超えない: ${outMean.toFixed(2)} vs ${rawMean.toFixed(2)}`);
+    });
+
+    test('A5: タイムスタンプは単調非減少を維持する', () => {
+      const interpolator = new Interpolator({ spacing: 1 });
+      const points: any[] = [];
+      for (let i = 0; i <= 50; i++) {
+        points.push(mkPt(i * 3, 100 + Math.sin(i * 0.3) * 20, i * 4));
+      }
+      const out = interpolator.interpolate(points);
+      for (let i = 1; i < out.length; i++) {
+        assert.ok(out[i].timestamp >= out[i - 1].timestamp,
+          `timestamp must be non-decreasing at ${i}`);
+      }
+    });
+
+    test('A5: 始点・終端の位置が入力と一致する', () => {
+      const interpolator = new Interpolator({ spacing: 1 });
+      const points = [mkPt(10, 10, 0), mkPt(50, 40, 30), mkPt(90, 15, 60)];
+      const out = interpolator.interpolate(points);
+      assert.strictEqual(out[0].x, 10);
+      assert.strictEqual(out[0].y, 10);
+      assert.strictEqual(out.at(-1)!.x, 90);
+      assert.strictEqual(out.at(-1)!.y, 15);
     });
   });
 

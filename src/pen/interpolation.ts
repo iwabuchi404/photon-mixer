@@ -10,7 +10,11 @@ import type { PointerPoint } from './input.js';
 export interface InterpolationConfig {
   /** 最終的な描画点の目標間隔（px） */
   spacing: number;
-  /** Catmull-Romへ渡す制御点を揃える間隔（px） */
+  /**
+   * 弧長リサンプリングの間隔（px）。
+   * interpolate() では生点をそのまま制御点に使うため使われない。
+   * PostCorrector の事前間引き（resampleByArcLength の既定値）として残す。
+   */
   inputSpacing: number;
   /** 高速先端予測を行う速度閾値（px/sec） */
   speedThreshold: number;
@@ -22,6 +26,9 @@ const DEFAULT_CONFIG: InterpolationConfig = {
   speedThreshold: 2000,
 };
 
+/** 補間へ通す前に間引く最小間隔（px）。240Hz 入力の静止重複点を除去する */
+const THIN_PX = 0.5;
+
 export class Interpolator {
   private config: InterpolationConfig;
 
@@ -30,7 +37,12 @@ export class Interpolator {
   }
 
   /**
-   * 点列を一定弧長へ揃えてからcentripetal Catmull-Romで補間する。
+   * 生点列へ centripetal Catmull-Rom を直接掛け、弧長 spacing で排出する。
+   *
+   * 事前の折れ線リサンプル（resampleByArcLength）は行わない。
+   * 折れ線上に載った制御点を補間すると結果が事実上の区分線形になり、
+   * 曲線の滑らかさが失われるため。centripetal パラメータ化は
+   * 不均一な点間隔をそのまま扱える。
    *
    * predict=true は将来の「末尾1区間だけ仮描画」用。現在のライブ描画では
    * ストローク全体を再描画するため、呼び出し側はfalseのまま使用する。
@@ -38,8 +50,9 @@ export class Interpolator {
   interpolate(points: PointerPoint[], predict = false): PointerPoint[] {
     if (points.length < 2) return points.map(p => ({ ...p }));
 
-    const source = points.map(p => ({ ...p }));
-    if (predict) {
+    // 密な生点（ほぼ同一位置の重複サンプル）を間引く
+    const source = this.thinPoints(points, THIN_PX);
+    if (predict && source.length >= 2) {
       const last = source[source.length - 1];
       const prev = source[source.length - 2];
       if (this.calculateVelocity(prev, last) > this.config.speedThreshold) {
@@ -47,27 +60,118 @@ export class Interpolator {
         if (predicted) source.push(predicted);
       }
     }
+    if (source.length < 2) return source;
 
-    const controls = this.resampleByArcLength(source, this.config.inputSpacing);
-    if (controls.length < 2) return controls;
-
-    const result: PointerPoint[] = [{ ...controls[0] }];
-    for (let i = 0; i < controls.length - 1; i++) {
-      const p1 = controls[i];
-      const p2 = controls[i + 1];
+    const result: PointerPoint[] = [{ ...source[0] }];
+    let carry = 0; // 前回排出点からの弧長の積算
+    for (let i = 0; i < source.length - 1; i++) {
+      const p1 = source[i];
+      const p2 = source[i + 1];
       const p0 = i > 0
-        ? controls[i - 1]
+        ? source[i - 1]
         : this.extrapolateEndpoint(p1, p2);
-      const p3 = i + 2 < controls.length
-        ? controls[i + 2]
+      const p3 = i + 2 < source.length
+        ? source[i + 2]
         : this.extrapolateEndpoint(p2, p1);
-
-      const segment = this.interpolateSegment(p0, p1, p2, p3);
-      result.push(...segment.slice(1));
+      carry = this.emitSegmentByArcLength(p0, p1, p2, p3, result, carry);
     }
 
     // 浮動小数誤差が累積しても、確定ストロークの終端は入力終端と一致させる。
-    result[result.length - 1] = { ...source[source.length - 1] };
+    const end = source[source.length - 1];
+    const lastOut = result[result.length - 1];
+    if (Math.hypot(end.x - lastOut.x, end.y - lastOut.y) <= Math.max(this.config.spacing, 1e-3)) {
+      result[result.length - 1] = { ...end };
+    } else {
+      result.push({ ...end });
+    }
+    return result;
+  }
+
+  /**
+   * 1区間の centripetal Catmull-Rom 曲線を密にサンプルして弧長を測り、
+   * spacing 間隔ごとに排出点を打つ。区間をまたぐ余り距離は carry で持ち越し、
+   * ストローク全体で均一な弧長間隔になる。
+   * 戻り値は次区間へ持ち越す余り距離。
+   */
+  private emitSegmentByArcLength(
+    p0: PointerPoint,
+    p1: PointerPoint,
+    p2: PointerPoint,
+    p3: PointerPoint,
+    out: PointerPoint[],
+    carry: number,
+  ): number {
+    const t0 = 0;
+    const t1 = t0 + this.knotInterval(p0, p1);
+    const t2 = t1 + this.knotInterval(p1, p2);
+    const t3 = t2 + this.knotInterval(p2, p3);
+    const spacing = Math.max(this.config.spacing, 0.01);
+
+    const posAt = (u: number) =>
+      this.centripetalPosition(p0, p1, p2, p3, t0, t1, t2, t3, t1 + (t2 - t1) * u);
+
+    // 粗く弧長を見積もって密サンプル数を決める（排出点あたり4点以上）
+    const COARSE = 8;
+    let prev = posAt(0);
+    let arcLen = 0;
+    for (let j = 1; j <= COARSE; j++) {
+      const pos = posAt(j / COARSE);
+      arcLen += Math.hypot(pos.x - prev.x, pos.y - prev.y);
+      prev = pos;
+    }
+    if (arcLen <= 1e-9) return carry;
+
+    const fine = Math.min(256, Math.max(8, Math.ceil((arcLen / spacing) * 4)));
+    let dist = carry;
+    prev = posAt(0);
+    for (let j = 1; j <= fine; j++) {
+      const u = j / fine;
+      const pos = posAt(u);
+      let segD = Math.hypot(pos.x - prev.x, pos.y - prev.y);
+      let ax = prev.x;
+      let ay = prev.y;
+      let u0 = (j - 1) / fine;
+      while (segD > 1e-9 && dist + segD >= spacing) {
+        const need = spacing - dist;
+        const frac = need / segD;
+        const ex = ax + (pos.x - ax) * frac;
+        const ey = ay + (pos.y - ay) * frac;
+        const uEff = u0 + frac * (u - u0);
+        out.push({
+          x: ex,
+          y: ey,
+          pressure: this.lerp(p1.pressure, p2.pressure, uEff),
+          tiltX: this.lerp(p1.tiltX, p2.tiltX, uEff),
+          tiltY: this.lerp(p1.tiltY, p2.tiltY, uEff),
+          timestamp: this.lerp(p1.timestamp, p2.timestamp, uEff),
+        });
+        ax = ex;
+        ay = ey;
+        u0 = uEff;
+        segD -= need;
+        dist = 0;
+      }
+      dist += segD;
+      prev = pos;
+    }
+    return dist;
+  }
+
+  /**
+   * ほぼ同一位置の連続点を間引く。最後の生点は位置・属性を正確に保つ
+   * （離筆時の筆圧・時刻が終端処理で使われるため）。
+   */
+  private thinPoints(points: PointerPoint[], minDist: number): PointerPoint[] {
+    const result: PointerPoint[] = [{ ...points[0] }];
+    for (let i = 1; i < points.length; i++) {
+      const p = points[i];
+      const last = result[result.length - 1];
+      if (Math.hypot(p.x - last.x, p.y - last.y) < minDist) {
+        if (i === points.length - 1) result[result.length - 1] = { ...p };
+        continue;
+      }
+      result.push({ ...p });
+    }
     return result;
   }
 
@@ -115,37 +219,6 @@ export class Interpolator {
       result.push({ ...end });
     } else {
       result[result.length - 1] = { ...end };
-    }
-    return result;
-  }
-
-  private interpolateSegment(
-    p0: PointerPoint,
-    p1: PointerPoint,
-    p2: PointerPoint,
-    p3: PointerPoint,
-  ): PointerPoint[] {
-    const chord = Math.hypot(p2.x - p1.x, p2.y - p1.y);
-    const numPoints = Math.max(1, Math.ceil(chord / Math.max(this.config.spacing, 0.01)));
-    const result: PointerPoint[] = [];
-
-    const t0 = 0;
-    const t1 = t0 + this.knotInterval(p0, p1);
-    const t2 = t1 + this.knotInterval(p1, p2);
-    const t3 = t2 + this.knotInterval(p2, p3);
-
-    for (let i = 0; i <= numPoints; i++) {
-      const u = i / numPoints;
-      const t = t1 + (t2 - t1) * u;
-      const { x, y } = this.centripetalPosition(p0, p1, p2, p3, t0, t1, t2, t3, t);
-      result.push({
-        x,
-        y,
-        pressure: this.lerp(p1.pressure, p2.pressure, u),
-        tiltX: this.lerp(p1.tiltX, p2.tiltX, u),
-        tiltY: this.lerp(p1.tiltY, p2.tiltY, u),
-        timestamp: this.lerp(p1.timestamp, p2.timestamp, u),
-      });
     }
     return result;
   }
