@@ -4,6 +4,7 @@
 
 import { initRenderer } from './core/renderer.js';
 import { PenInputManager } from './pen/input.js';
+import { InputRecorder, replayRecording } from './pen/input-recorder.js';
 import { TouchGestureManager } from './pen/touch-gestures.js';
 import { StabilizationController } from './pen/stabilization-mode.js';
 import { Interpolator } from './pen/interpolation.js';
@@ -150,6 +151,7 @@ const TOOL_HINTS: Partial<Record<Tool, string>> = {
 class PhotonMixerApp {
   private renderer: Awaited<ReturnType<typeof initRenderer>> | null = null;
   private penInput: PenInputManager | null = null;
+  private inputRecorder = new InputRecorder();
   private touchGestures: TouchGestureManager | null = null;
   private stabilizer: StabilizationController;
   private interpolator: Interpolator;
@@ -278,6 +280,27 @@ class PhotonMixerApp {
     this.renderPipeline.setRibbonMode(true);
     // 診断フック: タイル統計（verify 用。製品動作に影響なし）
     (window as any).__tileStats = () => this.renderPipeline?.tileStats() ?? null;
+    // 診断フック: 入力記録/再生（D7。実機の生サンプルをJSONで取得・再現する）
+    (window as any).__pmxInput = {
+      start: () => this.inputRecorder.start(),
+      /** 記録を停止して JSON 文字列を返す（download=true でファイル保存） */
+      stop: (download = false) => {
+        const rec = this.inputRecorder.stop();
+        if (download) {
+          const url = URL.createObjectURL(new Blob([JSON.stringify(rec)], { type: 'application/json' }));
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `pmx-input_${Date.now()}.json`;
+          a.click();
+          URL.revokeObjectURL(url);
+        }
+        return rec;
+      },
+      recording: () => this.inputRecorder.recording,
+      /** 記録 JSON を入力パイプラインへ再生する */
+      replay: (rec: Parameters<typeof replayRecording>[0]) =>
+        replayRecording(rec, (ev) => this.handlePenInput(ev)),
+    };
     // 混色方式の初期値をエンジンへ明示的に反映（UI表示・state・GPU の三者統一）
     this.renderPipeline.updateBrushConfig({ mixMode: this.state.mixMode });
 
@@ -1222,13 +1245,16 @@ class PhotonMixerApp {
   private selectionSegments: number[] | null = null;
 
   private handlePenInput(event: import('./pen/input.js').PenInputEvent): void {
+    // D7: フィルタ適用前の生イベントを記録（実機データの再現用）
+    this.inputRecorder.record(event);
+
     if (this.state.isPanning) return;
 
     const { type, point } = event;
 
-    // 筆圧下限：ホバー等の筆圧0（未満）イベントは描画・操作の対象外
-    // （マウス/タッチは常に0.5なので影響なし。up は必ず通して終端処理する）
-    if (type !== 'up' && type !== 'cancel' && point.pressure < this.minPressure) return;
+    // 筆圧下限：ホバー等の低筆圧イベントでは描画を開始しない
+    // （描画中のサンプルは捨てない。線の途中の弱筆圧で区間が抜けるのを防ぐ）
+    if (type === 'down' && point.pressure < this.minPressure) return;
 
     // スクリーン座標 -> キャンバス座標
     const { x, y } = this.viewport.toCanvas(point.x, point.y);
@@ -1314,8 +1340,8 @@ class PhotonMixerApp {
         const initialUpdate = this.liveStrokeProcessor.begin(transformedPoint, { deferFlush });
         this.renderPipeline?.beginIncrementalStroke();
 
-        // 消しゴムモードならパイプライン切り替え
-        this.renderPipeline?.setEraseMode(this.state.currentTool === 'eraser');
+        // 消しゴムモードならパイプライン切り替え（消しゴムスイッチ開始のストロークも含む）
+        this.renderPipeline?.setEraseMode(this.state.currentTool === 'eraser' || event.eraser);
 
         if (this.usesSmudge()) {
           // 点ごとの色を使うモードに切り替えてスナップショットを非同期取得
@@ -1508,7 +1534,7 @@ class PhotonMixerApp {
           else this.handleStampUpdate(update);
         }
 
-        const erase = this.state.currentTool === 'eraser';
+        const erase = this.state.currentTool === 'eraser' || event.eraser;
         const finishTransform = this.postCorrector.getConfig().enabled && !this.usesSmudge()
           ? (points: PointerPoint[]) => this.postCorrector.correct(points)
           : undefined;
@@ -1741,12 +1767,24 @@ class PhotonMixerApp {
       }
     });
 
+    // フォーカス喪失で keyup が取りこぼされても修飾状態が残らないようにする
+    window.addEventListener('blur', () => {
+      this.state.isPanning = false;
+      this.shiftDown = false;
+      if (this.prevTool) {
+        this.setTool(this.prevTool);
+        this.prevTool = null;
+      }
+      this.applyToolCursor();
+    });
+
     canvas.addEventListener('mousedown', (e) => {
       lastX = e.clientX;
       lastY = e.clientY;
     });
 
-    window.addEventListener('mousemove', (e) => {
+    // pointermove で追従（ペンにも反応する。mousemove はペンを拾わない環境がある）
+    window.addEventListener('pointermove', (e) => {
       if (this.state.isPanning && (e.buttons & 1 || e.buttons & 4)) {
         const dx = e.clientX - lastX;
         const dy = e.clientY - lastY;
@@ -1761,16 +1799,31 @@ class PhotonMixerApp {
     });
 
     // カーソルがウィンドウ外/UI上に出たら隠す
-    window.addEventListener('mouseout', () => this.updateBrushCursor(0, 0, false));
+    window.addEventListener('pointerout', () => this.updateBrushCursor(0, 0, false));
   }
 
   /**
-   * ブラシカーソル（円）を画面位置に追従させる
-   * 半径 = ブラシ径 × ズーム倍率（画面上の実寸）
+   * ブラシカーソル（円）の追従位置を記録し、rAF で実際の DOM 更新を行う。
+   * イベントごとの style 書き換え（レイアウト再計算）を避けるため。
+   * size は半径（シェーダーの定義）なので直径は 2 × size × ズーム倍率。
    */
+  private cursorPos = { x: 0, y: 0, visible: false };
+  private cursorRaf = 0;
+  private cursorDiameter = 0;
+
   private updateBrushCursor(sx: number, sy: number, visible: boolean): void {
+    this.cursorPos = { x: sx, y: sy, visible };
+    if (this.cursorRaf) return;
+    this.cursorRaf = requestAnimationFrame(() => {
+      this.cursorRaf = 0;
+      this.flushBrushCursor();
+    });
+  }
+
+  private flushBrushCursor(): void {
     const el = document.getElementById('brush-cursor');
     if (!el) return;
+    const { x, y, visible } = this.cursorPos;
     // パン中やスポイト/バケツ時は非表示（描画系ツールのみ表示）
     const drawing = this.state.currentTool === 'ribbon' || this.state.currentTool === 'brush' || this.state.currentTool === 'eraser';
     if (!visible || this.state.isPanning || !drawing) {
@@ -1778,11 +1831,15 @@ class PhotonMixerApp {
       return;
     }
     const size = this.strokeManager.getPressureConfig().maxSize;
-    const diameter = size * this.viewport.getTransform().scale;
-    el.style.width = `${diameter}px`;
-    el.style.height = `${diameter}px`;
-    el.style.left = `${sx}px`;
-    el.style.top = `${sy}px`;
+    const diameter = size * 2 * this.viewport.getTransform().scale;
+    if (diameter !== this.cursorDiameter) {
+      this.cursorDiameter = diameter;
+      el.style.width = `${diameter}px`;
+      el.style.height = `${diameter}px`;
+    }
+    el.style.left = '0';
+    el.style.top = '0';
+    el.style.transform = `translate(${x}px, ${y}px) translate(-50%, -50%)`;
     el.style.display = 'block';
   }
 

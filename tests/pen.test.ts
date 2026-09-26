@@ -204,6 +204,7 @@ describe('ペン入力統合テスト', () => {
         receivedPoint = event.point;
       });
 
+      mockCanvas.emitEvent('pointerdown', new MockPointerEvent('pointerdown', { pointerType: 'mouse' }));
       const mouseEvent = new MockPointerEvent('pointermove', {
         pointerType: 'mouse',
         clientX: 300,
@@ -225,6 +226,7 @@ describe('ペン入力統合テスト', () => {
         receivedPoint = event.point;
       });
 
+      mockCanvas.emitEvent('pointerdown', new MockPointerEvent('pointerdown', { pointerType: 'pen' }));
       const penEvent = new MockPointerEvent('pointermove', {
         pointerType: 'pen',
         tiltX: 30,
@@ -242,8 +244,9 @@ describe('ペン入力統合テスト', () => {
     test('coalesced eventの全点を時刻順に取り込む', () => {
       const manager = new PenInputManager(mockCanvas as any);
       const received: any[] = [];
-      manager.onPenInput(event => received.push(event.point));
+      manager.onPenInput(event => { if (event.type === 'move') received.push(event.point); });
 
+      mockCanvas.emitEvent('pointerdown', new MockPointerEvent('pointerdown'));
       const samples = [
         new MockPointerEvent('pointermove', { clientX: 101.25, clientY: 201, timeStamp: 10, pressure: 0.2 }),
         new MockPointerEvent('pointermove', { clientX: 102.5, clientY: 202, timeStamp: 12, pressure: 0.4 }),
@@ -287,6 +290,117 @@ describe('ペン入力統合テスト', () => {
 
       mockCanvas.emitEvent('pointerdown', new MockPointerEvent('pointerdown'));
       assert.strictEqual(callCount, 1, 'クリア後はハンドラーが呼ばれない');
+    });
+  });
+
+  describe('C系修正（入力頑健性）', async () => {
+    const { PenInputManager } = await import('../src/pen/input.js');
+    const { InputRecorder, recordingToEvents } = await import('../src/pen/input-recorder.js');
+
+    test('C1: 副ボタン(2)では描画を開始しない', () => {
+      const manager = new PenInputManager(mockCanvas as any);
+      const events: any[] = [];
+      manager.onPenInput((event) => events.push(event));
+
+      mockCanvas.emitEvent('pointerdown', new MockPointerEvent('pointerdown', { button: 2 }));
+      mockCanvas.emitEvent('pointermove', new MockPointerEvent('pointermove'));
+      mockCanvas.emitEvent('pointerup', new MockPointerEvent('pointerup', { button: 2 }));
+
+      assert.deepStrictEqual(events.map((e) => e.type), []);
+    });
+
+    test('C1: 消しゴムスイッチ(button5)はeraserフラグ付きで開始される', () => {
+      const manager = new PenInputManager(mockCanvas as any);
+      const events: any[] = [];
+      manager.onPenInput((event) => events.push(event));
+
+      mockCanvas.emitEvent('pointerdown', new MockPointerEvent('pointerdown', { button: 5 }));
+      mockCanvas.emitEvent('pointermove', new MockPointerEvent('pointermove', { clientX: 110 }));
+      mockCanvas.emitEvent('pointerup', new MockPointerEvent('pointerup', { button: 5 }));
+
+      assert.deepStrictEqual(events.map((e) => e.type), ['down', 'move', 'up']);
+      assert.deepStrictEqual(events.map((e) => e.eraser), [true, true, true]);
+
+      // 次のストロークは通常描画に戻る
+      events.length = 0;
+      mockCanvas.emitEvent('pointerdown', new MockPointerEvent('pointerdown', { button: 0 }));
+      mockCanvas.emitEvent('pointerup', new MockPointerEvent('pointerup', { button: 0 }));
+      assert.deepStrictEqual(events.map((e) => e.eraser), [false, false]);
+    });
+
+    test('C2: lostpointercapture でアクティブストロークがupとして確定する', () => {
+      const manager = new PenInputManager(mockCanvas as any);
+      const events: any[] = [];
+      manager.onPenInput((event) => events.push(event));
+
+      mockCanvas.emitEvent('pointerdown', new MockPointerEvent('pointerdown', { pointerId: 7 }));
+      mockCanvas.emitEvent('pointermove', new MockPointerEvent('pointermove', { pointerId: 7, clientX: 120 }));
+      mockCanvas.emitEvent('lostpointercapture', new MockPointerEvent('lostpointercapture', { pointerId: 7 }));
+
+      assert.deepStrictEqual(events.map((e) => e.type), ['down', 'move', 'up']);
+
+      // 既に解放済みの後の lostpointercapture は何もしない
+      events.length = 0;
+      mockCanvas.emitEvent('lostpointercapture', new MockPointerEvent('lostpointercapture', { pointerId: 7 }));
+      assert.strictEqual(events.length, 0);
+    });
+
+    test('C4: upイベントの筆圧は直前の点を継承する（筆圧0の点を追加しない）', () => {
+      const manager = new PenInputManager(mockCanvas as any);
+      const events: any[] = [];
+      manager.onPenInput((event) => events.push(event));
+
+      mockCanvas.emitEvent('pointerdown', new MockPointerEvent('pointerdown', { pressure: 0.8 }));
+      mockCanvas.emitEvent('pointermove', new MockPointerEvent('pointermove', { pressure: 0.6, clientX: 110 }));
+      // 実機では離筆時に pressure=0 の up が来る
+      mockCanvas.emitEvent('pointerup', new MockPointerEvent('pointerup', { pressure: 0 }));
+
+      assert.deepStrictEqual(events.map((e) => e.type), ['down', 'move', 'up']);
+      assert.strictEqual(events[2].point.pressure, 0.6, 'up 点は直前の筆圧を継承する');
+    });
+
+    test('C6: rectをサンプルごとに再取得しない', () => {
+      let calls = 0;
+      const orig = mockCanvas.getBoundingClientRect.bind(mockCanvas);
+      (mockCanvas as any).getBoundingClientRect = () => { calls++; return orig(); };
+
+      const manager = new PenInputManager(mockCanvas as any);
+      manager.onPenInput(() => {});
+
+      mockCanvas.emitEvent('pointerdown', new MockPointerEvent('pointerdown'));
+      mockCanvas.emitEvent('pointermove', new MockPointerEvent('pointermove', { clientX: 101 }));
+      mockCanvas.emitEvent('pointermove', new MockPointerEvent('pointermove', { clientX: 102 }));
+      assert.strictEqual(calls, 1, 'rect はキャッシュされる');
+
+      manager.invalidateRect();
+      mockCanvas.emitEvent('pointermove', new MockPointerEvent('pointermove', { clientX: 103 }));
+      assert.strictEqual(calls, 2, 'invalidate後のみ再取得');
+    });
+
+    test('D7: 記録→再生でイベント列が往復する', () => {
+      const recorder = new InputRecorder();
+      recorder.start();
+      const mk = (type: any, t: number, x: number) => ({
+        type, pointerId: 1, pointerType: 'pen', eraser: false,
+        point: { x, y: 50, pressure: 0.7, tiltX: 10, tiltY: -5, timestamp: t, pointerId: 1 },
+      });
+      recorder.record(mk('down', 1000, 10) as any);
+      recorder.record(mk('move', 1016, 20) as any);
+      recorder.record(mk('up', 1032, 30) as any);
+      const rec = recorder.stop();
+
+      assert.strictEqual(rec.version, 1);
+      assert.strictEqual(rec.events.length, 3);
+      assert.strictEqual(rec.events[0].t, 0);
+      assert.strictEqual(rec.events[2].t, 32);
+
+      const evs = recordingToEvents(rec);
+      assert.strictEqual(evs.length, 3);
+      assert.strictEqual(evs[0].type, 'down');
+      assert.strictEqual(evs[1].point.x, 20);
+      assert.strictEqual(evs[1].point.tiltX, 10);
+      assert.strictEqual(evs[1].point.timestamp, 16);
+      assert.strictEqual(evs[2].type, 'up');
     });
   });
 
