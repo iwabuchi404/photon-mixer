@@ -35,7 +35,14 @@ export class Stabilizer {
   /** 平滑化済み筆圧の直前値。 */
   private lastPressure: number | null = null;
   private lastVelocity: number = 0;
+  /** 直近の生入力履歴（速度の窓推定用。1サンプルの速度は高周波でノイズまみれ） */
+  private rawHistory: { x: number; y: number; t: number }[] = [];
+  /** 表示スケール（画面px/キャンバスpx）。threshold は画面上の見た目速度基準 */
+  private viewScale = 1;
   private static readonly NOMINAL_INTERVAL_MS = 1000 / 120;
+  /** 速度推定の時間窓（ms） */
+  private static readonly VELOCITY_WINDOW_MS = 16;
+  private static readonly MAX_HISTORY = 64;
 
   constructor(config: Partial<StabilizationConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -50,11 +57,15 @@ export class Stabilizer {
       this.lastRawPoint = point;
       this.lastOutputPoint = point;
       this.lastPressure = point.pressure;
+      this.rawHistory = [{ x: point.x, y: point.y, t: point.timestamp }];
       return point;
     }
 
-    // 速度は補正済みの遅れた点ではなく、生入力点同士から計算する。
-    const velocity = this.calculateVelocity(this.lastRawPoint, point);
+    // 速度は補正済みの遅れた点ではなく、生入力点の時間窓から計算する
+    // （1サンプル間隔の速度は高周波入力でノイズだらけになる）
+    this.rawHistory.push({ x: point.x, y: point.y, t: point.timestamp });
+    if (this.rawHistory.length > Stabilizer.MAX_HISTORY) this.rawHistory.shift();
+    const velocity = this.windowVelocity() * this.viewScale;
     this.lastVelocity = velocity;
 
     // 基準αをサンプル間隔に合わせて時間補正する。120Hz相当を基準にすることで、
@@ -109,16 +120,26 @@ export class Stabilizer {
   }
 
   /**
-   * 速度を計算（px/sec）
+   * 直近 VELOCITY_WINDOW_MS 内の生入力から速度を計算（キャンバスpx/sec）。
+   * 窓が短く距離もほぼない場合は 0 として扱う（除算ノイズ対策）。
    */
-  private calculateVelocity(from: PointerPoint, to: PointerPoint): number {
-    const dx = to.x - from.x;
-    const dy = to.y - from.y;
-    const distance = Math.sqrt(dx * dx + dy * dy);
-    const dt = to.timestamp - from.timestamp;
+  private windowVelocity(): number {
+    const h = this.rawHistory;
+    const cur = h[h.length - 1];
+    let i = h.length - 1;
+    while (i > 0 && cur.t - h[i - 1].t <= Stabilizer.VELOCITY_WINDOW_MS) i--;
+    // サンプル間隔が窓より長い低周波入力では窓内に古い点が無いので、
+    // 履歴の最古点にフォールバックする（さもないと速度が常に0になる）
+    if (i === h.length - 1) i = 0;
+    const base = h[i];
+    const len = Math.hypot(cur.x - base.x, cur.y - base.y);
+    const dt = cur.t - base.t;
+    return dt > 0.5 && len > 1e-9 ? (len / dt) * 1000 : 0;
+  }
 
-    if (dt <= 0) return 0;
-    return (distance / dt) * 1000; // px/sec
+  /** 表示スケールを設定（ズーム連動補正。A3） */
+  setViewScale(scale: number): void {
+    this.viewScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
   }
 
   /**
@@ -158,6 +179,7 @@ export class Stabilizer {
     this.lastOutputPoint = null;
     this.lastPressure = null;
     this.lastVelocity = 0;
+    this.rawHistory = [];
   }
 
   /**

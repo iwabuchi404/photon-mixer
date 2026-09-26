@@ -62,6 +62,16 @@ export class StabilizationController {
   }
 
   /**
+   * 表示スケール（ズーム倍率）を設定する。
+   * radius/threshold を画面上の見た目基準に揃えるため、
+   * ズーム変化時に呼び出す（A3）。
+   */
+  setViewScale(scale: number): void {
+    this.ema.setViewScale(scale);
+    this.pulledString.setViewScale(scale);
+  }
+
+  /**
    * 補正方式を切り替える
    */
   setMode(mode: StabilizationMode): void {

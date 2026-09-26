@@ -659,6 +659,7 @@ class PhotonMixerApp {
     this.viewport.reset(width, height, window.innerWidth, window.innerHeight);
     const transform = this.viewport.getTransform();
     this.renderPipeline.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation, transform.flip);
+    this.stabilizer.setViewScale(transform.scale);
     this.layerHistories.clear();
     this.clearSelectionUI(); // 旧キャンバスサイズの選択マスクを破棄
     this.rebuildLayerPanel();
@@ -990,6 +991,7 @@ class PhotonMixerApp {
     this.viewport.reset(snapshot.width, snapshot.height, window.innerWidth, window.innerHeight);
     const transform = this.viewport.getTransform();
     this.renderPipeline.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation, transform.flip);
+    this.stabilizer.setViewScale(transform.scale);
     this.layerHistories.clear();
     this.rebuildLayerPanel();
     this.refreshEffectEdit();
@@ -1017,6 +1019,7 @@ class PhotonMixerApp {
       this.viewport.reset(width, height, window.innerWidth, window.innerHeight);
       const transform = this.viewport.getTransform();
       this.renderPipeline.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation, transform.flip);
+      this.stabilizer.setViewScale(transform.scale);
       this.layerHistories.clear();
       this.rebuildLayerPanel();
       this.refreshEffectEdit();
@@ -1066,6 +1069,7 @@ class PhotonMixerApp {
   private applyViewport(): void {
     const t = this.viewport.getTransform();
     this.renderPipeline?.updateViewport(t.scale, t.offsetX, t.offsetY, t.rotation, t.flip);
+    this.stabilizer.setViewScale(t.scale); // A3: 補正半径/閾値を画面基準に揃える
     this.drawSelectionOverlay();
   }
 
@@ -1639,6 +1643,7 @@ class PhotonMixerApp {
       }
       const transform = this.viewport.getTransform();
       this.renderPipeline?.updateViewport(transform.scale, transform.offsetX, transform.offsetY, transform.rotation, transform.flip);
+      this.stabilizer.setViewScale(transform.scale);
       this.updateZoomDisplay();
       this.drawSelectionOverlay();
     }, { passive: false });

@@ -603,6 +603,29 @@ describe('ペン入力統合テスト', () => {
       assert.ok(Math.abs(at60.x - at240.x) < 0.75, `60Hz=${at60.x}, 240Hz=${at240.x}`);
     });
 
+    test('A1: 速度は時間窓から推定する（単発スパイクで爆発しない）', () => {
+      const stabilizer = new Stabilizer({ threshold: 1000 });
+      // 4ms間隔で1pxずつ（250px/s）進行中に 10px の単発スパイク（瞬間2500px/s相当）
+      stabilizer.stabilize({ x: 0, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 0 });
+      stabilizer.stabilize({ x: 1, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 4 });
+      stabilizer.stabilize({ x: 2, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 8 });
+      stabilizer.stabilize({ x: 12, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 12 });
+      stabilizer.stabilize({ x: 3, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 16 });
+      // 窓推定なら全履歴の変位で ~190px/s。単発なら 9px/4ms = 2250px/s
+      assert.ok(stabilizer.getLastVelocity() < 500,
+        `窓推定の速度になるはず: ${stabilizer.getLastVelocity()}`);
+    });
+
+    test('A3: 表示スケールで速度がズーム連動する', () => {
+      const stabilizer = new Stabilizer({ threshold: 1000 });
+      stabilizer.setViewScale(4);
+      stabilizer.stabilize({ x: 0, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 0 });
+      stabilizer.stabilize({ x: 10, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 100 });
+      // キャンバス速度 100px/s × scale 4 = 表示 400px/s
+      assert.ok(Math.abs(stabilizer.getLastVelocity() - 400) < 1e-6,
+        `表示速度400のはず: ${stabilizer.getLastVelocity()}`);
+    });
+
     test('確定バッチは最後の生入力位置で終わる', () => {
       const stabilizer = new Stabilizer({ threshold: 1000, minAlpha: 0.1 });
       const points = [
@@ -765,6 +788,53 @@ describe('ペン入力統合テスト', () => {
       const end240 = r240.at(-1)!;
       const dist = Math.hypot(end60.x - end240.x, end60.y - end240.y);
       assert.ok(dist < 1.0, `end point drift should be < 1px, got ${dist}`);
+    });
+
+    test('A1: 逆方向ノイズ1サンプルでは緩みに入らない', () => {
+      const ps = new PulledStringStabilizer({ radius: 10, finishLine: false, adaptive: false });
+      // 前進してブラシが張った後、1px の逆方向ジッターだけのサンプル
+      const out1 = ps.stabilize(mkPoint(0, 0, 0));
+      const out2 = ps.stabilize(mkPoint(20, 0, 10));
+      const jitter = ps.stabilize(mkPoint(19, 0, 14));
+      // 窓推定では変位が前進方向のまま → slack せず dead zone で null。
+      // 単発判定なら V·S<0 で slack し effR が 3.5 に潰れて追従点が出てしまう
+      assert.strictEqual(jitter, null, 'ジッターではブラシを動かさないはず');
+      assert.ok(out1 && out2);
+    });
+
+    test('A1: 窓ベース速度 — 単発スパイクで実効半径が潰れない', () => {
+      const ps = new PulledStringStabilizer({ radius: 10, finishLine: false });
+      // 4ms間隔で1pxずつの低速爬行（62.5px/s）の後、1msで5pxのスパイク
+      ps.stabilize(mkPoint(0, 0, 0));
+      ps.stabilize(mkPoint(1, 0, 4));
+      ps.stabilize(mkPoint(2, 0, 8));
+      ps.stabilize(mkPoint(3, 0, 12));
+      ps.stabilize(mkPoint(4, 0, 16));
+      ps.stabilize(mkPoint(5, 0, 20));
+      const spike = ps.stabilize(mkPoint(10, 0, 21));
+      // 窓推定: 変位9px/17ms ≈ 530px/s → effR ≈ 6 → brush ≈ 4
+      // 単発: 5px/1ms = 5000px/s → effR ≈ 1.5 → brush ≈ 8.5
+      assert.ok(spike !== null && spike.x < 6, `窓推定ならブラシは置いていかれるはず: ${spike?.x}`);
+    });
+
+    test('A2: 筆圧は平滑化される（筆圧ジャンプが階段にならない）', () => {
+      const ps = new PulledStringStabilizer({ radius: 0, finishLine: false, adaptive: false, reverseSlack: false });
+      ps.stabilize({ x: 0, y: 0, pressure: 0.5, tiltX: 0, tiltY: 0, timestamp: 0 });
+      const out = ps.stabilize({ x: 5, y: 0, pressure: 0.9, tiltX: 0, tiltY: 0, timestamp: 8 });
+      // α≈0.34 で 0.5→0.9 の途中（≈0.64）。生筆圧なら 0.9
+      assert.ok(out !== null && out.pressure > 0.55 && out.pressure < 0.8,
+        `平滑化されるはず: ${out?.pressure}`);
+    });
+
+    test('A3: 表示スケールで実効半径がズーム連動する', () => {
+      const mk = () => new PulledStringStabilizer({ radius: 10, finishLine: false, adaptive: false, reverseSlack: false });
+      const ps1 = mk();
+      const r1 = ps1.stabilizeBatch([mkPoint(0, 0, 0), mkPoint(20, 0, 10)]);
+      const ps2 = mk();
+      ps2.setViewScale(2); // 2倍ズーム → 画面上10px相当 = キャンバス5px
+      const r2 = ps2.stabilizeBatch([mkPoint(0, 0, 0), mkPoint(20, 0, 10)]);
+      assert.ok(Math.abs(r1.at(-1)!.x - 10) < 0.5, `scale1: ${r1.at(-1)!.x}`);
+      assert.ok(Math.abs(r2.at(-1)!.x - 15) < 0.5, `scale2は半径半分のはず: ${r2.at(-1)!.x}`);
     });
 
     test('updateConfig で設定を更新できる', () => {
