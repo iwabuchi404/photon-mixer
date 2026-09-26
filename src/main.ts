@@ -302,6 +302,12 @@ class PhotonMixerApp {
       /** 記録 JSON を入力パイプラインへ再生する */
       replay: (rec: Parameters<typeof replayRecording>[0]) =>
         replayRecording(rec, (ev) => this.handlePenInput(ev)),
+      /** 診断用: タッチ描画を端末既定相当（非永続・非明示）で切替。
+       *  デスクトップ等でスマホ状態（coarse→ON/pen検出で自動OFF）を再現する */
+      setTouchDraw: (v: boolean) => {
+        this.penInput?.setTouchDrawEnabled(v);
+        this.touchGestures?.setTouchDrawEnabled(v);
+      },
     };
     // 混色方式の初期値をエンジンへ明示的に反映（UI表示・state・GPU の三者統一）
     this.renderPipeline.updateBrushConfig({ mixMode: this.state.mixMode });
@@ -3279,7 +3285,13 @@ class PhotonMixerApp {
 
     const frame = (timestamp: number) => {
       this.perfMonitor.beginFrame(timestamp);
-      this.renderPipeline?.render();
+      // GPU/合成パスの例外で rAF ループが死なないよう保護する
+      // （死ぬと以後一切描画されず「途中から描けなくなる」症状になる）。
+      try {
+        this.renderPipeline?.render();
+      } catch (e) {
+        console.error('[render]', e);
+      }
       this.perfMonitor.endFrame(timestamp);
 
       if (timestamp - lastCleanup > 1000) {

@@ -702,8 +702,9 @@ export class RenderPipeline {
       const cellTiles = [...eligible].filter((t) => tiles.has(t));
       if (cellTiles.length === 0) continue;
 
-      const base = override && override.cellId === cell.id
-        ? override.tex
+      const isOverrideCell = !!(override && override.cellId === cell.id);
+      const base = isOverrideCell
+        ? override!.tex
         : this.ensureComposed(cell.id);
       const srcFull = hasVisibleEffects
         ? this.applyCellEffects(cell, base, null)
@@ -716,11 +717,23 @@ export class RenderPipeline {
         );
         const dst = destinations.get(t)!;
         const target = dst === this.compA ? this.compB : this.compA;
+        // ソース解決: 効果あり→ fullscreen 効果結果 / override タイル→ fullscreen
+        // ライブ合成 / それ以外→ コミット済みタイル。override タイルはセル未占有
+        // があり得るため srcTile にフォールバックしてはいけない（null.createView
+        // で render ループが死ぬ回帰バグ）。
+        let src: { srcFull: GPUTexture } | { srcTile: GPUTexture } | null = null;
+        if (srcFull) src = { srcFull };
+        else if (isOverrideCell && override!.tiles.has(t)) src = { srcFull: override!.tex };
+        else {
+          const tex = this.tileStore.ensureResidentTile(cell.id, t);
+          if (tex) src = { srcTile: tex };
+        }
+        if (!src) continue;
         ops.push({
           dst, target, mode: cell.blendMode, opacity: cell.opacity,
           tileOx: r.x, tileOy: r.y,
           scissor: { x: r.x, y: r.y, w: r.w, h: r.h },
-          ...(srcFull ? { srcFull } : { srcTile: this.tileStore.ensureResidentTile(cell.id, t)! }),
+          ...src,
         });
         next.set(t, target);
         touched.add(t);
