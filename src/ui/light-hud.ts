@@ -5,6 +5,8 @@
  * DOM 動的生成（index.html 非依存）。
  */
 
+import { VIEW_EV_MIN, VIEW_EV_MAX } from '../color/display.js';
+
 export interface LightHudCallbacks {
   /** 現在の表示露出 EV を読む */
   getEV: () => number;
@@ -12,11 +14,8 @@ export interface LightHudCallbacks {
   setEV: (ev: number) => void;
 }
 
-const EV_MIN = -6;
-const EV_MAX = 6;
-
 export function clampEV(ev: number): number {
-  return Math.max(EV_MIN, Math.min(EV_MAX, ev));
+  return Math.max(VIEW_EV_MIN, Math.min(VIEW_EV_MAX, ev));
 }
 
 export function formatEV(ev: number): string {
@@ -56,8 +55,8 @@ export class LightHud {
 
     const slider = document.createElement('input');
     slider.type = 'range';
-    slider.min = String(EV_MIN);
-    slider.max = String(EV_MAX);
+    slider.min = String(VIEW_EV_MIN);
+    slider.max = String(VIEW_EV_MAX);
     slider.step = '0.1';
     slider.style.cssText = 'width:140px;accent-color:#ff7a1a;';
     slider.addEventListener('input', () => {

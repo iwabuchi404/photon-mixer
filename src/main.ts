@@ -30,7 +30,7 @@ import './ui/components/tool-bar.js'; // customElements.define('pm-tool-bar') �
 import type { ToolBar } from './ui/components/tool-bar.js';
 import { TOOLS, PARAM_DEFS, getToolDef, type ParamKey } from './ui/tool-config.js';
 import { ToolSettingsStore } from './ui/tool-settings.js';
-import { evToExposure, linearToDisplaySrgb, type TonemapId, type DisplayModeId } from './color/display.js';
+import { evToExposure, displayTransform, clampViewEV, TONEMAP_IDS, DISPLAY_MODE_IDS, type TonemapId, type DisplayModeId } from './color/display.js';
 import type { FilterType, FilterParams } from './render/filter.js';
 import { CurveEditor } from './ui/curve-editor.js';
 import { LightHud } from './ui/light-hud.js';
@@ -41,6 +41,7 @@ import type { PointerPoint } from './pen/input.js';
 import type { BrushConfig } from './render/brush.js';
 import type { BrushMixMode } from './render/brush.js';
 import { linearToSrgb } from './color/linear.js';
+import { float16ToFloat32, float32ToFloat16 } from './color/float16.js';
 
 interface DocumentSnapshot {
   width: number;
@@ -56,34 +57,6 @@ interface DocumentSnapshot {
 }
 
 const MAX_CANVAS_DIMENSION = 8192;
-
-function float32ToFloat16(f: number): number {
-  const buf = new ArrayBuffer(4);
-  const f32 = new Float32Array(buf);
-  const u32 = new Uint32Array(buf);
-  f32[0] = f;
-  const x = u32[0];
-  const s = (x >> 16) & 0x8000;
-  let e = ((x >> 23) & 0xFF) - (127 - 15);
-  let m = x & 0x7FFFFF;
-  if (e <= 0) {
-    if (e < -10) return s;
-    m = (m | 0x800000) >> (1 - e);
-    return s | (m >> 13);
-  } else if (e >= 31) return s | 0x7C00;
-  return s | (e << 10) | (m >> 13);
-}
-
-// Float16（Uint16 表現）→ Float32 変換
-// ... (略)
-function float16ToFloat32(h: number): number {
-  const sign = (h >> 15) & 1;
-  const exp  = (h >> 10) & 0x1F;
-  const frac =  h        & 0x3FF;
-  if (exp === 0)  return (sign ? -1 : 1) * Math.pow(2, -14) * (frac / 1024);
-  if (exp === 31) return frac === 0 ? (sign ? -Infinity : Infinity) : NaN;
-  return (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + frac / 1024);
-}
 
 // committedSnapshot から指定キャンバス座標の色をサンプリング（最近傍）
 function sampleSnapshot(
@@ -282,6 +255,17 @@ class PhotonMixerApp {
     this.renderPipeline.setRibbonMode(true);
     // 診断フック: タイル統計（verify 用。製品動作に影響なし）
     (window as any).__tileStats = () => this.renderPipeline?.tileStats() ?? null;
+    // 診断フック: 表示変換の GPU/CPU パリティ検証（scripts/verify-hdr.mjs）
+    // straight リニア HDR 値（1.0 超可）を fs_display に通し、表示符号化済みの値を返す。
+    (window as any).__hdrProbe = (colors: [number, number, number][], params: {
+      exposure: number; tonemap: number; mode: number; hdr: number;
+    }) => this.renderPipeline?.probeDisplayTransform(colors, params) ?? null;
+    // 診断フック: HDR 出力の実際の状態（extended 受理時のみ有効）
+    (window as any).__hdrState = () => ({
+      capable: this.renderer?.hdrCapable ?? false,
+      on: this.renderer?.hdr ?? false,
+      format: this.renderer?.format ?? null,
+    });
     // 診断フック: 入力記録/再生（D7。実機の生サンプルをJSONで取得・再現する）
     (window as any).__pmxInput = {
       start: () => this.inputRecorder.start(),
@@ -1061,6 +1045,10 @@ class PhotonMixerApp {
   /**
    * HDR出力の ON/OFF。canvas の format は変えず toneMapping だけ
    * standard⇄extended を切り替える（パイプライン再生成は不要）。
+   *
+   * HDR ON では fs_display がトーンマップとリニア生モードを分岐より前で
+   * バイパスする（composite.wgsl）。そののまま UI を生かすと「AgX に変えても
+   * 何も変わらない」という状態になるため、無効なコントロールを明示して隠す。
    */
   private setHdrOutput(on: boolean): void {
     if (!this.renderer?.hdrCapable) return;
@@ -1072,7 +1060,18 @@ class PhotonMixerApp {
       toneMapping: { mode: on ? 'extended' : 'standard' },
     });
     this.renderPipeline?.setHdrOutput(on);
+    this.renderer.hdr = on; // renderer.hdr を実状態に追従（スポイト表示Chipが参照する）
     localStorage.setItem('pm.hdrOutput', on ? '1' : '0');
+
+    const note = document.getElementById('hdr-note');
+    if (note) note.style.display = on ? '' : 'none';
+    const tone = document.getElementById('view-tonemap') as HTMLSelectElement | null;
+    if (tone) tone.disabled = on;
+    const mode = document.getElementById('view-mode') as HTMLSelectElement | null;
+    // 「表示変換」「クリップ警告」は HDR と併用可。「リニア生」だけは意味を持たない
+    for (const opt of mode?.options ?? []) {
+      if (opt.value === 'raw') (opt as HTMLOptionElement).disabled = on;
+    }
   }
 
   /** 現在のビューポート状態をパイプラインへ反映 */
@@ -2354,15 +2353,23 @@ class PhotonMixerApp {
 
   /** View 設定を UI とエンジンへ適用（.pmx 読込時） */
   private applyViewSettings(v: { viewEV: number; tonemap: TonemapId; viewMode: DisplayModeId }): void {
+    // 読み込んだ値がスライダー範囲外・enum 外だと、select.value が空に落ちて
+    // currentViewSettings() が空文字列を保存し直す。エンジン適用前に必ず正規化する。
+    const viewEV = Number.isFinite(v.viewEV) ? clampViewEV(v.viewEV) : 0;
+    const tonemap = TONEMAP_IDS.includes(v.tonemap) ? v.tonemap : 'pbrNeutral';
+    const viewMode = DISPLAY_MODE_IDS.includes(v.viewMode) ? v.viewMode : 'transform';
+    if (viewEV !== v.viewEV || tonemap !== v.tonemap || viewMode !== v.viewMode) {
+      console.warn('Unsupported view settings in .pmx, normalized:', v, '->', { viewEV, tonemap, viewMode });
+    }
     const exp = document.getElementById('view-exposure') as HTMLInputElement | null;
     const expVal = document.getElementById('view-exposure-val');
     const tone = document.getElementById('view-tonemap') as HTMLSelectElement | null;
     const mode = document.getElementById('view-mode') as HTMLSelectElement | null;
-    if (exp) exp.value = String(v.viewEV);
-    if (expVal) expVal.textContent = (v.viewEV >= 0 ? '+' : '') + v.viewEV.toFixed(1);
-    if (tone) tone.value = v.tonemap;
-    if (mode) mode.value = v.viewMode;
-    this.renderPipeline?.setDisplayParams(evToExposure(v.viewEV), v.tonemap, v.viewMode);
+    if (exp) exp.value = String(viewEV);
+    if (expVal) expVal.textContent = (viewEV >= 0 ? '+' : '') + viewEV.toFixed(1);
+    if (tone) tone.value = tonemap;
+    if (mode) mode.value = viewMode;
+    this.renderPipeline?.setDisplayParams(evToExposure(viewEV), tonemap, viewMode);
   }
 
   private async handleSpoit(x: number, y: number): Promise<void> {
@@ -2382,6 +2389,10 @@ class PhotonMixerApp {
   /**
    * スポイト知覚ギャップ表示: 内部リニア値と表示上の見え方の乖離が大きいときのみ
    * 「内部値 / 表示」の色チップを並べて表示する（仕様）。
+   *
+   * 「表示」側は画面（fs_display）と同じ計算を通す。HDR出力が有効なときは
+   * トーンマップもクランプも通らないため、hex チップ（0..255 では白を超えて表現できない）
+   * では表せない。その場合は「白超え」をバッジで明示し、倍率を併記する。
    */
   private updateSpoitGap(c: LinearColor | null): void {
     const el = document.getElementById('spoit-gap');
@@ -2389,20 +2400,30 @@ class PhotonMixerApp {
     if (!c) { el.style.display = 'none'; return; }
     const view = this.currentViewSettings();
     const hdr = Math.max(c.r, c.g, c.b) > 1.0;
-    const gap = hdr || view.viewEV !== 0 || view.tonemap !== 'none';
+    const hdrOut = this.renderer?.hdr === true;
+    const gap = hdr || hdrOut || view.viewEV !== 0 || view.tonemap !== 'none';
     if (!gap) { el.style.display = 'none'; return; }
 
     const toHex = (rgb: { r: number; g: number; b: number }) =>
       '#' + [rgb.r, rgb.g, rgb.b].map(v => Math.max(0, Math.min(255, Math.round(v * 255))).toString(16).padStart(2, '0')).join('');
     const rawHex = toHex(linearColorToSrgb(c)); // 内部値（クランプ表示）
-    const disp = linearToDisplaySrgb([c.r, c.g, c.b], evToExposure(view.viewEV), view.tonemap);
+
+    // fs_display と同一の変換。HDR出力時はトーンマップ介さず光量直通（クランプは下側のみ）。
+    const disp = displayTransform([c.r, c.g, c.b], {
+      exposure: evToExposure(view.viewEV),
+      tonemap: view.tonemap,
+      mode: view.viewMode,
+      hdrOut,
+    });
+    const dispPeak = Math.max(disp[0], disp[1], disp[2]);
+    const overWhite = dispPeak > 1;
     const dispHex = toHex({ r: disp[0], g: disp[1], b: disp[2] });
     const f = (v: number) => v.toFixed(v >= 10 ? 1 : 3);
     el.innerHTML =
-      `<div style="font-size:9px; color:#7fb2ff; margin-bottom:3px;">スポイト（内部値 / 表示）${hdr ? ' <span style="color:#000;background:#ffb24a;border-radius:6px;padding:0 4px;">HDR</span>' : ''}</div>` +
+      `<div style="font-size:9px; color:#7fb2ff; margin-bottom:3px;">スポイト（内部値 / 表示）${hdr ? ' <span style="color:#000;background:#ffb24a;border-radius:6px;padding:0 4px;">HDR</span>' : ''}${hdrOut ? ' <span style="color:#000;background:#7fb2ff;border-radius:6px;padding:0 4px;">HDR出力</span>' : ''}</div>` +
       `<div style="display:flex; gap:8px; align-items:center; font-size:9px; color:#9a9;">` +
       `<div style="text-align:center;"><div style="width:28px;height:20px;background:${rawHex};border:1px solid #555;"></div>内部値</div>` +
-      `<div style="text-align:center;"><div style="width:28px;height:20px;background:${dispHex};border:1px solid #555;"></div>表示</div>` +
+      `<div style="text-align:center;"><div style="width:28px;height:20px;background:${dispHex};border:1px solid ${overWhite ? '#ffb24a' : '#555'};${overWhite ? 'box-shadow:0 0 6px 1px #ff7a1a;' : ''}"></div>表示${overWhite ? `<div style="color:#ffb24a;">白超え ×${f(dispPeak)}</div>` : ''}</div>` +
       `<div>R:${f(c.r)}<br>G:${f(c.g)}<br>B:${f(c.b)}</div>` +
       `</div>`;
     el.style.display = '';

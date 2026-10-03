@@ -7,6 +7,7 @@ import assert from 'node:assert';
 import { test, describe } from 'node:test';
 import {
   srgbToLinear, linearToSrgb, linearColorToSrgb, srgbColorToLinear,
+  linearToSrgbExt, srgbExtToLinear,
 } from '../src/color/linear.js';
 import { linearToOklab, oklabToLinear, mixOklab } from '../src/color/oklab.js';
 
@@ -38,6 +39,25 @@ describe('sRGB ⇔ リニア', () => {
   test('linearToSrgb は 0..1 にクランプする', () => {
     assert.strictEqual(linearToSrgb(-0.5), 0);
     assert.ok(approx(linearToSrgb(2.0), 1));
+  });
+
+  test('拡張sRGB（linearToSrgbExt）は 1.0 超を保持する', () => {
+    // linearToSrgb と違いクランプしない（composite.wgsl の linear_to_srgb_ext と同一式）
+    assert.ok(linearToSrgbExt(2.0) > 1, `out=${linearToSrgbExt(2.0)}`);
+    assert.ok(linearToSrgbExt(64) > linearToSrgbExt(16));
+    assert.strictEqual(linearToSrgbExt(-1), 0); // 下側のみクランプ
+  });
+
+  test('拡張sRGB は 0..1 では通常 sRGB と一致する', () => {
+    for (const v of [0, 0.002, 0.04045, 0.1, 0.5, 1]) {
+      assert.ok(approx(linearToSrgbExt(v), linearToSrgb(v)), `v=${v}`);
+    }
+  });
+
+  test('拡張sRGB の往復一致（HDR を含む）', () => {
+    for (const v of [0, 0.01, 0.25, 0.5, 1, 1.5, 4, 16, 1000]) {
+      assert.ok(approx(srgbExtToLinear(linearToSrgbExt(v)), v, Math.max(1e-6, v * 1e-6)), `v=${v}`);
+    }
   });
 
   test('色オブジェクト変換はαを保持して往復一致', () => {

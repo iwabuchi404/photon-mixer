@@ -13,10 +13,10 @@
 
 import * as fflate from 'fflate';
 import type { LayerNode, CellNode, EffectChainItem } from './render/layer-model.js';
-import type { TonemapId, DisplayModeId } from './color/display.js';
+import { TONEMAP_IDS, DISPLAY_MODE_IDS, VIEW_EV_MIN, VIEW_EV_MAX, type TonemapId, type DisplayModeId } from './color/display.js';
 
 const PMX_VERSION = '3.0';
-const PMX_TILE_SIZE = 512;
+export const PMX_TILE_SIZE = 512;
 const MAX_PMX_INPUT_BYTES = 1024 * 1024 * 1024;
 const MAX_PMX_EXPANDED_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_PMX_ENTRIES = 100_000;
@@ -26,6 +26,7 @@ const MAX_NODE_COUNT = 4096;
 const MAX_FOLDER_DEPTH = 64;
 const VALID_BLEND_MODES = new Set(['normal', 'multiply', 'screen', 'overlay', 'add']);
 const VALID_FILTER_TYPES = new Set(['blur', 'glow', 'sharpen', 'exposure', 'levels', 'curve']);
+const MAX_SWATCHES = 1024;
 
 /** セルのタイル保存用データ */
 export interface PmxTileData {
@@ -170,6 +171,34 @@ function validateNode(
   }
 }
 
+function validateDocumentSettings(value: unknown): void {
+  assertRecord(value, 'document settings');
+  const view = value.view;
+  assertRecord(view, 'view settings');
+  assertFiniteNumber(view.viewEV, 'view EV');
+  // UI のスライダー範囲を超えると、UI が表示する露出とエンジンに実際に渡る
+  // 露出がずれて、再保存時に viewEV が静かに書き換わるため範囲外を弾く
+  if (view.viewEV < VIEW_EV_MIN || view.viewEV > VIEW_EV_MAX) {
+    throw new Error(`Invalid .pmx: view EV out of range (${VIEW_EV_MIN}..${VIEW_EV_MAX})`);
+  }
+  // enum は indexOf() が -1 を返すと uniform に -1 が入り、WGSL 側で
+  // 意図しない既定演算子へ化けるため、メンバーを厳密に検証する
+  if (!TONEMAP_IDS.includes(view.tonemap as TonemapId)) throw new Error('Invalid .pmx: unknown tonemap');
+  if (!DISPLAY_MODE_IDS.includes(view.viewMode as DisplayModeId)) throw new Error('Invalid .pmx: unknown view mode');
+  if (!Array.isArray(value.swatches) || value.swatches.length > MAX_SWATCHES) {
+    throw new Error('Invalid .pmx: invalid swatches');
+  }
+  for (const swatch of value.swatches) {
+    assertRecord(swatch, 'swatch');
+    // r/g/b は HDR（1.0 超）を保持しうるので有限性のみ。a は 0..1。
+    assertFiniteNumber(swatch.r, 'swatch r');
+    assertFiniteNumber(swatch.g, 'swatch g');
+    assertFiniteNumber(swatch.b, 'swatch b');
+    assertFiniteNumber(swatch.a, 'swatch a');
+    if (swatch.a < 0 || swatch.a > 1) throw new Error('Invalid .pmx: swatch alpha out of range');
+  }
+}
+
 function validateManifest(value: unknown): { manifest: PmxManifest; cellIds: Set<string> } {
   assertRecord(value, 'manifest');
   if (value.version !== '3.0' || value.tileSize !== PMX_TILE_SIZE) throw new Error('Unsupported .pmx format');
@@ -188,14 +217,7 @@ function validateManifest(value: unknown): { manifest: PmxManifest; cellIds: Set
   assertSafeId(value.activeCellId, 'active cell id');
   if (!cellIds.has(value.activeCellId)) throw new Error('Invalid .pmx: active cell not found');
   if (typeof value.app !== 'string') throw new Error('Invalid .pmx: app');
-  if (value.documentSettings !== undefined) {
-    assertRecord(value.documentSettings, 'document settings');
-    assertRecord(value.documentSettings.view, 'view settings');
-    assertFiniteNumber(value.documentSettings.view.viewEV, 'view EV');
-    if (typeof value.documentSettings.view.tonemap !== 'string' || typeof value.documentSettings.view.viewMode !== 'string' || !Array.isArray(value.documentSettings.swatches)) {
-      throw new Error('Invalid .pmx: view settings');
-    }
-  }
+  if (value.documentSettings !== undefined) validateDocumentSettings(value.documentSettings);
   return { manifest: value as unknown as PmxManifest, cellIds };
 }
 

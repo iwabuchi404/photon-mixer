@@ -4,7 +4,8 @@
 
 import assert from 'node:assert';
 import { test, describe } from 'node:test';
-import { applyLevels, type LevelsParams } from '../src/color/levels.js';
+import { applyLevels, applyLevelsLinear, type LevelsParams } from '../src/color/levels.js';
+import { srgbToLinear, linearToSrgb } from '../src/color/linear.js';
 
 const identity: LevelsParams = { inLow: 0, inHigh: 1, gamma: 1, outLow: 0, outHigh: 1 };
 const approx = (a: number, b: number, e = 1e-6) => Math.abs(a - b) <= e;
@@ -49,5 +50,48 @@ describe('applyLevels', () => {
       const o = applyLevels(v, p);
       assert.ok(o >= 0.1 - 1e-6 && o <= 0.95 + 1e-6, `v=${v} -> ${o}`);
     }
+  });
+});
+
+describe('applyLevelsLinear（リニア HDR 入力・fs_levels の twin）', () => {
+  test('SDR 域では applyLevels と同一の結果になる（挙動不変）', () => {
+    const params: LevelsParams[] = [
+      identity,
+      { ...identity, inLow: 0.25 },
+      { ...identity, inHigh: 0.5 },
+      { ...identity, gamma: 2 },
+      { ...identity, outLow: 0.2, outHigh: 0.8 },
+    ];
+    for (const p of params) {
+      for (let v = 0; v <= 1.0001; v += 0.05) {
+        const expected = srgbToLinear(applyLevels(linearToSrgb(v), p));
+        assert.ok(approx(applyLevelsLinear(v, p), expected, 1e-5), `v=${v} p=${JSON.stringify(p)}`);
+      }
+    }
+  });
+
+  test('恒等パラメータは HDR（1.0 超）を厳密に保存する', () => {
+    // これが Levels で Glow/露出の光量を潰さないことの根拠
+    for (const v of [1.5, 4, 16, 64, 1000]) {
+      assert.ok(approx(applyLevelsLinear(v, identity), v, 1e-4), `v=${v} -> ${applyLevelsLinear(v, identity)}`);
+    }
+  });
+
+  test('減光する補正では HDR 超過分も同じ比率で減光する（有限・正）', () => {
+    const p = { ...identity, outHigh: 0.5 };
+    for (const v of [2, 4, 16]) {
+      const o = applyLevelsLinear(v, p);
+      assert.ok(Number.isFinite(o) && o > 0, `v=${v} -> ${o}`);
+      assert.ok(o < v, `減光されるべき: v=${v} -> ${o}`);
+    }
+  });
+
+  test('増光する補正では HDR も増光する', () => {
+    const p = { ...identity, inHigh: 0.5 };
+    assert.ok(applyLevelsLinear(4, p) > 4, `out=${applyLevelsLinear(4, p)}`);
+  });
+
+  test('負値は 0 に丸められる', () => {
+    assert.strictEqual(applyLevelsLinear(-1, identity), 0);
   });
 });

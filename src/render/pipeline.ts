@@ -19,13 +19,14 @@ import { TileStore, TILE_SIZE } from './tile-store.js';
 import { TransformRenderer } from './transform.js';
 import { FilterRenderer, type FilterType, type FilterParams } from './filter.js';
 import { buildCurveLut, type CurvePoint } from '../color/curve.js';
+import { float16ToFloat32, float32ToFloat16 } from '../color/float16.js';
 import { rasterizePolygon, floodFillMask, maskBounds, invertMask } from '../selection/mask.js';
 import {
   type LayerNode, type FolderNode, type CellNode, type EffectChainItem,
   findNode, findCell, findParent, flattenCells, visibleCells, findEffect,
   createCell, createFolder, createEffect, removeNode, moveNode,
 } from './layer-model.js';
-import { linearToDisplaySrgb, TONEMAP_IDS, DISPLAY_MODE_IDS, type TonemapId, type DisplayModeId } from '../color/display.js';
+import { displayTransform, TONEMAP_IDS, DISPLAY_MODE_IDS, type TonemapId, type DisplayModeId, type DisplayParams, type RGB } from '../color/display.js';
 
 const BUFFER_FORMAT: GPUTextureFormat = 'rgba16float';
 /** 変形・フィルター書き戻し時のタイル余裕（1タイル分）。過剰保持は上限40で有界 */
@@ -433,10 +434,16 @@ export class RenderPipeline {
 
   /** 表示変換（ビュー露出=2^EV / トーンマップ / 表示モード）を設定 */
   setDisplayParams(exposure: number, tonemap: TonemapId, mode: DisplayModeId): void {
+    // indexOf が -1 を返すと uniform に -1 が入り、WGSL 側の i32(-0.5) が 0 に
+    // 切り捨てられ「PBR Neutral / 表示変換」に静かに化ける。不変条件として弾く。
+    const tonemapIndex = TONEMAP_IDS.indexOf(tonemap);
+    const modeIndex = DISPLAY_MODE_IDS.indexOf(mode);
+    if (tonemapIndex < 0) throw new Error(`Unknown tonemap: ${tonemap}`);
+    if (modeIndex < 0) throw new Error(`Unknown display mode: ${mode}`);
     this.displayExposure = exposure;
     this.displayTonemap = tonemap;
     this.displayMode = mode;
-    this.compositeRenderer.setDisplayParams(exposure, TONEMAP_IDS.indexOf(tonemap), DISPLAY_MODE_IDS.indexOf(mode));
+    this.compositeRenderer.setDisplayParams(exposure, tonemapIndex, modeIndex);
     this.invalidate();
   }
 
@@ -2155,8 +2162,14 @@ export class RenderPipeline {
     const imageData = ctx.createImageData(width, height);
 
     const uint16sPerRow = bytesPerRow / 2;
-    // 画面表示と同じ変換で書き出す（WYSIWYG）。リニア生モードはトーンマップ無し(none)
-    const exportTonemap = this.displayMode === 'raw' ? 'none' : this.displayTonemap;
+    // 画面表示と同じ変換で書き出す（WYSIWYG）。fs_display の CPU twin に一本化。
+    const view: DisplayParams = {
+      exposure: this.displayExposure,
+      tonemap: this.displayTonemap,
+      mode: this.displayMode,
+      // PNG は 8bit sRGB なので、HDR出力（extended）が有効でも SDR で書き出す
+      hdrOut: false,
+    };
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
         const idx = y * uint16sPerRow + x * 4;
@@ -2170,15 +2183,8 @@ export class RenderPipeline {
           imageData.data[pxIdx] = 0; imageData.data[pxIdx + 1] = 0;
           imageData.data[pxIdx + 2] = 0; imageData.data[pxIdx + 3] = 0;
         } else {
-          const straight: [number, number, number] = [r / a, g / a, b / a];
-          let disp: [number, number, number];
-          if (this.displayMode === 'clip') {
-            if (Math.max(straight[0], straight[1], straight[2]) > 1) disp = [1, 0, 0];
-            else if (Math.min(straight[0], straight[1], straight[2]) < 0) disp = [0, 0.3, 1];
-            else disp = linearToDisplaySrgb(straight, this.displayExposure, exportTonemap);
-          } else {
-            disp = linearToDisplaySrgb(straight, this.displayExposure, exportTonemap);
-          }
+          const straight: RGB = [r / a, g / a, b / a];
+          const disp = displayTransform(straight, view);
           imageData.data[pxIdx] = Math.round(disp[0] * 255);
           imageData.data[pxIdx + 1] = Math.round(disp[1] * 255);
           imageData.data[pxIdx + 2] = Math.round(disp[2] * 255);
@@ -2192,6 +2198,70 @@ export class RenderPipeline {
 
   async loadBrushTexture(image: ImageBitmap | HTMLImageElement): Promise<void> {
     await this.brushRenderer.loadTexture(image);
+  }
+
+  /**
+   * 診断用: 指定した straight リニア HDR 値（1.0 超可）を fs_display に通し、
+   * 表示符号化済みの値を返す。CPU twin は `displayTransform`。
+   *
+   * 画面（canvas）を経由しないので、`getCurrentTexture()` の COPY_SRC 不可という
+   * 制約を回避できる。`hdr: true` の結果は 1.0 を超える（extended canvas の受入値）。
+   *
+   * 戻り値は `{ mode: 'u8' | 'f16', values: number[] }`。values は [r,g,b,a]×width で
+   * 平坦化済み。8bit フォーマットでは 0..1 に正規化されている。
+   */
+  async probeDisplayTransform(
+    colors: RGB[],
+    params: { exposure: number; tonemap: number; mode: number; hdr: number },
+  ): Promise<{ mode: 'u8' | 'f16'; format: GPUTextureFormat; values: number[] }> {
+    const { device } = this.renderer;
+    const width = colors.length;
+    if (width === 0) throw new Error('probeDisplayTransform: no colors');
+    const height = 1;
+
+    // 入力は プリマルチプライド α=1 の rgba16float（リニア HDR）
+    const bytesPerRow = Math.ceil(width * 8 / 256) * 256;
+    const staging = device.createBuffer({
+      size: bytesPerRow * height,
+      // copyBufferToTexture には COPY_SRC が必要（readback はprobeDisplay 側で行う）
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    });
+    const src = device.createTexture({
+      size: [width, height],
+      format: 'rgba16float',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    const pixels = new Uint16Array(width * 4);
+    colors.forEach((c, i) => {
+      pixels[i * 4] = float32ToFloat16(c[0]);
+      pixels[i * 4 + 1] = float32ToFloat16(c[1]);
+      pixels[i * 4 + 2] = float32ToFloat16(c[2]);
+      pixels[i * 4 + 3] = float32ToFloat16(1);
+    });
+    device.queue.writeBuffer(staging, 0, pixels);
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToTexture({ buffer: staging }, { texture: src }, [width, height]);
+    device.queue.submit([enc.finish()]);
+
+    const raw = await this.compositeRenderer.probeDisplay(src, width, height, params);
+    src.destroy();
+
+    const isF16 = this.compositeRenderer.probeBytesPerPixel === 8;
+    const byteStride = this.compositeRenderer.probeBytesPerPixel; // u8 なら 4 / f16 なら 8
+    // BGRA 系フォーマットはバイト順が B,G,R,A なので R と B を入れ替える
+    const swizzle = this.compositeRenderer.probeFormat.startsWith('bgra');
+    // raw はバイト列。f16 は 2 バイト/チャンネルなので Uint16 として読む。
+    const u16 = isF16 ? new Uint16Array(raw.buffer, raw.byteOffset, raw.byteLength >> 1) : null;
+    const at = (byteIndex: number) => (u16 ? float16ToFloat32(u16[byteIndex >> 1]) : raw[byteIndex]);
+    const out: number[] = [];
+    for (let x = 0; x < width; x++) {
+      for (let ch = 0; ch < 4; ch++) {
+        const src = swizzle && ch === 0 ? 2 : swizzle && ch === 2 ? 0 : ch;
+        const v = at(x * byteStride + src * (isF16 ? 2 : 1));
+        out.push(isF16 ? v : v / 255);
+      }
+    }
+    return { mode: isF16 ? 'f16' : 'u8', format: this.compositeRenderer.probeFormat, values: out };
   }
 
   clearBrushTexture(): void {
@@ -2229,16 +2299,6 @@ export class RenderPipeline {
     this.moveContent = null;
     this.moveResult = null;
   }
-}
-
-// Float16 → Float32 変換
-function float16ToFloat32(h: number): number {
-  const sign = (h >> 15) & 1;
-  const exp = (h >> 10) & 0x1F;
-  const frac = h & 0x3FF;
-  if (exp === 0) return (sign ? -1 : 1) * Math.pow(2, -14) * (frac / 1024);
-  if (exp === 31) return frac === 0 ? (sign ? -Infinity : Infinity) : NaN;
-  return (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + frac / 1024);
 }
 
 // リニア→sRGB 変換 (Byte)

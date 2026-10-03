@@ -155,8 +155,11 @@ interface PhotonSwatch { id: string; name?: string; color: {r,g,b,a}; createdAt:
 ### .pmx 保存対象
 ```ts
 interface PmxDocumentSettings {
-  view: { viewEV: number; tonemap: 'pbrNeutral'|'agx'|'reinhard'|'none'; viewMode: 'display'|'rawLinear'|'clipWarning'; };
-  swatches: PhotonSwatch[];
+  // 実装修正: 旧 spec の 'display'|'rawLinear'|'clipWarning' は実装と不一致だった
+  // （indexOf が -1 を返し "PBR Neutral"/"表示変換" に無言で化けていた）。
+  // 値は src/color/display.ts の TONEMAP_IDS / DISPLAY_MODE_IDS が単一の出所。
+  view: { viewEV: number; tonemap: 'pbrNeutral'|'agx'|'reinhard'|'none'; viewMode: 'transform'|'raw'|'clip' };
+  swatches: { r: number; g: number; b: number; a: number }[]; // r/g/b は HDR（1.0 超）を保持
 }
 interface PmxEffectLayer {
   id: string; name: string; visible: boolean; opacity: number; blendMode: 'normal';
@@ -182,3 +185,15 @@ interface PmxEffectLayer {
 > 実装済み追加: 効果の入力ソースルーティング（「下の全結果」or 特定ペイントレイヤー）。レイヤー指定時はそのレイヤーを処理して acc に重ねる＝「調整レイヤーとノードの中間」。.pmx 保存対象。
 > 未対応（v1範囲外）: EXR・タイル / 効果→効果の連結（多段DAG）/ マスク（効果の部分適用）。
 ```
+
+### Levels / Curve の HDR 保全（2026-10 追記）
+
+Levels・Curve は 0..1 の符号化域で補正する設計のため、そのままだと
+1.0 超の光量（Glow・加算（光）・露出で生じた分）が**不可逆に潰れる**。
+「作品データ = リニア HDR の原本」に反するため、次の方式に統一した。
+
+- 符号化は**拡張 sRGB**（上限クランプなし）。1.0 超は単調に >1 へ写像される
+- 補正（入力黒/白・gamma・出力黒/白、LUT 参照）は **0..1 域のまま**＝SDR の見た目は従来と同一
+- 1.0 超の超過分を、補正の**局所ゲイン**（sOut/sIn）で引き伸ばしてから逆変換する
+- identity パラメータなら厳密に恒等（HDR 値を完全保持）。減光補正なら超過分も同率で減光する
+- twin: `applyLevelsLinear`（`src/color/levels.ts`）/ `applyCurveLinear`（`src/color/curve.ts`）

@@ -6,7 +6,7 @@
  * トーンマップ/モードの enum インデックスは WGSL・composite.ts と揃えること。
  */
 
-import { linearToSrgb } from './linear.js';
+import { linearToSrgb, linearToSrgbExt } from './linear.js';
 
 export type TonemapId = 'pbrNeutral' | 'agx' | 'reinhard' | 'none';
 /** WGSL の enum と一致させる（index = 値） */
@@ -16,6 +16,14 @@ export type DisplayModeId = 'transform' | 'raw' | 'clip';
 export const DISPLAY_MODE_IDS: DisplayModeId[] = ['transform', 'raw', 'clip'];
 
 export type RGB = [number, number, number];
+
+/** 表示露出 EV の許容範囲（UI・保存/読込の検証で共有する単一の出所） */
+export const VIEW_EV_MIN = -6;
+export const VIEW_EV_MAX = 6;
+
+export function clampViewEV(ev: number): number {
+  return Math.max(VIEW_EV_MIN, Math.min(VIEW_EV_MAX, ev));
+}
 
 /** EV(ストップ) → 線形露出倍率 */
 export function evToExposure(ev: number): number {
@@ -94,9 +102,58 @@ export function tonemap(rgb: RGB, id: TonemapId): RGB {
 /**
  * シーン リニア(straight, HDR) → 表示 sRGB(0..1)。
  * exposure = 2^EV、tonemap 指定。raw 相当が欲しい場合は id='none' を渡す。
+ * 表示モードやクリップ警告は扱わないため(full display transform)、それらを含む
+ * 用途には `displayTransform` を使うこと。
  */
 export function linearToDisplaySrgb(rgb: RGB, exposure: number, id: TonemapId): RGB {
   const exposed: RGB = [rgb[0] * exposure, rgb[1] * exposure, rgb[2] * exposure];
   const mapped = tonemap(exposed, id);
   return [linearToSrgb(mapped[0]), linearToSrgb(mapped[1]), linearToSrgb(mapped[2])];
+}
+
+// --- fs_display の CPU twin ---
+
+/** クリップ警告（>1.0）の色。`composite.wgsl` fs_display と同一値 */
+export const CLIP_OVER_RED: RGB = [1, 0, 0];
+/** クリップ警告（<0.0）の色。`composite.wgsl` fs_display と同一値 */
+export const CLIP_UNDER_BLUE: RGB = [0, 0.3, 1];
+
+export interface DisplayParams {
+  /** ビュー露出 = 2^EV */
+  exposure: number;
+  tonemap: TonemapId;
+  mode: DisplayModeId;
+  /** HDR出力（extended canvas）。トーンマップもクランプも介さず光量直通する */
+  hdrOut?: boolean;
+}
+
+/**
+ * `composite.wgsl` の `fs_display` と同じ分岐順・同じ式を CPU 側でたどる。
+ *
+ * 返り値は「表示符号化済み」の値。`hdrOut` のときだけ 1.0 を超える
+ * （extended canvas が >1 を受け取るためクランプしない。それ以外は 0..1）。
+ *
+ * 分岐順は WGSL 側と必ず揃えること:
+ *   1. クリップ警告（mode='clip'）— 判定は**露出前のシーン値**
+ *   2. hdrOut が最優先（トーンマップも 'raw' も迂回する）
+ *   3. mode='raw' → clamp のみ
+ *   4. それ以外 → tonemap
+ *   5. 出力の OETF（hdrOut は上限クランプなし）
+ */
+export function displayTransform(rgb: RGB, p: DisplayParams): RGB {
+  if (p.mode === 'clip') {
+    if (Math.max(rgb[0], rgb[1], rgb[2]) > 1) return CLIP_OVER_RED;
+    if (Math.min(rgb[0], rgb[1], rgb[2]) < 0) return CLIP_UNDER_BLUE;
+  }
+  const exposed: RGB = [rgb[0] * p.exposure, rgb[1] * p.exposure, rgb[2] * p.exposure];
+  let disp: RGB;
+  if (p.hdrOut) {
+    disp = [Math.max(exposed[0], 0), Math.max(exposed[1], 0), Math.max(exposed[2], 0)];
+  } else if (p.mode === 'raw') {
+    disp = [clamp01(exposed[0]), clamp01(exposed[1]), clamp01(exposed[2])];
+  } else {
+    disp = tonemap(exposed, p.tonemap);
+  }
+  const oetf = p.hdrOut ? linearToSrgbExt : linearToSrgb;
+  return [oetf(disp[0]), oetf(disp[1]), oetf(disp[2])];
 }

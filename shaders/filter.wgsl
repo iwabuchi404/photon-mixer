@@ -108,14 +108,30 @@ fn fs_exposure(in: VOut) -> @location(0) vec4f {
 }
 
 // レベル補正（sRGB 域で per-channel。プリマルチ → straight に戻して適用）
-fn f_srgb_to_linear(v: f32) -> f32 {
+//
+// HDR 保全: Levels/Curve は 0..1 の符号化域で動くが、単純にクランプすると
+// Glow/露出で作った 1.0 超の光量が永久に潰れる（作品データ = リニアHDRの原本 に反する）。
+// そこで符号化には「上限クランプなし」の拡張 sRGB 変換を使い、
+//   1. ext = 拡張符号化値（>1 を保持）
+//   2. sIn = min(ext, 1)      ← 補正は従来どおり 0..1 域で行う（SDR の挙動は不変）
+//   3. sOut = 補正結果
+//   4. over = ext - 1（1.0 超の超過分）を sIn→sOut の局所ゲインで引き伸ばす
+// とする。gain = sOut/sIn は「補正なしなら 1」なので、identity パラメータでは
+// HDR 値が完全に保存され（sOut + over = ext）、減光する補正では超過分も
+// 同じ比率で減光する。
+fn f_srgb_ext_to_linear(v: f32) -> f32 {
   if (v <= 0.04045) { return v / 12.92; }
   return pow((v + 0.055) / 1.055, 2.4);
 }
-fn f_linear_to_srgb(v: f32) -> f32 {
-  let c = clamp(v, 0.0, 1.0);
+fn f_linear_to_srgb_ext(v: f32) -> f32 {
+  let c = max(v, 0.0);
   if (c <= 0.0031308) { return c * 12.92; }
   return 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+// 補正の局所ゲイン（0 付近での除算を避ける）
+fn f_domain_gain(sIn: f32, sOut: f32) -> f32 {
+  if (sIn < 1e-4) { return 1.0; }
+  return sOut / sIn;
 }
 fn levels1(v: f32) -> f32 {
   var n = (v - u.in_low) / max(u.in_high - u.in_low, 1e-4);
@@ -128,23 +144,30 @@ fn fs_levels(in: VOut) -> @location(0) vec4f {
   let c = textureSampleLevel(tex0, samp, in.uv, 0.0);
   let a = c.a;
   let straight = select(c.rgb, c.rgb / a, a > 0.0001);
-  let s = vec3f(f_linear_to_srgb(straight.r), f_linear_to_srgb(straight.g), f_linear_to_srgb(straight.b));
-  let adj = vec3f(levels1(s.r), levels1(s.g), levels1(s.b));
-  let outLin = vec3f(f_srgb_to_linear(adj.r), f_srgb_to_linear(adj.g), f_srgb_to_linear(adj.b));
+  let ext = vec3f(f_linear_to_srgb_ext(straight.r), f_linear_to_srgb_ext(straight.g), f_linear_to_srgb_ext(straight.b));
+  let sIn = clamp(ext, vec3f(0.0), vec3f(1.0));
+  let adj = vec3f(levels1(sIn.r), levels1(sIn.g), levels1(sIn.b));
+  let gain = vec3f(f_domain_gain(sIn.r, adj.r), f_domain_gain(sIn.g, adj.g), f_domain_gain(sIn.b, adj.b));
+  let outEnc = adj + max(ext - vec3f(1.0), vec3f(0.0)) * gain;
+  let outLin = vec3f(f_srgb_ext_to_linear(outEnc.r), f_srgb_ext_to_linear(outEnc.g), f_srgb_ext_to_linear(outEnc.b));
   return vec4f(outLin * a, a);
 }
 
-// トーンカーブ: sRGB 域の各chを LUT(tex1, 256x1) で写像
+// トーンカーブ: sRGB 域の各chを LUT(tex1, 256x1) で写像（ Levels と同じ HDR 保全方針）
 @fragment
 fn fs_curve(in: VOut) -> @location(0) vec4f {
   let c = textureSampleLevel(tex0, samp, in.uv, 0.0);
   let a = c.a;
   let straight = select(c.rgb, c.rgb / a, a > 0.0001);
-  let s = vec3f(f_linear_to_srgb(straight.r), f_linear_to_srgb(straight.g), f_linear_to_srgb(straight.b));
-  let mr = textureSampleLevel(tex1, samp, vec2f(s.r, 0.5), 0.0).r;
-  let mg = textureSampleLevel(tex1, samp, vec2f(s.g, 0.5), 0.0).r;
-  let mb = textureSampleLevel(tex1, samp, vec2f(s.b, 0.5), 0.0).r;
-  let outLin = vec3f(f_srgb_to_linear(mr), f_srgb_to_linear(mg), f_srgb_to_linear(mb));
+  let ext = vec3f(f_linear_to_srgb_ext(straight.r), f_linear_to_srgb_ext(straight.g), f_linear_to_srgb_ext(straight.b));
+  let sIn = clamp(ext, vec3f(0.0), vec3f(1.0));
+  let mr = textureSampleLevel(tex1, samp, vec2f(sIn.r, 0.5), 0.0).r;
+  let mg = textureSampleLevel(tex1, samp, vec2f(sIn.g, 0.5), 0.0).r;
+  let mb = textureSampleLevel(tex1, samp, vec2f(sIn.b, 0.5), 0.0).r;
+  let sOut = vec3f(mr, mg, mb);
+  let gain = vec3f(f_domain_gain(sIn.r, mr), f_domain_gain(sIn.g, mg), f_domain_gain(sIn.b, mb));
+  let outEnc = sOut + max(ext - vec3f(1.0), vec3f(0.0)) * gain;
+  let outLin = vec3f(f_srgb_ext_to_linear(outEnc.r), f_srgb_ext_to_linear(outEnc.g), f_srgb_ext_to_linear(outEnc.b));
   return vec4f(outLin * a, a);
 }
 

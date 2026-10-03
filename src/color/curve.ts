@@ -4,6 +4,8 @@
  * sRGB 域の入力値に対する出力を返す（filter.wgsl の fs_curve が LUT を参照）。
  */
 
+import { linearToSrgbExt, srgbExtToLinear } from './linear.js';
+
 export interface CurvePoint { x: number; y: number }
 
 /** 制御点列を 256 サンプルに評価（各 0..1、単調性を保つ） */
@@ -65,4 +67,30 @@ export function buildCurveLut(points: CurvePoint[]): Uint8Array {
     data[k * 4] = b; data[k * 4 + 1] = b; data[k * 4 + 2] = b; data[k * 4 + 3] = 255;
   }
   return data;
+}
+
+/** 256 サンプルを 0..1 の値に復元（`buildCurveLut` の逆。テストと CPU twin 用） */
+export function lutToSamples(lut: Uint8Array): number[] {
+  const out: number[] = new Array(256);
+  for (let k = 0; k < 256; k++) out[k] = lut[k * 4] / 255;
+  return out;
+}
+
+/**
+ * リニア HDR 入力（1.0 超可）に対するトーンカーブ。GPU 側 `fs_curve` と同一式。
+ *
+ * LUT は 0..1 の符号化域しか表現できないので、Levels と同じ方針で
+ * 1.0 超の超過分を補正の局所ゲインで引き伸ばす。identity LUT では厳密に恒等となり、
+ * Glow/露出の光量を潰さない。
+ */
+export function applyCurveLinear(samples: number[], linearV: number): number {
+  const ext = linearToSrgbExt(linearV);
+  const sIn = Math.max(0, Math.min(1, ext));
+  // GPU は 256×1 LUT を textureSampleLevel で参照（線形補間相当）
+  const pos = sIn * 255;
+  const i0 = Math.min(255, Math.max(0, Math.floor(pos)));
+  const i1 = Math.min(255, i0 + 1);
+  const sOut = samples[i0] + (samples[i1] - samples[i0]) * (pos - i0);
+  const gain = sIn < 1e-4 ? 1 : sOut / sIn;
+  return srgbExtToLinear(sOut + Math.max(ext - 1, 0) * gain);
 }

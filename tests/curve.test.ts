@@ -4,9 +4,10 @@
 
 import assert from 'node:assert';
 import { test, describe } from 'node:test';
-import { sampleCurve, buildCurveLut, type CurvePoint } from '../src/color/curve.js';
+import { sampleCurve, buildCurveLut, lutToSamples, applyCurveLinear, type CurvePoint } from '../src/color/curve.js';
 
 const identity: CurvePoint[] = [{ x: 0, y: 0 }, { x: 1, y: 1 }];
+const approx = (a: number, b: number, e = 1e-6) => Math.abs(a - b) <= e;
 
 describe('sampleCurve', () => {
   test('恒等カーブはほぼ x=y', () => {
@@ -52,5 +53,43 @@ describe('buildCurveLut', () => {
     assert.strictEqual(lut[0], 0);
     assert.strictEqual(lut[255 * 4], 255);
     assert.strictEqual(lut[3], 255); // alpha
+  });
+});
+
+describe('applyCurveLinear（リニア HDR 入力・fs_curve の twin）', () => {
+  const idSamples = lutToSamples(buildCurveLut(identity));
+
+  test('恒等LUT は HDR（1.0 超）を保存する', () => {
+    // これが Curve で Glow/露出の光量を潰さないことの根拠
+    for (const v of [1.5, 4, 16, 64]) {
+      assert.ok(approx(applyCurveLinear(idSamples, v), v, 1e-3), `v=${v} -> ${applyCurveLinear(idSamples, v)}`);
+    }
+  });
+
+  test('SDR 域で単調増加', () => {
+    let prev = -1;
+    for (const v of [0, 0.05, 0.2, 0.5, 0.8, 1]) {
+      const o = applyCurveLinear(idSamples, v);
+      assert.ok(o >= prev - 1e-3, `not monotonic at v=${v}`);
+      prev = o;
+    }
+  });
+
+  test('減光カーブでは HDR も減光し、有限・正を保つ', () => {
+    const dark = lutToSamples(buildCurveLut([{ x: 0, y: 0 }, { x: 0.5, y: 0.4 }, { x: 1, y: 0.8 }]));
+    for (const v of [2, 4, 16]) {
+      const o = applyCurveLinear(dark, v);
+      assert.ok(Number.isFinite(o) && o > 0, `v=${v} -> ${o}`);
+      assert.ok(o < v, `減光されるべき: v=${v} -> ${o}`);
+    }
+  });
+
+  test('増光カーブでは HDR も増光する', () => {
+    const bright = lutToSamples(buildCurveLut([{ x: 0, y: 0 }, { x: 0.5, y: 0.6 }, { x: 1, y: 1 }]));
+    assert.ok(applyCurveLinear(bright, 4) > 4, `out=${applyCurveLinear(bright, 4)}`);
+  });
+
+  test('負値は 0 に丸められる', () => {
+    assert.strictEqual(applyCurveLinear(idSamples, -1), 0);
   });
 });
